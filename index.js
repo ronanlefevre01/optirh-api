@@ -44,7 +44,7 @@ app.use(helmet());
 app.use(express.json());
 
 // ===== ENV / DB =====
-import pg from "pg";
+
 const { Pool } = pg;
 
 // Render définit une variable d’env `RENDER=true` → permet de savoir si on est en prod
