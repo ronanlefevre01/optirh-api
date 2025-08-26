@@ -6,7 +6,6 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import pg from "pg";
 
 const app = express();
 
@@ -20,7 +19,7 @@ const ALLOWED_ORIGINS = [
 app.use((req, res, next) => { res.header("Vary", "Origin"); next(); });
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // curl/health/no-origin
+    if (!origin) return cb(null, true); // curl/health/no-origin (ex: Expo)
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"));
   },
@@ -29,22 +28,20 @@ app.use(cors({
   credentials: false,
 }));
 app.options("*", cors());
-app.use(helmet());
+
+// Helmet (assoupli pour API)
+app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: "1mb" }));
 
-/** ===== ENV / DB ===== */
-const { Pool } = pg;
-const isProd = !!process.env.RENDER;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: isProd ? { rejectUnauthorized: false } : undefined,
-});
-
+/** ===== ENV ===== */
 const API = process.env.JSONBIN_API_URL;
 const MASTER = process.env.JSONBIN_MASTER_KEY;
 const BIN_ID = process.env.JSONBIN_OPTIRH_BIN_ID;
 const SIGNING_SECRET = process.env.APP_SIGNING_SECRET;
 const JWT_SECRET = process.env.JWT_SECRET;
+
+["JSONBIN_API_URL","JSONBIN_MASTER_KEY","JSONBIN_OPTIRH_BIN_ID","APP_SIGNING_SECRET","JWT_SECRET"]
+  .forEach(k => { if (!process.env[k]) console.warn(`[warn] Missing env ${k}`); });
 
 /** ===== UTILS ===== */
 const sign = (payload) =>
@@ -52,18 +49,23 @@ const sign = (payload) =>
 
 const genCompanyCode = (name = "CO") => {
   const base = String(name).replace(/[^A-Z0-9]/gi, "").slice(0, 3).toUpperCase() || "CO";
-  return base + Math.floor(100 + Math.random() * 900);
+  return base + Math.floor(100 + Math.random() * 900); // ex: OPT123
 };
 
-/** ===== JSONBIN (single Bin registry) ===== */
+// JSONBin I/O
 async function loadRegistry() {
   const r = await fetch(`${API}/b/${BIN_ID}/latest`, { headers: { "X-Master-Key": MASTER } });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
     throw new Error(`JSONBin read error (${r.status}) ${txt}`);
   }
-  const json = await r.json();
-  return json.record;
+  const json = await r.json(); // {record, metadata}
+  // structure par défaut si Bin vide
+  const rec = json.record || {};
+  rec.licences = rec.licences || {};
+  rec.tenants  = rec.tenants  || {}; // tenants[company_code] = { company, licence_key, users, next_user_id, leaves[] }
+  rec.rev = rec.rev || 0;
+  return rec;
 }
 async function saveRegistry(record) {
   const r = await fetch(`${API}/b/${BIN_ID}`, {
@@ -79,21 +81,36 @@ async function saveRegistry(record) {
   return json.record;
 }
 
+// Petit helper pour gérer les conflits d’écriture
+async function withRegistryUpdate(mutator, maxRetry = 3) {
+  for (let i = 0; i < maxRetry; i++) {
+    const reg = await loadRegistry();
+    const now = new Date().toISOString();
+    const next = { ...reg, rev: (reg.rev || 0) + 1, updated_at: now };
+    const changed = await mutator(next, reg);
+    if (!changed) return reg;
+    try {
+      await saveRegistry(next);
+      return next;
+    } catch (e) {
+      if (i === maxRetry - 1) throw e;
+      // sinon on retente
+    }
+  }
+}
+
 /** ===== HEALTH ===== */
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-/** ===== LICENCES ===== */
+/** ===== LICENCES (toujours JSONBin) ===== */
 app.post("/api/licences", async (req, res) => {
   try {
     const { licence_key, company, modules, expires_at, status = "active" } = req.body || {};
     if (!licence_key || !company?.name)
       return res.status(400).json({ error: "licence_key & company.name required" });
 
-    for (let i = 0; i < 3; i++) {
-      const reg = await loadRegistry();
+    await withRegistryUpdate((next) => {
       const now = new Date().toISOString();
-      const next = { rev: (reg.rev || 0) + 1, updated_at: now, licences: reg.licences || {} };
-
       const prev = next.licences[licence_key];
       next.licences[licence_key] = {
         ...(prev || {}),
@@ -106,14 +123,10 @@ app.post("/api/licences", async (req, res) => {
         created_at: prev?.created_at || now,
         updated_at: now,
       };
+      return true;
+    });
 
-      try {
-        await saveRegistry(next);
-        return res.status(201).json({ ok: true });
-      } catch (e) {
-        if (i === 2) return res.status(502).json({ error: String(e.message || e) });
-      }
-    }
+    return res.status(201).json({ ok: true });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
@@ -140,7 +153,9 @@ app.get("/api/licences/validate", async (req, res) => {
   }
 });
 
-/** ===== AUTH / TENANT ===== */
+/** ===== AUTH / TENANT (FULL JSONBin) ===== */
+
+// Patron active la licence → création du tenant + compte OWNER
 app.post("/auth/activate-licence", async (req, res) => {
   try {
     const { licence_key, admin_email, admin_password } = req.body || {};
@@ -151,123 +166,322 @@ app.post("/auth/activate-licence", async (req, res) => {
     const lic = reg.licences?.[licence_key];
     if (!lic || lic.status !== "active") return res.status(403).json({ error: "Invalid licence" });
 
-    const existing = await pool.query("SELECT id FROM companies WHERE licence_key=$1", [licence_key]);
-    if (existing.rowCount > 0) return res.status(409).json({ error: "Licence already activated" });
+    const code = lic.company_code;
+    if (reg.tenants[code]) return res.status(409).json({ error: "Licence already activated" });
 
-    const { rows } = await pool.query(
-      `INSERT INTO companies(name, company_code, licence_key, siret, contact_email)
-       VALUES ($1,$2,$3,$4,$5) RETURNING id, company_code`,
-      [
-        lic.company.name,
-        lic.company_code,
-        lic.licence_key,
-        lic.company.siret || null,
-        lic.company.contact_email || null,
-      ]
-    );
-
-    const companyId = rows[0].id;
+    const now = new Date().toISOString();
     const hash = await bcrypt.hash(admin_password, 10);
-    await pool.query(
-      `INSERT INTO users(company_id, role, email, password_hash, first_name, last_name)
-       VALUES ($1,'OWNER',$2,$3,$4,$5)`,
-      [
-        companyId,
-        admin_email,
-        hash,
-        lic.company.contact_firstname || null,
-        lic.company.contact_lastname || null,
-      ]
-    );
 
-    return res.status(201).json({ ok: true, company_id: companyId, company_code: rows[0].company_code });
+    await withRegistryUpdate((next) => {
+      const n = next;
+      n.tenants = n.tenants || {};
+      if (n.tenants[code]) throw new Error("Licence already activated");
+
+      n.tenants[code] = {
+        company: {
+          name: lic.company.name,
+          siret: lic.company.siret || null,
+          contact_email: lic.company.contact_email || null,
+          contact_firstname: lic.company.contact_firstname || null,
+          contact_lastname: lic.company.contact_lastname || null,
+          created_at: now,
+        },
+        licence_key,
+        users: {
+          "1": {
+            id: 1,
+            role: "OWNER",
+            email: admin_email,
+            password_hash: hash,
+            first_name: lic.company.contact_firstname || null,
+            last_name: lic.company.contact_lastname || null,
+            created_at: now,
+          },
+        },
+        next_user_id: 2,
+        leaves: [],
+        created_at: now,
+        updated_at: now,
+      };
+      return true;
+    });
+
+    return res.status(201).json({ ok: true, company_code: code });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
+// Login Patron/Employé via JSONBin
 app.post("/auth/login", async (req, res) => {
   try {
     const { company_code, email, password } = req.body || {};
     if (!company_code || !email || !password)
       return res.status(400).json({ error: "fields required" });
 
-    const c = await pool.query("SELECT id FROM companies WHERE company_code=$1", [company_code]);
-    if (c.rowCount === 0) return res.status(404).json({ error: "Unknown company" });
-    const company_id = c.rows[0].id;
+    const reg = await loadRegistry();
+    const tenant = reg.tenants?.[company_code];
+    if (!tenant) return res.status(404).json({ error: "Unknown company" });
 
-    const u = await pool.query(
-      "SELECT id, role, password_hash FROM users WHERE company_id=$1 AND email=$2",
-      [company_id, email]
-    );
-    if (u.rowCount === 0) return res.status(401).json({ error: "Invalid credentials" });
+    // chercher user par email
+    const users = tenant.users || {};
+    const user = Object.values(users).find(u => String(u.email).toLowerCase() === String(email).toLowerCase());
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-    const ok = await bcrypt.compare(password, u.rows[0].password_hash);
+    const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-    const token = jwt.sign({ sub: u.rows[0].id, company_id, role: u.rows[0].role }, JWT_SECRET, {
-      expiresIn: "30d",
-    });
-    return res.json({ token, role: u.rows[0].role });
+    const token = jwt.sign({ sub: user.id, company_code, role: user.role }, JWT_SECRET, { expiresIn: "30d" });
+    return res.json({ token, role: user.role });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-/** ===== AUTH MIDDLEWARE ===== */
+/** ===== AUTH MIDDLEWARE (JWT) ===== */
 function authRequired(req, res, next) {
   try {
     const h = req.headers.authorization || "";
     if (!h.startsWith("Bearer ")) return res.status(401).json({ error: "Auth required" });
     const token = h.slice(7);
-    const payload = jwt.verify(token, JWT_SECRET); // { sub, company_id, role }
+    const payload = jwt.verify(token, JWT_SECRET); // { sub, company_code, role }
     req.user = payload;
     next();
-  } catch (e) {
+  } catch {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
 
-/** ===== USERS ===== */
-// Inviter un salarié (OWNER uniquement)
+/** ===== USERS (FULL JSONBin) ===== */
+
+// Inviter un salarié (OWNER)
 app.post("/users/invite", authRequired, async (req, res) => {
   try {
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
-
     const { email, first_name, last_name, role = "EMPLOYEE", temp_password } = req.body || {};
     if (!email || !temp_password) return res.status(400).json({ error: "email & temp_password required" });
 
-    const dupe = await pool.query(
-      "SELECT 1 FROM users WHERE company_id=$1 AND email=$2",
-      [req.user.company_id, email]
-    );
-    if (dupe.rowCount > 0) return res.status(409).json({ error: "User already exists" });
+    let created = null;
 
-    const hash = await bcrypt.hash(temp_password, 10);
-    const now = new Date().toISOString();
-    const ins = await pool.query(
-      `INSERT INTO users(company_id, role, email, password_hash, first_name, last_name, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       RETURNING id, email, role, first_name, last_name, created_at`,
-      [req.user.company_id, role, email, hash, first_name || null, last_name || null, now]
-    );
+    await withRegistryUpdate(async (next) => {
+      const code = req.user.company_code;
+      const t = next.tenants?.[code];
+      if (!t) throw new Error("Tenant not found");
 
-    return res.status(201).json({ ok: true, user: ins.rows[0] });
+      // doublon email ?
+      const exists = Object.values(t.users || {}).some(u => String(u.email).toLowerCase() === String(email).toLowerCase());
+      if (exists) throw new Error("User already exists");
+
+      const id = t.next_user_id || 1;
+      const hash = await bcrypt.hash(temp_password, 10);
+      const now = new Date().toISOString();
+
+      t.users = t.users || {};
+      t.users[String(id)] = {
+        id,
+        role,
+        email,
+        password_hash: hash,
+        first_name: first_name || null,
+        last_name: last_name || null,
+        created_at: now,
+      };
+      t.next_user_id = id + 1;
+      t.updated_at = now;
+      created = { id, email, role, first_name: first_name || null, last_name: last_name || null, created_at: now };
+
+      next.tenants[code] = t;
+      return true;
+    });
+
+    return res.status(201).json({ ok: true, user: created });
+  } catch (e) {
+    // mappe le message "User already exists" en 409 si besoin
+    const msg = String(e.message || e);
+    if (msg.includes("User already exists")) return res.status(409).json({ error: msg });
+    if (msg.includes("Tenant not found")) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// Lister les salariés (OWNER)
+app.get("/users", authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
+    const reg = await loadRegistry();
+    const t = reg.tenants?.[req.user.company_code];
+    if (!t) return res.status(404).json({ error: "Tenant not found" });
+    const list = Object.values(t.users || {}).sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+    return res.json({ users: list });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// Lister les salariés de l’entreprise
-app.get("/users", authRequired, async (req, res) => {
+// Mettre à jour un salarié (OWNER)
+app.patch("/users/:id", authRequired, async (req, res) => {
   try {
-    const q = await pool.query(
-      "SELECT id, email, role, first_name, last_name, created_at FROM users WHERE company_id=$1 ORDER BY created_at DESC",
-      [req.user.company_id]
-    );
-    return res.json({ users: q.rows });
+    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
+    const id = String(req.params.id);
+    const { first_name, last_name, email, role } = req.body || {};
+    let updated = null;
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t = next.tenants?.[code];
+      if (!t || !t.users?.[id]) throw new Error("User not found");
+
+      const u = { ...t.users[id] };
+      if (first_name !== undefined) u.first_name = first_name;
+      if (last_name  !== undefined) u.last_name  = last_name;
+      if (email      !== undefined) u.email      = email;
+      if (role       !== undefined) u.role       = role;
+      u.updated_at = new Date().toISOString();
+
+      t.users[id] = u;
+      t.updated_at = u.updated_at;
+      next.tenants[code] = t;
+      updated = { ...u };
+      delete updated.password_hash; // ne jamais renvoyer le hash
+      return true;
+    });
+
+    return res.json({ ok: true, user: updated });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes("User not found")) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// Supprimer un salarié (OWNER)
+app.delete("/users/:id", authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
+    const id = String(req.params.id);
+    if (Number(id) === Number(req.user.sub)) return res.status(400).json({ error: "Cannot delete yourself" });
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t = next.tenants?.[code];
+      if (!t || !t.users?.[id]) throw new Error("User not found");
+      delete t.users[id];
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      return true;
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes("User not found")) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+/** ===== LEAVES (FULL JSONBin) ===== */
+
+// Employé crée une demande
+app.post("/leaves", authRequired, async (req, res) => {
+  try {
+    const { start_date, end_date, type = "paid", reason } = req.body || {};
+    if (!start_date || !end_date) return res.status(400).json({ error: "start_date & end_date required" });
+
+    const reg = await loadRegistry();
+    const t = reg.tenants?.[req.user.company_code];
+    if (!t) return res.status(404).json({ error: "Tenant not found" });
+    const requesterUser = t.users?.[String(req.user.sub)];
+    if (!requesterUser) return res.status(404).json({ error: "User not found" });
+
+    const leave = {
+      id: crypto.randomUUID(),
+      company_code: req.user.company_code,
+      user_id: req.user.sub,
+      requester: {
+        email: requesterUser.email,
+        first_name: requesterUser.first_name || "",
+        last_name: requesterUser.last_name || "",
+      },
+      start_date,
+      end_date,
+      type,
+      reason: reason || null,
+      status: "pending",
+      decided_by: null,
+      decided_at: null,
+      created_at: new Date().toISOString(),
+    };
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const tt = next.tenants?.[code];
+      if (!tt) throw new Error("Tenant not found");
+      tt.leaves = tt.leaves || [];
+      tt.leaves.unshift(leave);
+      tt.updated_at = new Date().toISOString();
+      next.tenants[code] = tt;
+      return true;
+    });
+
+    return res.status(201).json({ ok: true, leave });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Lister les congés (OWNER: tous, EMPLOYEE: les siens)
+app.get("/leaves", authRequired, async (req, res) => {
+  try {
+    const { status } = req.query;
+    const reg = await loadRegistry();
+    const t = reg.tenants?.[req.user.company_code];
+    if (!t) return res.status(404).json({ error: "Tenant not found" });
+
+    let list = t.leaves || [];
+    if (req.user.role === "OWNER") {
+      if (status) list = list.filter(l => l.status === status);
+    } else {
+      list = list.filter(l => Number(l.user_id) === Number(req.user.sub));
+    }
+    list = [...list].sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+    return res.json({ leaves: list });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// OWNER approuve/refuse
+app.patch("/leaves/:id", authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
+    const id = String(req.params.id);
+    const { action } = req.body || {};
+    if (!["approve","deny"].includes(action)) return res.status(400).json({ error: "invalid action" });
+
+    let updated = null;
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t = next.tenants?.[code];
+      if (!t || !Array.isArray(t.leaves)) throw new Error("Tenant not found");
+      const idx = t.leaves.findIndex(l => l.id === id);
+      if (idx === -1) throw new Error("Leave not found");
+      const l = { ...t.leaves[idx] };
+      l.status = action === "approve" ? "approved" : "denied";
+      l.decided_by = req.user.sub;
+      l.decided_at = new Date().toISOString();
+      t.leaves[idx] = l;
+      t.updated_at = l.decided_at;
+      next.tenants[code] = t;
+      updated = l;
+      return true;
+    });
+
+    return res.json({ ok: true, leave: updated });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes("Leave not found")) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
   }
 });
 
