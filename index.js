@@ -112,7 +112,6 @@ function ensureTenantDefaults(t) {
 // Envoi Expo Push (via node-fetch déjà importé)
 async function sendExpoPush(tokens = [], message = { title: '', body: '', data: {} }) {
   if (!tokens || tokens.length === 0) return;
-  // batch par ~90 messages
   const batchSize = 90;
   for (let i = 0; i < tokens.length; i += batchSize) {
     const chunk = tokens.slice(i, i + batchSize).map(to => ({
@@ -134,7 +133,7 @@ async function sendExpoPush(tokens = [], message = { title: '', body: '', data: 
 /** ===== HEALTH ===== */
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-/** ===== LICENCES (toujours JSONBin) ===== */
+/** ===== LICENCES ===== */
 app.post("/api/licences", async (req, res) => {
   try {
     const { licence_key, company, modules, expires_at, status = "active" } = req.body || {};
@@ -185,7 +184,7 @@ app.get("/api/licences/validate", async (req, res) => {
   }
 });
 
-/** ===== AUTH / TENANT (FULL JSONBin) ===== */
+/** ===== AUTH / TENANT ===== */
 
 // Patron active la licence → création du tenant + compte OWNER
 app.post("/auth/activate-licence", async (req, res) => {
@@ -244,7 +243,7 @@ app.post("/auth/activate-licence", async (req, res) => {
   }
 });
 
-// Login Patron/Employé via JSONBin
+// Login Patron/Employé
 app.post("/auth/login", async (req, res) => {
   try {
     const { company_code, email, password } = req.body || {};
@@ -255,7 +254,6 @@ app.post("/auth/login", async (req, res) => {
     const tenant = reg.tenants?.[company_code];
     if (!tenant) return res.status(404).json({ error: "Unknown company" });
 
-    // chercher user par email
     const users = tenant.users || {};
     const user = Object.values(users).find(u => String(u.email).toLowerCase() === String(email).toLowerCase());
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
@@ -270,7 +268,7 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-/** ===== AUTH MIDDLEWARE (JWT) ===== */
+/** ===== AUTH MIDDLEWARE ===== */
 function authRequired(req, res, next) {
   try {
     const h = req.headers.authorization || "";
@@ -284,14 +282,12 @@ function authRequired(req, res, next) {
   }
 }
 
-/** ===== USERS (FULL JSONBin) ===== */
+/** ===== USERS ===== */
 
-// Inviter un salarié (OWNER)
 app.post("/users/invite", authRequired, async (req, res) => {
   try {
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
 
-    // 🔧 normalisation + validation
     const email = (req.body?.email || "").trim().toLowerCase();
     const temp_password = (req.body?.temp_password || "").trim();
     const first_name = (req.body?.first_name ?? null);
@@ -308,7 +304,6 @@ app.post("/users/invite", authRequired, async (req, res) => {
       const t = next.tenants?.[code];
       if (!t) throw new Error("Tenant not found");
 
-      // doublon email ?
       const exists = Object.values(t.users || {}).some(u => String(u.email).toLowerCase() === String(email).toLowerCase());
       if (exists) throw new Error("User already exists");
 
@@ -336,7 +331,6 @@ app.post("/users/invite", authRequired, async (req, res) => {
 
     return res.status(201).json({ ok: true, user: created });
   } catch (e) {
-    // mappe le message "User already exists" en 409 si besoin
     const msg = String(e.message || e);
     if (msg.includes("User already exists")) return res.status(409).json({ error: msg });
     if (msg.includes("Tenant not found")) return res.status(404).json({ error: msg });
@@ -344,7 +338,6 @@ app.post("/users/invite", authRequired, async (req, res) => {
   }
 });
 
-// Lister les salariés (OWNER)
 app.get("/users", authRequired, async (req, res) => {
   try {
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
@@ -358,7 +351,6 @@ app.get("/users", authRequired, async (req, res) => {
   }
 });
 
-// Mettre à jour un salarié (OWNER)
 app.patch("/users/:id", authRequired, async (req, res) => {
   try {
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
@@ -382,7 +374,7 @@ app.patch("/users/:id", authRequired, async (req, res) => {
       t.updated_at = u.updated_at;
       next.tenants[code] = t;
       updated = { ...u };
-      delete updated.password_hash; // ne jamais renvoyer le hash
+      delete updated.password_hash;
       return true;
     });
 
@@ -394,7 +386,6 @@ app.patch("/users/:id", authRequired, async (req, res) => {
   }
 });
 
-// Supprimer un salarié (OWNER)
 app.delete("/users/:id", authRequired, async (req, res) => {
   try {
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
@@ -419,7 +410,7 @@ app.delete("/users/:id", authRequired, async (req, res) => {
   }
 });
 
-/** ===== LEAVES (FULL JSONBin) ===== */
+/** ===== LEAVES ===== */
 
 // Employé crée une demande
 app.post("/leaves", authRequired, async (req, res) => {
@@ -469,7 +460,7 @@ app.post("/leaves", authRequired, async (req, res) => {
   }
 });
 
-// Lister les congés (OWNER: tous, EMPLOYEE: les siens)
+// Lister les congés
 app.get("/leaves", authRequired, async (req, res) => {
   try {
     const { status } = req.query;
@@ -490,41 +481,6 @@ app.get("/leaves", authRequired, async (req, res) => {
   }
 });
 
-// OWNER approuve/refuse
-app.patch("/leaves/:id", authRequired, async (req, res) => {
-  try {
-    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
-    const id = String(req.params.id);
-    const { action } = req.body || {};
-    if (!["approve","deny"].includes(action)) return res.status(400).json({ error: "invalid action" });
-
-    let updated = null;
-
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t = next.tenants?.[code];
-      if (!t || !Array.isArray(t.leaves)) throw new Error("Tenant not found");
-      const idx = t.leaves.findIndex(l => l.id === id);
-      if (idx === -1) throw new Error("Leave not found");
-      const l = { ...t.leaves[idx] };
-      l.status = action === "approve" ? "approved" : "denied";
-      l.decided_by = req.user.sub;
-      l.decided_at = new Date().toISOString();
-      t.leaves[idx] = l;
-      t.updated_at = l.decided_at;
-      next.tenants[code] = t;
-      updated = l;
-      return true;
-    });
-
-    return res.json({ ok: true, leave: updated });
-  } catch (e) {
-    const msg = String(e.message || e);
-    if (msg.includes("Leave not found")) return res.status(404).json({ error: msg });
-    return res.status(500).json({ error: msg });
-  }
-});
-
 /** ===== DEVICES (Expo push tokens) ===== */
 app.post('/devices/register', authRequired, async (req, res) => {
   try {
@@ -534,7 +490,6 @@ app.post('/devices/register', authRequired, async (req, res) => {
     await withRegistryUpdate((next) => {
       const code = req.user.company_code;
       const t = ensureTenantDefaults(next.tenants?.[code]);
-      // upsert (un seul enregistrement identique)
       t.devices = t.devices.filter(d => !(Number(d.user_id) === Number(req.user.sub) && d.token === pushToken));
       t.devices.push({
         user_id: req.user.sub,
@@ -579,15 +534,14 @@ app.get('/calendar/events', authRequired, async (req, res) => {
     if (!t) return res.status(404).json({ error: 'Tenant not found' });
     const tt = ensureTenantDefaults(t);
 
-    // chevauchement avec [from, to]
-    const list = (tt.calendar_events || []).filter(e => !(e.end < from || e.start > to));
+    const list = (tt.calendar_events || []).filter(e => !(e.end < from || e.start > to)); // chevauchement
     res.json({ events: list });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// OWNER approuve/refuse + crée l'événement + push
+/** ===== OWNER approuve/refuse + crée l'événement + push ===== */
 app.patch('/leaves/:id', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
@@ -627,13 +581,12 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
       t.leaves[idx] = l;
       updated = l;
 
-      // si approuvée → créer l’événement dans l’agenda partagé
       if (normalized === 'approved') {
         const label = `Congé ${ (l.requester?.first_name || '') + ' ' + (l.requester?.last_name || '') }`.trim();
         const ev = {
           id: crypto.randomUUID(),
           title: label || 'Congé',
-          start: l.start_date, // "YYYY-MM-DD"
+          start: l.start_date,
           end:   l.end_date,
           employee_id: l.user_id,
           created_at: new Date().toISOString(),
