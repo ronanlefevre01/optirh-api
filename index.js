@@ -60,10 +60,9 @@ async function loadRegistry() {
     throw new Error(`JSONBin read error (${r.status}) ${txt}`);
   }
   const json = await r.json(); // {record, metadata}
-  // structure par défaut si Bin vide
   const rec = json.record || {};
   rec.licences = rec.licences || {};
-  rec.tenants  = rec.tenants  || {}; // tenants[company_code] = { company, licence_key, users, next_user_id, leaves[] }
+  rec.tenants  = rec.tenants  || {};
   rec.rev = rec.rev || 0;
   return rec;
 }
@@ -94,7 +93,6 @@ async function withRegistryUpdate(mutator, maxRetry = 3) {
       return next;
     } catch (e) {
       if (i === maxRetry - 1) throw e;
-      // sinon on retente
     }
   }
 }
@@ -102,12 +100,46 @@ async function withRegistryUpdate(mutator, maxRetry = 3) {
 /** ===== HELPERS AGENDA & PUSH ===== */
 
 // S'assure que les tableaux existent dans le tenant
+// S'assure que les champs de base existent dans le tenant
 function ensureTenantDefaults(t) {
-  t.leaves = Array.isArray(t.leaves) ? t.leaves : [];
-  t.calendar_events = Array.isArray(t.calendar_events) ? t.calendar_events : [];
-  t.devices = Array.isArray(t.devices) ? t.devices : [];
-  return t;
+  const obj = (t && typeof t === 'object') ? t : {};
+
+  obj.leaves = Array.isArray(obj.leaves) ? obj.leaves : [];
+  obj.calendar_events = Array.isArray(obj.calendar_events) ? obj.calendar_events : [];
+  obj.devices = Array.isArray(obj.devices) ? obj.devices : [];
+
+  // Réglages d'entreprise (par défaut : jours ouvrés)
+  obj.settings = obj.settings || {};
+  if (!obj.settings.leave_count_mode) {
+    obj.settings.leave_count_mode = 'ouvres'; // 'ouvres' ou 'ouvrables'
+  }
+
+  return obj;
 }
+
+// Chevauchement de périodes "YYYY-MM-DD"
+const overlaps = (aStart, aEnd, bStart, bEnd) => !(aEnd < bStart || aStart > bEnd);
+
+// Liste des conflits pour une période (exclut optionnellement un user_id)
+function conflictsForPeriod(tenant, start, end, { excludeUserId } = {}) {
+  const t = ensureTenantDefaults(tenant);
+  return (t.leaves || [])
+    .filter(l =>
+      (l.status === 'approved' || l.status === 'pending') &&
+      (excludeUserId == null || Number(l.user_id) !== Number(excludeUserId)) &&
+      overlaps(start, end, l.start_date, l.end_date)
+    )
+    .map(l => ({
+      id: l.id,
+      user_id: l.user_id,
+      requester: l.requester || null,
+      start: l.start_date,
+      end: l.end_date,
+      status: l.status,
+      type: l.type || null,
+    }));
+}
+
 
 // Envoi Expo Push (via node-fetch déjà importé)
 async function sendExpoPush(tokens = [], message = { title: '', body: '', data: {} }) {
@@ -128,7 +160,6 @@ async function sendExpoPush(tokens = [], message = { title: '', body: '', data: 
     }
   }
 }
-
 
 /** ===== HEALTH ===== */
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
@@ -412,17 +443,46 @@ app.delete("/users/:id", authRequired, async (req, res) => {
 
 /** ===== LEAVES ===== */
 
-// Employé crée une demande
+// Pré-vérifier les conflits
+app.get('/leaves/conflicts', authRequired, async (req, res) => {
+  try {
+    const start = String(req.query.start || '');
+    const end   = String(req.query.end || '');
+    const exclude = req.query.exclude_user_id != null ? Number(req.query.exclude_user_id) : null;
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end))
+      return res.status(400).json({ error: 'bad date format' });
+
+    const reg = await loadRegistry();
+    const t = reg.tenants?.[req.user.company_code];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+
+    const conflicts = conflictsForPeriod(t, start, end, { excludeUserId: exclude });
+    res.json({ conflicts });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Employé crée une demande (avec blocage conflit sauf force)
 app.post("/leaves", authRequired, async (req, res) => {
   try {
-    const { start_date, end_date, type = "paid", reason } = req.body || {};
+    const { start_date, end_date, type = "paid", reason, force = false } = req.body || {};
     if (!start_date || !end_date) return res.status(400).json({ error: "start_date & end_date required" });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date) || !/^\d{4}-\d{2}-\d{2}$/.test(end_date))
+      return res.status(400).json({ error: "bad date format" });
 
     const reg = await loadRegistry();
     const t = reg.tenants?.[req.user.company_code];
     if (!t) return res.status(404).json({ error: "Tenant not found" });
     const requesterUser = t.users?.[String(req.user.sub)];
     if (!requesterUser) return res.status(404).json({ error: "User not found" });
+
+    // check conflits (autres salariés)
+    const conflicts = conflictsForPeriod(t, start_date, end_date, { excludeUserId: req.user.sub });
+    if (conflicts.length && !force) {
+      return res.status(409).json({ error: "conflict", conflicts });
+    }
 
     const leave = {
       id: crypto.randomUUID(),
@@ -454,7 +514,7 @@ app.post("/leaves", authRequired, async (req, res) => {
       return true;
     });
 
-    return res.status(201).json({ ok: true, leave });
+    return res.status(201).json({ ok: true, leave, conflicts: conflicts || [] });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
@@ -589,6 +649,7 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
           start: l.start_date,
           end:   l.end_date,
           employee_id: l.user_id,
+          type: l.type || null, // <-- important pour la couleur côté app
           created_at: new Date().toISOString(),
         };
         t.calendar_events.push(ev);
