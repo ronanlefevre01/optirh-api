@@ -258,8 +258,16 @@ function authRequired(req, res, next) {
 app.post("/users/invite", authRequired, async (req, res) => {
   try {
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
-    const { email, first_name, last_name, role = "EMPLOYEE", temp_password } = req.body || {};
-    if (!email || !temp_password) return res.status(400).json({ error: "email & temp_password required" });
+
+    // 🔧 normalisation + validation
+    const email = (req.body?.email || "").trim().toLowerCase();
+    const temp_password = (req.body?.temp_password || "").trim();
+    const first_name = (req.body?.first_name ?? null);
+    const last_name  = (req.body?.last_name ?? null);
+    const role = (req.body?.role || "EMPLOYEE");
+
+    if (!email) return res.status(400).json({ error: "email requis" });
+    if (!temp_password) return res.status(400).json({ error: "temp_password requis" });
 
     let created = null;
 
