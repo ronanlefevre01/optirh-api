@@ -740,6 +740,7 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
           start: l.start_date, // YYYY-MM-DD
           end:   l.end_date,
           employee_id: l.user_id,
+          leave_id: l.id,
           created_at: new Date().toISOString(),
         };
         t.calendar_events.push(ev);
