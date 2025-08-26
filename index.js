@@ -447,22 +447,41 @@ app.delete("/users/:id", authRequired, async (req, res) => {
 app.get('/leaves/conflicts', authRequired, async (req, res) => {
   try {
     const start = String(req.query.start || '');
-    const end   = String(req.query.end || '');
-    const exclude = req.query.exclude_user_id != null ? Number(req.query.exclude_user_id) : null;
+    const end   = String(req.query.end   || '');
+    const excludeParam = req.query.exclude_user_id != null ? Number(req.query.exclude_user_id) : null;
+    const only = String(req.query.only || ''); // 'approved' optionnel
 
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end))
-      return res.status(400).json({ error: 'bad date format' });
+    // Vérif formats
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    if (!re.test(start) || !re.test(end)) {
+      return res.status(400).json({ error: 'bad date format (YYYY-MM-DD)' });
+    }
+    if (start > end) {
+      return res.status(400).json({ error: 'start must be <= end' });
+    }
 
     const reg = await loadRegistry();
-    const t = reg.tenants?.[req.user.company_code];
-    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+    const t0 = reg.tenants?.[req.user.company_code];
+    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
+    const t = ensureTenantDefaults(t0);
 
-    const conflicts = conflictsForPeriod(t, start, end, { excludeUserId: exclude });
-    res.json({ conflicts });
+    // Par défaut : si l’appelant est EMPLOYEE, on exclut ses propres demandes.
+    // Si un manager veut exclure un salarié précis, il peut passer ?exclude_user_id=123
+    const excludeUserId =
+      excludeParam != null ? excludeParam :
+      (req.user.role === 'EMPLOYEE' ? Number(req.user.sub) : undefined);
+
+    let conflicts = conflictsForPeriod(t, start, end, { excludeUserId });
+    if (only === 'approved') {
+      conflicts = conflicts.filter(c => c.status === 'approved');
+    }
+
+    return res.json({ conflicts, count: conflicts.length });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 // Employé crée une demande (avec blocage conflit sauf force)
 app.post("/leaves", authRequired, async (req, res) => {
@@ -695,6 +714,60 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
+/** ===== SETTINGS (réglages d’entreprise) ===== */
+// Récupérer les réglages (mode de décompte, etc.)
+app.get('/settings', authRequired, async (req, res) => {
+  try {
+    const reg = await loadRegistry();
+    const t0 = reg.tenants?.[req.user.company_code];
+    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
+    const t = ensureTenantDefaults(t0);
+    return res.json({ settings: t.settings || { leave_count_mode: 'ouvres' } });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Mettre à jour les réglages (OWNER uniquement)
+app.patch('/settings', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+
+    const { leave_count_mode, workweek } = req.body || {};
+    if (leave_count_mode && !['ouvres', 'ouvrables'].includes(leave_count_mode)) {
+      return res.status(400).json({ error: 'leave_count_mode must be "ouvres" or "ouvrables"' });
+    }
+    if (workweek && !Array.isArray(workweek)) {
+      return res.status(400).json({ error: 'workweek must be an array of numbers (0..6)' });
+    }
+
+    let out = null;
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      t.settings = t.settings || {};
+      if (leave_count_mode) t.settings.leave_count_mode = leave_count_mode;
+      if (Array.isArray(workweek)) t.settings.workweek = workweek;
+
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      out = t.settings;
+      return true;
+    });
+
+    return res.json({ ok: true, settings: out });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+
 
 /** ===== START ===== */
 app.listen(process.env.PORT || 3000, () => {
