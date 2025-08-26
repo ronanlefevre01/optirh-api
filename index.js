@@ -10,58 +10,43 @@ import pg from "pg";
 
 const app = express();
 
-/** ===== CORS (whitelist) =====
- *  Autorise ton front OptiAdmin + le dev local.
- *  Tu peux ajouter d’autres origines si besoin.
- */
+/** ===== CORS (whitelist) ===== */
 const ALLOWED_ORIGINS = [
   "https://opti-admin.vercel.app",
   "https://www.opti-admin.vercel.app",
   "http://localhost:5173",
   "http://localhost:3000",
 ];
-
-// Important: renvoyer Vary: Origin pour les caches
 app.use((req, res, next) => { res.header("Vary", "Origin"); next(); });
-
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true); // curl/health/no-origin
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
-    },
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false, // pas de cookies cross-site
-  })
-);
-// Répondre aux préflights
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // curl/health/no-origin
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false,
+}));
 app.options("*", cors());
-
-// Helmet APRÈS CORS (pour ne pas interférer avec les headers)
 app.use(helmet());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// ===== ENV / DB =====
-
+/** ===== ENV / DB ===== */
 const { Pool } = pg;
-
-// Render définit une variable d’env `RENDER=true` → permet de savoir si on est en prod
 const isProd = !!process.env.RENDER;
-
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: isProd ? { rejectUnauthorized: false } : undefined, // <<— important
+  ssl: isProd ? { rejectUnauthorized: false } : undefined,
 });
 
 const API = process.env.JSONBIN_API_URL;
 const MASTER = process.env.JSONBIN_MASTER_KEY;
-const BIN_ID = process.env.JSONBIN_OPTIRH_BIN_ID; // spécifique à OptiRH
-const SIGNING_SECRET = process.env.APP_SIGNING_SECRET; // HMAC app
-const JWT_SECRET = process.env.JWT_SECRET; // JWT sessions
+const BIN_ID = process.env.JSONBIN_OPTIRH_BIN_ID;
+const SIGNING_SECRET = process.env.APP_SIGNING_SECRET;
+const JWT_SECRET = process.env.JWT_SECRET;
 
-// ===== UTILS =====
+/** ===== UTILS ===== */
 const sign = (payload) =>
   crypto.createHmac("sha256", SIGNING_SECRET).update(JSON.stringify(payload)).digest("base64url");
 
@@ -70,14 +55,14 @@ const genCompanyCode = (name = "CO") => {
   return base + Math.floor(100 + Math.random() * 900);
 };
 
-// ===== JSONBIN (single Bin registry) =====
+/** ===== JSONBIN (single Bin registry) ===== */
 async function loadRegistry() {
   const r = await fetch(`${API}/b/${BIN_ID}/latest`, { headers: { "X-Master-Key": MASTER } });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
     throw new Error(`JSONBin read error (${r.status}) ${txt}`);
   }
-  const json = await r.json(); // {record, metadata}
+  const json = await r.json();
   return json.record;
 }
 async function saveRegistry(record) {
@@ -94,10 +79,10 @@ async function saveRegistry(record) {
   return json.record;
 }
 
-// ===== HEALTH =====
+/** ===== HEALTH ===== */
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// ===== LICENCES =====
+/** ===== LICENCES ===== */
 app.post("/api/licences", async (req, res) => {
   try {
     const { licence_key, company, modules, expires_at, status = "active" } = req.body || {};
@@ -155,7 +140,7 @@ app.get("/api/licences/validate", async (req, res) => {
   }
 });
 
-// ===== AUTH / TENANT =====
+/** ===== AUTH / TENANT ===== */
 app.post("/auth/activate-licence", async (req, res) => {
   try {
     const { licence_key, admin_email, admin_password } = req.body || {};
@@ -166,7 +151,6 @@ app.post("/auth/activate-licence", async (req, res) => {
     const lic = reg.licences?.[licence_key];
     if (!lic || lic.status !== "active") return res.status(403).json({ error: "Invalid licence" });
 
-    // idempotence : si déjà activée, on refuse
     const existing = await pool.query("SELECT id FROM companies WHERE licence_key=$1", [licence_key]);
     if (existing.rowCount > 0) return res.status(409).json({ error: "Licence already activated" });
 
@@ -230,7 +214,64 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// ===== START =====
+/** ===== AUTH MIDDLEWARE ===== */
+function authRequired(req, res, next) {
+  try {
+    const h = req.headers.authorization || "";
+    if (!h.startsWith("Bearer ")) return res.status(401).json({ error: "Auth required" });
+    const token = h.slice(7);
+    const payload = jwt.verify(token, JWT_SECRET); // { sub, company_id, role }
+    req.user = payload;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+/** ===== USERS ===== */
+// Inviter un salarié (OWNER uniquement)
+app.post("/users/invite", authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
+
+    const { email, first_name, last_name, role = "EMPLOYEE", temp_password } = req.body || {};
+    if (!email || !temp_password) return res.status(400).json({ error: "email & temp_password required" });
+
+    const dupe = await pool.query(
+      "SELECT 1 FROM users WHERE company_id=$1 AND email=$2",
+      [req.user.company_id, email]
+    );
+    if (dupe.rowCount > 0) return res.status(409).json({ error: "User already exists" });
+
+    const hash = await bcrypt.hash(temp_password, 10);
+    const now = new Date().toISOString();
+    const ins = await pool.query(
+      `INSERT INTO users(company_id, role, email, password_hash, first_name, last_name, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING id, email, role, first_name, last_name, created_at`,
+      [req.user.company_id, role, email, hash, first_name || null, last_name || null, now]
+    );
+
+    return res.status(201).json({ ok: true, user: ins.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Lister les salariés de l’entreprise
+app.get("/users", authRequired, async (req, res) => {
+  try {
+    const q = await pool.query(
+      "SELECT id, email, role, first_name, last_name, created_at FROM users WHERE company_id=$1 ORDER BY created_at DESC",
+      [req.user.company_id]
+    );
+    return res.json({ users: q.rows });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/** ===== START ===== */
 app.listen(process.env.PORT || 3000, () => {
   console.log("OptiRH API up on", process.env.PORT || 3000);
 });
