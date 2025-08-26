@@ -621,21 +621,18 @@ app.get('/calendar/events', authRequired, async (req, res) => {
 });
 
 /** ===== OWNER approuve/refuse + crée l'événement + push ===== */
+/** ===== OWNER: approve/deny + edit + cancel (agenda sync + push) ===== */
 app.patch('/leaves/:id', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
     const id = String(req.params.id);
 
-    // compat : action ('approve'|'deny') OU status ('approved'|'denied')
-    const { action, status: statusRaw, manager_note } = req.body || {};
+    // Compat : approve/deny via action ou status; edit via { edit:{...} }; cancel via action='cancel'
+    const { action, status: statusRaw, manager_note, edit } = req.body || {};
     const normalized =
       action === 'approve' ? 'approved' :
       action === 'deny'    ? 'denied'  :
       statusRaw;
-
-    if (!['approved','denied'].includes(normalized)) {
-      return res.status(400).json({ error: 'invalid action/status' });
-    }
 
     let updated = null;
     let createdEvent = null;
@@ -651,6 +648,79 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
       if (idx === -1) throw new Error('Leave not found');
 
       const l = { ...t.leaves[idx] };
+
+      // --- Annulation ---
+      if (action === 'cancel') {
+        if (l.status !== 'approved') throw new Error('Only approved leave can be cancelled');
+        l.status = 'cancelled';
+        l.manager_note = manager_note || l.manager_note || null;
+        l.decided_by = req.user.sub;
+        l.decided_at = new Date().toISOString();
+
+        // supprimer l’événement lié
+        t.calendar_events = (t.calendar_events || []).filter(ev => ev.leave_id !== id);
+
+        t.leaves[idx] = l;
+        updated = l;
+        employeeUserId = l.user_id;
+
+        t.updated_at = new Date().toISOString();
+        next.tenants[code] = t;
+        return true;
+      }
+
+      // --- Edition (dates/type) ---
+      if (edit && typeof edit === 'object') {
+        if (l.status !== 'approved') throw new Error('Only approved leave can be edited');
+        const { start_date, end_date, type } = edit;
+
+        if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(start_date))) throw new Error('bad start_date');
+        if (end_date   && !/^\d{4}-\d{2}-\d{2}$/.test(String(end_date)))   throw new Error('bad end_date');
+        if (start_date && end_date && String(start_date) > String(end_date)) throw new Error('start_date must be <= end_date');
+
+        if (start_date) l.start_date = String(start_date);
+        if (end_date)   l.end_date   = String(end_date);
+        if (type)       l.type       = String(type);
+        l.manager_note = manager_note || l.manager_note || null;
+        l.decided_by = req.user.sub;
+        l.decided_at = new Date().toISOString();
+
+        // MAJ de l’événement lié
+        const label = `Congé ${ (l.requester?.first_name || '') + ' ' + (l.requester?.last_name || '') }`.trim();
+        let ev = (t.calendar_events || []).find(ev => ev.leave_id === id);
+        if (ev) {
+          ev.title = label || 'Congé';
+          ev.start = l.start_date;
+          ev.end   = l.end_date;
+          ev.updated_at = new Date().toISOString();
+        } else {
+          // Older events (sans leave_id) : on recrée proprement
+          ev = {
+            id: crypto.randomUUID(),
+            leave_id: id,
+            title: label || 'Congé',
+            start: l.start_date,
+            end:   l.end_date,
+            employee_id: l.user_id,
+            created_at: new Date().toISOString(),
+          };
+          t.calendar_events.push(ev);
+        }
+
+        t.leaves[idx] = l;
+        updated = l;
+        employeeUserId = l.user_id;
+
+        t.updated_at = new Date().toISOString();
+        next.tenants[code] = t;
+        return true;
+      }
+
+      // --- Approve / Deny ---
+      if (!['approved', 'denied'].includes(normalized)) {
+        throw new Error('invalid action/status');
+      }
+
       l.status = normalized;
       l.manager_note = manager_note || l.manager_note || null;
       l.decided_by = req.user.sub;
@@ -660,15 +730,16 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
       t.leaves[idx] = l;
       updated = l;
 
+      // create event on approve
       if (normalized === 'approved') {
         const label = `Congé ${ (l.requester?.first_name || '') + ' ' + (l.requester?.last_name || '') }`.trim();
         const ev = {
           id: crypto.randomUUID(),
+          leave_id: id, // 👈 lien vers le congé
           title: label || 'Congé',
-          start: l.start_date,
+          start: l.start_date, // YYYY-MM-DD
           end:   l.end_date,
           employee_id: l.user_id,
-          type: l.type || null, // <-- important pour la couleur côté app
           created_at: new Date().toISOString(),
         };
         t.calendar_events.push(ev);
@@ -680,7 +751,7 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
       return true;
     });
 
-    // Notifier le salarié
+    // --- Push notif employé ---
     try {
       const reg = await loadRegistry();
       const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
@@ -689,18 +760,31 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
         .map(d => d.token);
 
       if (tokens.length) {
-        await sendExpoPush(tokens, normalized === 'approved'
-          ? {
-              title: 'Congé approuvé ✅',
-              body: `Du ${updated.start_date} au ${updated.end_date}`,
-              data: { type: 'leave', status: 'approved', leaveId: updated.id },
-            }
-          : {
-              title: 'Congé refusé ❌',
-              body: manager_note ? `Note: ${manager_note}` : 'Votre demande a été refusée',
-              data: { type: 'leave', status: 'denied', leaveId: updated.id },
-            }
-        );
+        if (action === 'cancel') {
+          await sendExpoPush(tokens, {
+            title: 'Congé annulé ❌',
+            body: `Période supprimée : ${updated.start_date} → ${updated.end_date}`,
+            data: { type: 'leave', status: 'cancelled', leaveId: updated.id },
+          });
+        } else if (edit) {
+          await sendExpoPush(tokens, {
+            title: 'Congé modifié ✏️',
+            body: `Nouvelles dates : ${updated.start_date} → ${updated.end_date}`,
+            data: { type: 'leave', status: 'approved', leaveId: updated.id },
+          });
+        } else if (updated?.status === 'approved') {
+          await sendExpoPush(tokens, {
+            title: 'Congé approuvé ✅',
+            body: `Du ${updated.start_date} au ${updated.end_date}`,
+            data: { type: 'leave', status: 'approved', leaveId: updated.id },
+          });
+        } else if (updated?.status === 'denied') {
+          await sendExpoPush(tokens, {
+            title: 'Congé refusé ❌',
+            body: manager_note ? `Note: ${manager_note}` : 'Votre demande a été refusée',
+            data: { type: 'leave', status: 'denied', leaveId: updated.id },
+          });
+        }
       }
     } catch (e) {
       console.warn('[push] skipped:', e?.message || e);
@@ -711,9 +795,15 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
     const msg = String(e.message || e);
     if (msg.includes('Leave not found')) return res.status(404).json({ error: msg });
     if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    if (msg.includes('invalid action/status')) return res.status(400).json({ error: msg });
+    if (msg.includes('Only approved leave')) return res.status(400).json({ error: msg });
+    if (msg.includes('bad start_date') || msg.includes('bad end_date') || msg.includes('start_date must')) {
+      return res.status(400).json({ error: msg });
+    }
     return res.status(500).json({ error: msg });
   }
 });
+
 
 /** ===== SETTINGS (réglages d’entreprise) ===== */
 // Récupérer les réglages (mode de décompte, etc.)
