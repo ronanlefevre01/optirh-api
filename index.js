@@ -632,6 +632,7 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
     const normalized =
       action === 'approve' ? 'approved' :
       action === 'deny'    ? 'denied'  :
+      action === 'cancel'  ? 'cancelled' :
       statusRaw;
 
     let updated = null;
@@ -804,6 +805,107 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
+// Modifier un événement d'agenda (OWNER)
+app.patch('/calendar/events/:id', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+
+    const { start, end, title } = req.body || {};
+    if (start && !/^\d{4}-\d{2}-\d{2}$/.test(start)) return res.status(400).json({ error: 'bad start' });
+    if (end   && !/^\d{4}-\d{2}-\d{2}$/.test(end))   return res.status(400).json({ error: 'bad end' });
+
+    let updated = null;
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const idx = (t.calendar_events || []).findIndex(e => e.id === req.params.id);
+      if (idx === -1) throw new Error('Event not found');
+
+      const ev = { ...t.calendar_events[idx] };
+      if (start) ev.start = start;
+      if (end)   ev.end   = end;
+      if (title !== undefined) ev.title = title;
+
+      t.calendar_events[idx] = ev;
+
+      // (optionnel) garder le leave en phase si l'event est lié à un congé
+      if (ev.leave_id) {
+        const lidx = (t.leaves || []).findIndex(l => l.id === ev.leave_id);
+        if (lidx !== -1) {
+          const l = { ...t.leaves[lidx] };
+          if (start) l.start_date = start;
+          if (end)   l.end_date   = end;
+          t.leaves[lidx] = l;
+        }
+      }
+
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      updated = ev;
+      return true;
+    });
+
+    return res.json({ ok: true, event: updated });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Event not found'))  return res.status(404).json({ error: msg });
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// Supprimer un événement (OWNER) + annuler le congé lié si présent
+app.delete('/calendar/events/:id', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+
+    let removed = null;
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const idx = (t.calendar_events || []).findIndex(e => e.id === req.params.id);
+      if (idx === -1) throw new Error('Event not found');
+
+      const ev = t.calendar_events[idx];
+      // retire l'event
+      t.calendar_events.splice(idx, 1);
+      removed = ev;
+
+      // si lié à un congé → on l'annule
+      if (ev.leave_id) {
+        const lidx = (t.leaves || []).findIndex(l => l.id === ev.leave_id);
+        if (lidx !== -1) {
+          const l = { ...t.leaves[lidx] };
+          l.status = 'cancelled';
+          l.decided_by = req.user.sub;
+          l.decided_at = new Date().toISOString();
+          t.leaves[lidx] = l;
+        }
+      }
+
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      return true;
+    });
+
+    return res.json({ ok: true, removed });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Event not found'))  return res.status(404).json({ error: msg });
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
 
 
 /** ===== SETTINGS (réglages d’entreprise) ===== */
