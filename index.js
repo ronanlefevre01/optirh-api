@@ -99,6 +99,38 @@ async function withRegistryUpdate(mutator, maxRetry = 3) {
   }
 }
 
+/** ===== HELPERS AGENDA & PUSH ===== */
+
+// S'assure que les tableaux existent dans le tenant
+function ensureTenantDefaults(t) {
+  t.leaves = Array.isArray(t.leaves) ? t.leaves : [];
+  t.calendar_events = Array.isArray(t.calendar_events) ? t.calendar_events : [];
+  t.devices = Array.isArray(t.devices) ? t.devices : [];
+  return t;
+}
+
+// Envoi Expo Push (via node-fetch déjà importé)
+async function sendExpoPush(tokens = [], message = { title: '', body: '', data: {} }) {
+  if (!tokens || tokens.length === 0) return;
+  // batch par ~90 messages
+  const batchSize = 90;
+  for (let i = 0; i < tokens.length; i += batchSize) {
+    const chunk = tokens.slice(i, i + batchSize).map(to => ({
+      to, sound: 'default', ...message,
+    }));
+    try {
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(chunk),
+      });
+    } catch (e) {
+      console.warn('[push] send error', e?.message || e);
+    }
+  }
+}
+
+
 /** ===== HEALTH ===== */
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
@@ -489,6 +521,163 @@ app.patch("/leaves/:id", authRequired, async (req, res) => {
   } catch (e) {
     const msg = String(e.message || e);
     if (msg.includes("Leave not found")) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+/** ===== DEVICES (Expo push tokens) ===== */
+app.post('/devices/register', authRequired, async (req, res) => {
+  try {
+    const { pushToken, platform } = req.body || {};
+    if (!pushToken) return res.status(400).json({ error: 'pushToken required' });
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t = ensureTenantDefaults(next.tenants?.[code]);
+      // upsert (un seul enregistrement identique)
+      t.devices = t.devices.filter(d => !(Number(d.user_id) === Number(req.user.sub) && d.token === pushToken));
+      t.devices.push({
+        user_id: req.user.sub,
+        token: pushToken,
+        platform: platform || null,
+        updated_at: new Date().toISOString(),
+      });
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      return true;
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/** ===== LEAVES PENDING (manager) ===== */
+app.get('/leaves/pending', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    const reg = await loadRegistry();
+    const t = reg.tenants?.[req.user.company_code];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+    const pending = (t.leaves || []).filter(l => l.status === 'pending')
+      .sort((a,b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    res.json({ leaves: pending });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/** ===== CALENDAR (agenda partagé) ===== */
+app.get('/calendar/events', authRequired, async (req, res) => {
+  try {
+    const from = String(req.query.from || '0000-01-01');
+    const to   = String(req.query.to   || '9999-12-31');
+
+    const reg = await loadRegistry();
+    const t = reg.tenants?.[req.user.company_code];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+    const tt = ensureTenantDefaults(t);
+
+    // chevauchement avec [from, to]
+    const list = (tt.calendar_events || []).filter(e => !(e.end < from || e.start > to));
+    res.json({ events: list });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// OWNER approuve/refuse + crée l'événement + push
+app.patch('/leaves/:id', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    const id = String(req.params.id);
+
+    // compat : action ('approve'|'deny') OU status ('approved'|'denied')
+    const { action, status: statusRaw, manager_note } = req.body || {};
+    const normalized =
+      action === 'approve' ? 'approved' :
+      action === 'deny'    ? 'denied'  :
+      statusRaw;
+
+    if (!['approved','denied'].includes(normalized)) {
+      return res.status(400).json({ error: 'invalid action/status' });
+    }
+
+    let updated = null;
+    let createdEvent = null;
+    let employeeUserId = null;
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const idx = (t.leaves || []).findIndex(l => l.id === id);
+      if (idx === -1) throw new Error('Leave not found');
+
+      const l = { ...t.leaves[idx] };
+      l.status = normalized;
+      l.manager_note = manager_note || l.manager_note || null;
+      l.decided_by = req.user.sub;
+      l.decided_at = new Date().toISOString();
+      employeeUserId = l.user_id;
+
+      t.leaves[idx] = l;
+      updated = l;
+
+      // si approuvée → créer l’événement dans l’agenda partagé
+      if (normalized === 'approved') {
+        const label = `Congé ${ (l.requester?.first_name || '') + ' ' + (l.requester?.last_name || '') }`.trim();
+        const ev = {
+          id: crypto.randomUUID(),
+          title: label || 'Congé',
+          start: l.start_date, // "YYYY-MM-DD"
+          end:   l.end_date,
+          employee_id: l.user_id,
+          created_at: new Date().toISOString(),
+        };
+        t.calendar_events.push(ev);
+        createdEvent = ev;
+      }
+
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      return true;
+    });
+
+    // Notifier le salarié
+    try {
+      const reg = await loadRegistry();
+      const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
+      const tokens = (t.devices || [])
+        .filter(d => Number(d.user_id) === Number(employeeUserId))
+        .map(d => d.token);
+
+      if (tokens.length) {
+        await sendExpoPush(tokens, normalized === 'approved'
+          ? {
+              title: 'Congé approuvé ✅',
+              body: `Du ${updated.start_date} au ${updated.end_date}`,
+              data: { type: 'leave', status: 'approved', leaveId: updated.id },
+            }
+          : {
+              title: 'Congé refusé ❌',
+              body: manager_note ? `Note: ${manager_note}` : 'Votre demande a été refusée',
+              data: { type: 'leave', status: 'denied', leaveId: updated.id },
+            }
+        );
+      }
+    } catch (e) {
+      console.warn('[push] skipped:', e?.message || e);
+    }
+
+    return res.json({ ok: true, leave: updated, event: createdEvent || null });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Leave not found')) return res.status(404).json({ error: msg });
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
