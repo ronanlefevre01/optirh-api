@@ -1108,16 +1108,16 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     const fileId = createRes.data.id;
     const fileName = createRes.data.name || "document.pdf";
 
-    // 2) Rendre accessible par lien si activé
-    if (GDRIVE_PUBLIC) {
-      await drive.permissions.create({
-        fileId,
-        requestBody: { role: "reader", type: "anyone" },
-      });
-    }
+   // 2) Rendre accessible par lien (lecture publique par lien)
+await drive.permissions.create({
+  fileId,
+  requestBody: { role: "reader", type: "anyone" },
+  supportsAllDrives: true,
+});
 
-    const webViewLink = `https://drive.google.com/file/d/${fileId}/view`;
-    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+// Liens pratiques
+const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
+const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
     // 3) Enregistrer l’annonce
     let saved = null;
@@ -1257,7 +1257,7 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
   }
 });
 
-// 2/ Confirmer après upload complet et créer l’annonce
+// 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
 app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
@@ -1268,21 +1268,31 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'fileId & title required' });
     }
 
-    // Rendre le fichier accessible (optionnel : public link)
-    if (GDRIVE_PUBLIC) {
-      await drive.permissions.create({
-        fileId,
-        requestBody: { role: 'reader', type: 'anyone' },
-      });
+    // Rendre le fichier accessible par lien (si activé)
+    try {
+      if (GDRIVE_PUBLIC) {
+        await drive.permissions.create({
+          fileId,
+          requestBody: { role: 'reader', type: 'anyone' },
+          supportsAllDrives: true,
+        });
+      }
+    } catch (e) {
+      // Ne bloque pas l'opération, mais log l'info (utile si la politique Workspace interdit "anyone")
+      console.warn('[Drive perms] set public failed:', e?.message || e);
     }
 
-    // Récupérer le lien web
+    // Métadonnées + liens
     const meta = await drive.files.get({
       fileId,
       fields: 'id,name,webViewLink,webContentLink',
+      supportsAllDrives: true,
     });
 
+    // Lien affichable + lien direct téléchargement
     const url = meta.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
+    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+    const fileName = meta.data.name || 'document.pdf';
 
     let created = null;
     await withRegistryUpdate((next) => {
@@ -1297,11 +1307,19 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
         type: 'pdf',
         title: String(title).trim(),
         body: null,
-        url,
-        drive_file_id: fileId, // utile si tu veux plus tard supprimer aussi sur Drive
+        url,                 // lien d'affichage (web)
+        drive_file_id: fileId,
+        file: {              // infos utiles pour l'app et pour une éventuelle suppression
+          driveFileId: fileId,
+          name: fileName,
+          mime: 'application/pdf',
+          webViewLink: url,
+          downloadUrl,
+        },
         created_at: now,
         created_by: req.user.sub,
       };
+
       t.announcements.unshift(ann);
       t.updated_at = now;
       next.tenants[code] = t;
@@ -1309,7 +1327,7 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
       return true;
     });
 
-    // push (optionnel)
+    // Push (optionnel)
     try {
       const reg = await loadRegistry();
       const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
@@ -1321,11 +1339,13 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
           data: { type: 'announcement' },
         });
       }
-    } catch {}
+    } catch (e) {
+      console.warn('[push] announcement skipped', e?.message || e);
+    }
 
-    res.status(201).json({ ok: true, announcement: created });
+    return res.status(201).json({ ok: true, announcement: created });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
