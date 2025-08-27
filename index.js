@@ -1248,17 +1248,25 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'fileName, mimeType, fileSize required' });
     }
 
-    // petit nettoyage du nom
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
+    // IMPORTANT : supportsAllDrives si dossier dans un Drive partagé
     const resp = await drive.files.create(
       {
-        requestBody: { name: safeName, parents: [GDRIVE_FOLDER_ID], mimeType },
-        media: undefined,
+        requestBody: {
+          name: safeName,
+          parents: [GDRIVE_FOLDER_ID],
+          mimeType,
+        },
+        // media sans body — on ouvre juste la session
+        media: { mimeType },
         fields: 'id',
+        supportsAllDrives: true,
       },
       {
+        // Gaxios options
         params: { uploadType: 'resumable' },
+        // (facultatif) les 2 headers aident Drive pour pré-allouer
         headers: {
           'X-Upload-Content-Type': mimeType,
           'X-Upload-Content-Length': String(fileSize),
@@ -1266,14 +1274,38 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
       }
     );
 
-    const fileId = resp.data.id;
-    const uploadUrl = resp.headers.location;
-    if (!fileId || !uploadUrl) return res.status(500).json({ error: 'Failed to create resumable session' });
-    res.json({ fileId, uploadUrl });
+    const fileId = resp.data?.id;
+    const uploadUrl = resp.headers?.location || resp.headers?.Location;
+
+    if (!fileId || !uploadUrl) {
+      // Log détaillé pour comprendre pourquoi
+      console.error('[Drive resumable] missing header/location', {
+        status: resp.status,
+        headers: resp.headers,
+        data: resp.data,
+      });
+      return res.status(500).json({
+        error: 'Failed to create resumable session (no Location header). ' +
+               'Vérifie le partage du dossier et supportsAllDrives.',
+      });
+    }
+
+    return res.json({ fileId, uploadUrl });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    // Log enrichi (erreurs Drive précises)
+    const status = e?.response?.status;
+    const data = e?.response?.data;
+    console.error('[Drive resumable] error', status, data || e);
+    if (status === 404) {
+      return res.status(404).json({ error: 'Folder not found. Le dossier n’est pas accessible par le compte de service ?' });
+    }
+    if (status === 403) {
+      return res.status(403).json({ error: 'Insufficient permissions. Partage le dossier avec le compte de service.' });
+    }
+    return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
+
 
 // 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
 app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
