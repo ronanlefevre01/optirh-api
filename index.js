@@ -78,10 +78,6 @@ function ensureDrive() {
   return drive;
 }
 
-function getDriveClient() {
-  // utilise le même client partout
-  return ensureDrive();
-}
 
 function requireDrive(res) {
   try {
