@@ -59,7 +59,6 @@ function getServiceAccountJSON() {
   if (!raw) throw new Error('Missing GDRIVE_SA_JSON or GDRIVE_SA_BASE64');
 
   const json = JSON.parse(raw);
-  // normalise la clé privée si elle arrive avec des "\\n"
   if (json.private_key && json.private_key.includes('\\n')) {
     json.private_key = json.private_key.replace(/\\n/g, '\n');
   }
@@ -67,23 +66,30 @@ function getServiceAccountJSON() {
 }
 
 let drive = null;
-function ensureDrive() {
-  if (drive) return drive;
-  const saCreds = getServiceAccountJSON();
-  const auth = new google.auth.GoogleAuth({
-    credentials: saCreds,
-    scopes: ['https://www.googleapis.com/auth/drive'],
-  });
-  drive = google.drive({ version: 'v3', auth });
-  return drive;
-}
+let driveAuth = null; // 👈 on garde le client d’auth pour faire driveAuth.request(...)
 
+function ensureDrive() {
+  if (drive && driveAuth) return { drive, driveAuth };
+
+  const sa = getServiceAccountJSON();
+  // JWT = client de service qui sait signer et faire des requêtes OAuth2
+  const jwt = new google.auth.JWT(
+    sa.client_email,
+    null,
+    sa.private_key,
+    ['https://www.googleapis.com/auth/drive'] // scope complet
+  );
+
+  driveAuth = jwt;                        // 👈 pour les requêtes manuelles (resumable init)
+  drive = google.drive({ version: 'v3', auth: jwt }); // client “drive.*”
+  return { drive, driveAuth };
+}
 
 function requireDrive(res) {
   try {
-    ensureDrive();
-    if (!GDRIVE_FOLDER_ID) {
-      res.status(500).json({ error: 'Drive not configured (GDRIVE_FOLDER_ID)' });
+    const { drive: d, driveAuth: a } = ensureDrive();
+    if (!d || !a || !GDRIVE_FOLDER_ID) {
+      res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64 or GDRIVE_FOLDER_ID)' });
       return false;
     }
     return true;
@@ -92,6 +98,7 @@ function requireDrive(res) {
     return false;
   }
 }
+
 
 /** ===== UTILS ===== */
 const sign = (payload) =>
@@ -1250,58 +1257,41 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    // IMPORTANT : supportsAllDrives si dossier dans un Drive partagé
-    const resp = await drive.files.create(
-      {
-        requestBody: {
-          name: safeName,
-          parents: [GDRIVE_FOLDER_ID],
-          mimeType,
-        },
-        // media sans body — on ouvre juste la session
-        media: { mimeType },
-        fields: 'id',
-        supportsAllDrives: true,
+    // Initialisation de session RESUMABLE (oblige Drive à renvoyer Location)
+    const resp = await driveAuth.request({
+      url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': mimeType,
+        'X-Upload-Content-Length': String(fileSize),
       },
-      {
-        // Gaxios options
-        params: { uploadType: 'resumable' },
-        // (facultatif) les 2 headers aident Drive pour pré-allouer
-        headers: {
-          'X-Upload-Content-Type': mimeType,
-          'X-Upload-Content-Length': String(fileSize),
-        },
-      }
-    );
+      data: {
+        name: safeName,
+        parents: [GDRIVE_FOLDER_ID],
+        mimeType,
+      },
+    });
 
-    const fileId = resp.data?.id;
     const uploadUrl = resp.headers?.location || resp.headers?.Location;
+    const fileId = resp.data?.id || null;
 
-    if (!fileId || !uploadUrl) {
-      // Log détaillé pour comprendre pourquoi
-      console.error('[Drive resumable] missing header/location', {
-        status: resp.status,
-        headers: resp.headers,
-        data: resp.data,
+    if (!uploadUrl) {
+      console.error('[Drive resumable] missing Location header', {
+        status: resp.status, headers: resp.headers, data: resp.data
       });
       return res.status(500).json({
-        error: 'Failed to create resumable session (no Location header). ' +
-               'Vérifie le partage du dossier et supportsAllDrives.',
+        error: 'Failed to create resumable session (no Location). Vérifie le partage du dossier et supportsAllDrives.'
       });
     }
 
-    return res.json({ fileId, uploadUrl });
+    res.json({ fileId, uploadUrl });
   } catch (e) {
-    // Log enrichi (erreurs Drive précises)
     const status = e?.response?.status;
     const data = e?.response?.data;
     console.error('[Drive resumable] error', status, data || e);
-    if (status === 404) {
-      return res.status(404).json({ error: 'Folder not found. Le dossier n’est pas accessible par le compte de service ?' });
-    }
-    if (status === 403) {
-      return res.status(403).json({ error: 'Insufficient permissions. Partage le dossier avec le compte de service.' });
-    }
+    if (status === 403) return res.status(403).json({ error: 'Insufficient permissions (partage du dossier ?)' });
+    if (status === 404) return res.status(404).json({ error: 'Folder not found' });
     return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
