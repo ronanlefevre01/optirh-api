@@ -53,80 +53,57 @@ const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
 const GDRIVE_PUBLIC    = (process.env.GDRIVE_PUBLIC || 'true') === 'true';
 
 function getServiceAccountJSON() {
-  // ✅ On privilégie la version base64 (pas de problèmes de \n)
-  const b64 = (process.env.GDRIVE_SA_BASE64 || '').trim();
-  let raw = (process.env.GDRIVE_SA_JSON || '').trim();
-
-  if (!raw && b64) {
-    try {
-      raw = Buffer.from(b64, 'base64').toString('utf8');
-    } catch (e) {
-      throw new Error('Invalid GDRIVE_SA_BASE64 (base64 decode failed)');
-    }
-  }
+  let raw = process.env.GDRIVE_SA_JSON || '';
+  const b64 = process.env.GDRIVE_SA_BASE64 || '';
+  if (!raw && b64) raw = Buffer.from(b64, 'base64').toString('utf8');
   if (!raw) throw new Error('Missing GDRIVE_SA_JSON or GDRIVE_SA_BASE64');
 
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch (e) {
-    throw new Error('Invalid GDRIVE_SA_JSON (JSON.parse failed)');
-  }
-
-  // normalise la clé privée si arrivée avec "\\n"
-  if (json.private_key && typeof json.private_key === 'string') {
-    if (json.private_key.includes('\\n')) {
-      json.private_key = json.private_key.replace(/\\n/g, '\n');
-    }
-  }
-
-  if (!json.client_email || !json.private_key) {
-    throw new Error('Service account JSON missing client_email or private_key');
+  const json = JSON.parse(raw);
+  // Si la clé arrive avec \\n littéraux (copier/coller), on normalise.
+  if (json.private_key && json.private_key.includes('\\n')) {
+    json.private_key = json.private_key.replace(/\\n/g, '\n');
   }
   return json;
 }
 
-let drive = null;
-let driveAuth = null;
+let drive = null;      // client google.drive
+let driveAuth = null;  // client JWT pour .request()
 
 function ensureDrive() {
   if (drive && driveAuth) return { drive, driveAuth };
-
   const sa = getServiceAccountJSON();
+
+  // LOG SANITISÉ (ne montre pas la clé) — garde-le le temps du debug
+  console.log('[Drive] SA email=', sa.client_email, ' keyLen=', (sa.private_key || '').length, ' folderIdSet=', !!GDRIVE_FOLDER_ID);
+
+  // ⬇️ si sa.private_key est vide ici, c’est *le* problème (env).
   const jwt = new google.auth.JWT(
     sa.client_email,
     null,
     sa.private_key,
-    ['https://www.googleapis.com/auth/drive']
+    ['https://www.googleapis.com/auth/drive'] // scope complet
   );
 
   driveAuth = jwt;
   drive = google.drive({ version: 'v3', auth: jwt });
-
-  // 🔎 petit log safe pour diagnostic (pas de secrets)
-  console.log('[Drive] SA loaded:', {
-    email: sa.client_email,
-    keyLen: sa.private_key ? sa.private_key.length : 0,
-    folderIdSet: !!GDRIVE_FOLDER_ID,
-  });
-
   return { drive, driveAuth };
 }
 
 function requireDrive(res) {
   try {
-    const { drive: d, driveAuth: a } = ensureDrive();
-    if (!d || !a || !GDRIVE_FOLDER_ID) {
-      res.status(500).json({ error: 'Drive not configured (GDRIVE_* envs missing)' });
+    const ok = ensureDrive();
+    if (!ok || !GDRIVE_FOLDER_ID) {
+      res.status(500).json({ error: 'Drive not configured (service account or GDRIVE_FOLDER_ID)' });
       return false;
     }
     return true;
   } catch (e) {
-    console.error('[Drive] init error:', e?.message || e);
-    res.status(500).json({ error: 'Drive not configured: ' + (e?.message || e) });
+    console.error('[Drive] ensure failed:', e?.message || e);
+    res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64)' });
     return false;
   }
 }
+
 
 
 
@@ -1275,6 +1252,7 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
     if (!requireDrive(res)) return;
 
+    const { driveAuth } = ensureDrive();
     const { fileName, mimeType, fileSize } = req.body || {};
     if (!fileName || !mimeType || typeof fileSize !== 'number') {
       return res.status(400).json({ error: 'fileName, mimeType, fileSize required' });
@@ -1282,68 +1260,51 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    // ✅ 1) s’assurer d’avoir un access token frais
-    const { driveAuth } = ensureDrive();
-    await driveAuth.authorize();                           // important
-    const tokenObj = await driveAuth.getAccessToken();     // {token: 'ya29...'} OU 'ya29...'
-    const accessToken = typeof tokenObj === 'string' ? tokenObj : tokenObj?.token;
+    const resp = await driveAuth.request({
+      url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': mimeType,
+        'X-Upload-Content-Length': String(fileSize),
+      },
+      data: { name: safeName, parents: [GDRIVE_FOLDER_ID], mimeType },
+    });
 
-    if (!accessToken) {
-      return res.status(500).json({ error: 'Failed to obtain Google access token' });
-    }
-
-    // ✅ 2) créer la session resumable “à la main” avec l’en-tête Authorization explicite
-    const initResp = await fetch(
-      'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json; charset=UTF-8',
-          'X-Upload-Content-Type': mimeType,
-          'X-Upload-Content-Length': String(fileSize),
-        },
-        body: JSON.stringify({
-          name: safeName,
-          parents: [GDRIVE_FOLDER_ID],
-          mimeType,
-        }),
-      }
-    );
-
-    if (!initResp.ok) {
-      const errBody = await initResp.text().catch(() => '');
-      console.error('[Drive resumable] init failed', initResp.status, errBody);
-      if (initResp.status === 403) return res.status(403).json({ error: 'Insufficient permissions (folder share?)' });
-      if (initResp.status === 404) return res.status(404).json({ error: 'Folder not found' });
-      return res.status(500).json({ error: 'Failed to create resumable session' });
-    }
-
-    const uploadUrl = initResp.headers.get('location') || initResp.headers.get('Location');
-    let fileId = null;
-    try {
-      const data = await initResp.json();
-      fileId = data?.id || null;
-    } catch { /* certaines réponses n’ont pas de JSON */ }
+    const uploadUrl = resp.headers?.location || resp.headers?.Location;
+    const fileId = resp.data?.id || null;
 
     if (!uploadUrl) {
       console.error('[Drive resumable] missing Location header', {
-        status: initResp.status,
-        headers: Object.fromEntries(initResp.headers.entries())
+        status: resp.status, headers: resp.headers, data: resp.data
       });
-      return res.status(500).json({ error: 'Resumable init succeeded but no Location header returned' });
+      return res.status(500).json({ error: 'Failed to create resumable session (no Location header)' });
     }
-
-    return res.json({ fileId, uploadUrl });
+    res.json({ fileId, uploadUrl });
   } catch (e) {
     const status = e?.response?.status;
-    const data = e?.response?.data;
-    console.error('[Drive resumable] error', status || '', data || e);
-    if (status === 403) return res.status(403).json({ error: 'Insufficient permissions (folder share?)' });
+    console.error('[Drive resumable] error', status, e?.response?.data || e);
+    if (status === 401) return res.status(401).json({ error: 'UNAUTHENTICATED (clé service account manquante)'}); // ← cas actuel
+    if (status === 403) return res.status(403).json({ error: 'Insufficient permissions (partage du dossier ?)'}); 
     if (status === 404) return res.status(404).json({ error: 'Folder not found' });
     return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
+
+app.get('/_debug/drive', (req, res) => {
+  try {
+    const sa = getServiceAccountJSON();
+    res.json({
+      ok: true,
+      client_email: sa.client_email,
+      keyLen: (sa.private_key || '').length,
+      folderIdSet: !!GDRIVE_FOLDER_ID,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 
 
 
