@@ -47,32 +47,54 @@ const JWT_SECRET = process.env.JWT_SECRET;
 ["JSONBIN_API_URL","JSONBIN_MASTER_KEY","JSONBIN_OPTIRH_BIN_ID","APP_SIGNING_SECRET","JWT_SECRET"]
   .forEach(k => { if (!process.env[k]) console.warn(`[warn] Missing env ${k}`); });
 
+
 // --- Google Drive (compte de service) ---
-const GDRIVE_SA_JSON = process.env.GDRIVE_SA_JSON; // contenu JSON de la clé du compte de service
-const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID; // dossier cible partagé avec le compte de service
-const GDRIVE_PUBLIC = (process.env.GDRIVE_PUBLIC || 'true') === 'true'; // donner un lien public “anyone with the link”
+const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;       // ID du dossier Drive
+const GDRIVE_PUBLIC    = (process.env.GDRIVE_PUBLIC || 'true') === 'true'; // lien public ?
+
+function getServiceAccountJSON() {
+  let raw = process.env.GDRIVE_SA_JSON || '';
+  const b64 = process.env.GDRIVE_SA_BASE64 || '';
+  if (!raw && b64) raw = Buffer.from(b64, 'base64').toString('utf8');
+  if (!raw) throw new Error('Missing GDRIVE_SA_JSON or GDRIVE_SA_BASE64');
+
+  const json = JSON.parse(raw);
+  // normalise la clé privée si elle arrive avec des "\\n"
+  if (json.private_key && json.private_key.includes('\\n')) {
+    json.private_key = json.private_key.replace(/\\n/g, '\n');
+  }
+  return json;
+}
 
 let drive = null;
-if (GDRIVE_SA_JSON && GDRIVE_FOLDER_ID) {
-  try {
-    const creds = JSON.parse(GDRIVE_SA_JSON);
-    const auth = new google.auth.JWT(
-      creds.client_email,
-      null,
-      creds.private_key,
-      ['https://www.googleapis.com/auth/drive'] // permet aussi de créer des permissions
-    );
-    drive = google.drive({ version: 'v3', auth });
-  } catch (e) {
-    console.warn('[GDrive] init error:', e?.message || e);
-  }
+function ensureDrive() {
+  if (drive) return drive;
+  const saCreds = getServiceAccountJSON();
+  const auth = new google.auth.GoogleAuth({
+    credentials: saCreds,
+    scopes: ['https://www.googleapis.com/auth/drive'],
+  });
+  drive = google.drive({ version: 'v3', auth });
+  return drive;
 }
+
+function getDriveClient() {
+  // utilise le même client partout
+  return ensureDrive();
+}
+
 function requireDrive(res) {
-  if (!drive || !GDRIVE_FOLDER_ID) {
-    res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON / GDRIVE_FOLDER_ID)' });
+  try {
+    ensureDrive();
+    if (!GDRIVE_FOLDER_ID) {
+      res.status(500).json({ error: 'Drive not configured (GDRIVE_FOLDER_ID)' });
+      return false;
+    }
+    return true;
+  } catch (e) {
+    res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64)' });
     return false;
   }
-  return true;
 }
 
 /** ===== UTILS ===== */
