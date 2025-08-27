@@ -1291,19 +1291,23 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
   }
 });
 
-app.get('/_debug/drive', (req, res) => {
+// >>> DEBUG DRIVE – A ENLEVER APRÈS VERIF
+app.get('/__drive/debug', (req, res) => {
   try {
-    const sa = getServiceAccountJSON();
+    const sa = getServiceAccountJSON();      // lit GDRIVE_SA_JSON ou GDRIVE_SA_BASE64
+    ensureDrive();
     res.json({
       ok: true,
-      client_email: sa.client_email,
-      keyLen: (sa.private_key || '').length,
-      folderIdSet: !!GDRIVE_FOLDER_ID,
+      client_email: sa.client_email || null,
+      keyLen: sa.private_key ? sa.private_key.length : 0,
+      folderIdSet: !!GDRIVE_FOLDER_ID
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+
+
 
 
 
