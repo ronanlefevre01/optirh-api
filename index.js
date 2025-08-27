@@ -1113,17 +1113,19 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     const title = String(req.body?.title || "Document");
     const published_at = String(req.body?.published_at || new Date().toISOString());
 
-    // 1) Upload vers Drive (CLIENT GLOBAL)
-    // 1) Upload vers Drive
+    // 1) Upload vers Drive (IMPORTANT: supportsAllDrives)
 const createRes = await drive.files.create({
+  supportsAllDrives: true,                          
   requestBody: {
     name: req.file.originalname || `doc_${Date.now()}.pdf`,
     parents: [GDRIVE_FOLDER_ID],
     mimeType: "application/pdf",
   },
-  media: { mimeType: "application/pdf", body: bufferToStream(req.file.buffer) },
+  media: {
+    mimeType: "application/pdf",
+    body: bufferToStream(req.file.buffer),
+  },
   fields: "id,name",
-  supportsAllDrives: true,
 });
 
 const fileId = createRes.data.id;
@@ -1135,14 +1137,14 @@ try {
     await drive.permissions.create({
       fileId,
       requestBody: { role: "reader", type: "anyone" },
-      supportsAllDrives: true,
+      supportsAllDrives: true,                       // 👈 garde-le aussi ici
     });
   }
 } catch (e) {
   console.warn("[Drive perms] lien public non appliqué :", e?.message || e);
 }
 
-// Liens (même si on n’a pas pu mettre la permission publique)
+// Liens
 const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
 const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
@@ -1199,9 +1201,9 @@ const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
     return res.status(201).json({ ok: true, announcement: saved });
   } catch (e) {
-    console.error("[announcements/upload] error:", e?.message || e);
-    return res.status(500).json({ error: "Upload Google Drive impossible" });
-  }
+  console.error("[announcements/upload] drive error:", e?.code, e?.message, e?.errors || e?.response?.data || e);
+  return res.status(500).json({ error: "Upload Google Drive impossible" });
+}
 });
 
 
