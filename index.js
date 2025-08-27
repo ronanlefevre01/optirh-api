@@ -107,6 +107,7 @@ function ensureTenantDefaults(t) {
   obj.leaves = Array.isArray(obj.leaves) ? obj.leaves : [];
   obj.calendar_events = Array.isArray(obj.calendar_events) ? obj.calendar_events : [];
   obj.devices = Array.isArray(obj.devices) ? obj.devices : [];
+  obj.announcements = Array.isArray(obj.announcements) ? obj.announcements : []; // 👈 NEW
 
   // Réglages d'entreprise (par défaut : jours ouvrés)
   obj.settings = obj.settings || {};
@@ -116,6 +117,7 @@ function ensureTenantDefaults(t) {
 
   return obj;
 }
+
 
 // Chevauchement de périodes "YYYY-MM-DD"
 const overlaps = (aStart, aEnd, bStart, bEnd) => !(aEnd < bStart || aStart > bEnd);
@@ -905,6 +907,151 @@ app.delete('/calendar/events/:id', authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
+/** ===== ANNOUNCEMENTS (panneau d’affichage) ===== */
+
+// Lister (OWNER & EMPLOYEE)
+app.get('/announcements', authRequired, async (req, res) => {
+  try {
+    const reg = await loadRegistry();
+    const t0 = reg.tenants?.[req.user.company_code];
+    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
+    const t = ensureTenantDefaults(t0);
+
+    const list = [...(t.announcements || [])].sort(
+      (a,b) => (b.created_at || '').localeCompare(a.created_at || '')
+    );
+    res.json({ announcements: list });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Créer (OWNER)
+app.post('/announcements', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+
+    const { type, title, body, url } = req.body || {};
+    if (!['message','pdf'].includes(type)) return res.status(400).json({ error: 'type must be message|pdf' });
+    if (!title || typeof title !== 'string' || !title.trim()) return res.status(400).json({ error: 'title required' });
+    if (type === 'message' && (!body || !String(body).trim())) return res.status(400).json({ error: 'body required for message' });
+    if (type === 'pdf' && (!url || !/^https?:\/\//i.test(url))) return res.status(400).json({ error: 'valid url required for pdf' });
+
+    let created = null;
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const now = new Date().toISOString();
+      const ann = {
+        id: crypto.randomUUID(),
+        type,
+        title: String(title).trim(),
+        body: type === 'message' ? String(body).trim() : null,
+        url : type === 'pdf' ? String(url).trim() : null,
+        created_at: now,
+        created_by: req.user.sub,
+      };
+      t.announcements.push(ann);
+      t.updated_at = now;
+      next.tenants[code] = t;
+      created = ann;
+      return true;
+    });
+
+    // push à tous les devices de la société
+    try {
+      const reg = await loadRegistry();
+      const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
+      const tokens = (t.devices || []).map(d => d.token);
+      if (tokens.length) {
+        await sendExpoPush(tokens, {
+          title: 'Nouvelle annonce 📢',
+          body: String(title).slice(0, 120),
+          data: { type: 'announcement' },
+        });
+      }
+    } catch (e) {
+      console.warn('[push] announcement skipped', e?.message || e);
+    }
+
+    res.status(201).json({ ok: true, announcement: created });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Supprimer (OWNER)
+app.delete('/announcements/:id', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    const id = String(req.params.id);
+
+    let removed = false;
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const before = t.announcements.length;
+      t.announcements = t.announcements.filter(a => a.id !== id);
+      removed = t.announcements.length < before;
+      if (removed) {
+        t.updated_at = new Date().toISOString();
+        next.tenants[code] = t;
+        return true;
+      }
+      return false;
+    });
+
+    if (!removed) return res.status(404).json({ error: 'Announcement not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Éditer (OWNER) – optionnel
+app.patch('/announcements/:id', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    const id = String(req.params.id);
+    const { title, body, url } = req.body || {};
+    let updated = null;
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const idx = t.announcements.findIndex(a => a.id === id);
+      if (idx === -1) throw new Error('Announcement not found');
+
+      const a = { ...t.announcements[idx] };
+      if (title !== undefined) a.title = String(title).trim();
+      if (a.type === 'message' && body !== undefined) a.body = String(body).trim();
+      if (a.type === 'pdf' && url  !== undefined) a.url  = String(url).trim();
+
+      t.announcements[idx] = a;
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      updated = a;
+      return true;
+    });
+
+    res.json({ ok: true, announcement: updated });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Announcement not found')) return res.status(404).json({ error: msg });
+    res.status(500).json({ error: msg });
+  }
+});
+
 
 
 
