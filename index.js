@@ -6,6 +6,10 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import multer from "multer";
+import { google } from "googleapis";
+import { Readable } from "stream";
+
 
 const app = express();
 
@@ -42,6 +46,34 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 ["JSONBIN_API_URL","JSONBIN_MASTER_KEY","JSONBIN_OPTIRH_BIN_ID","APP_SIGNING_SECRET","JWT_SECRET"]
   .forEach(k => { if (!process.env[k]) console.warn(`[warn] Missing env ${k}`); });
+
+// --- Google Drive (compte de service) ---
+const GDRIVE_SA_JSON = process.env.GDRIVE_SA_JSON; // contenu JSON de la clé du compte de service
+const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID; // dossier cible partagé avec le compte de service
+const GDRIVE_PUBLIC = (process.env.GDRIVE_PUBLIC || 'true') === 'true'; // donner un lien public “anyone with the link”
+
+let drive = null;
+if (GDRIVE_SA_JSON && GDRIVE_FOLDER_ID) {
+  try {
+    const creds = JSON.parse(GDRIVE_SA_JSON);
+    const auth = new google.auth.JWT(
+      creds.client_email,
+      null,
+      creds.private_key,
+      ['https://www.googleapis.com/auth/drive'] // permet aussi de créer des permissions
+    );
+    drive = google.drive({ version: 'v3', auth });
+  } catch (e) {
+    console.warn('[GDrive] init error:', e?.message || e);
+  }
+}
+function requireDrive(res) {
+  if (!drive || !GDRIVE_FOLDER_ID) {
+    res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON / GDRIVE_FOLDER_ID)' });
+    return false;
+  }
+  return true;
+}
 
 /** ===== UTILS ===== */
 const sign = (payload) =>
@@ -162,6 +194,31 @@ async function sendExpoPush(tokens = [], message = { title: '', body: '', data: 
     }
   }
 }
+
+// Upload mémoire (25 Mo max par PDF)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
+
+function bufferToStream(buffer) {
+  const stream = new Readable();
+  stream.push(buffer);
+  stream.push(null);
+  return stream;
+}
+
+function getDriveClient() {
+  const raw = process.env.GDRIVE_SA_JSON;
+  if (!raw) throw new Error("Missing GDRIVE_SA_JSON");
+  const creds = JSON.parse(raw);
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ["https://www.googleapis.com/auth/drive"],
+  });
+  return google.drive({ version: "v3", auth });
+}
+
 
 /** ===== HEALTH ===== */
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
@@ -743,7 +800,6 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
           start: l.start_date, // YYYY-MM-DD
           end:   l.end_date,
           employee_id: l.user_id,
-          leave_id: l.id,
           created_at: new Date().toISOString(),
         };
         t.calendar_events.push(ev);
@@ -984,36 +1040,7 @@ app.post('/announcements', authRequired, async (req, res) => {
   }
 });
 
-// Supprimer (OWNER)
-app.delete('/announcements/:id', authRequired, async (req, res) => {
-  try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
-    const id = String(req.params.id);
 
-    let removed = false;
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
-
-      const before = t.announcements.length;
-      t.announcements = t.announcements.filter(a => a.id !== id);
-      removed = t.announcements.length < before;
-      if (removed) {
-        t.updated_at = new Date().toISOString();
-        next.tenants[code] = t;
-        return true;
-      }
-      return false;
-    });
-
-    if (!removed) return res.status(404).json({ error: 'Announcement not found' });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
 
 // Éditer (OWNER) – optionnel
 app.patch('/announcements/:id', authRequired, async (req, res) => {
@@ -1052,6 +1079,255 @@ app.patch('/announcements/:id', authRequired, async (req, res) => {
   }
 });
 
+// POST /announcements/upload
+// FormData: title (string), published_at? (ISO), pdf (file: application/pdf)
+app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req, res) => {
+  try {
+    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
+    if (!req.file) return res.status(400).json({ error: "PDF manquant" });
+    if (req.file.mimetype !== "application/pdf") return res.status(400).json({ error: "Seuls les PDF sont acceptés" });
+    if (!requireDrive(res)) return;
+
+    const title = String(req.body?.title || "Document");
+    const published_at = String(req.body?.published_at || new Date().toISOString());
+
+    // 1) Upload vers Drive (CLIENT GLOBAL)
+    const createRes = await drive.files.create({
+      requestBody: {
+        name: req.file.originalname || `doc_${Date.now()}.pdf`,
+        parents: [GDRIVE_FOLDER_ID],
+        mimeType: "application/pdf",
+      },
+      media: {
+        mimeType: "application/pdf",
+        body: bufferToStream(req.file.buffer),
+      },
+      fields: "id, name",
+    });
+
+    const fileId = createRes.data.id;
+    const fileName = createRes.data.name || "document.pdf";
+
+    // 2) Rendre accessible par lien si activé
+    if (GDRIVE_PUBLIC) {
+      await drive.permissions.create({
+        fileId,
+        requestBody: { role: "reader", type: "anyone" },
+      });
+    }
+
+    const webViewLink = `https://drive.google.com/file/d/${fileId}/view`;
+    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+
+    // 3) Enregistrer l’annonce
+    let saved = null;
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error("Tenant not found");
+      const t = ensureTenantDefaults(t0);
+
+      const now = new Date().toISOString();
+      const ann = {
+        id: crypto.randomUUID(),
+        type: "pdf",
+        title: title.trim(),
+        url: webViewLink, // compat côté app
+        file: {
+          driveFileId: fileId,
+          name: fileName,
+          size: req.file.size || null,
+          mime: "application/pdf",
+          webViewLink,
+          downloadUrl,
+        },
+        published_at,
+        created_at: now,
+        created_by: req.user.sub,
+      };
+
+      t.announcements.unshift(ann);
+      t.updated_at = now;
+      next.tenants[code] = t;
+      saved = ann;
+      return true;
+    });
+
+    // Push optionnel
+    try {
+      const reg = await loadRegistry();
+      const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
+      const tokens = (t.devices || []).map(d => d.token);
+      if (tokens.length) {
+        await sendExpoPush(tokens, {
+          title: "Nouvelle annonce 📢",
+          body: title.slice(0, 120),
+          data: { type: "announcement" },
+        });
+      }
+    } catch (e) {
+      console.warn("[push] announcement skipped", e?.message || e);
+    }
+
+    return res.status(201).json({ ok: true, announcement: saved });
+  } catch (e) {
+    console.error("[announcements/upload] error:", e?.message || e);
+    return res.status(500).json({ error: "Upload Google Drive impossible" });
+  }
+});
+
+
+// Supprimer (OWNER) + effacer dans Drive si l’annonce vient de l’upload
+app.delete('/announcements/:id', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    const id = String(req.params.id);
+
+    let removed = null;
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const idx = (t.announcements || []).findIndex(a => a.id === id);
+      if (idx === -1) throw new Error('Announcement not found');
+
+      removed = t.announcements[idx];
+      t.announcements.splice(idx, 1);
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      return true;
+    });
+
+    // Efface le fichier Drive si on a un driveFileId
+    try {
+      if (removed?.type === 'pdf' && removed?.file?.driveFileId) {
+        const drive = getDriveClient();
+        await drive.files.delete({ fileId: removed.file.driveFileId });
+      }
+    } catch (e) {
+      console.warn('[Drive delete] skip:', e?.message || e);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Announcement not found')) return res.status(404).json({ error: msg });
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// 1/ Démarrer une session d’upload Drive (resumable) et retourner l'uploadUrl
+app.post('/announcements/upload-url', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!requireDrive(res)) return;
+
+    const { fileName, mimeType, fileSize } = req.body || {};
+    if (!fileName || !mimeType || typeof fileSize !== 'number') {
+      return res.status(400).json({ error: 'fileName, mimeType, fileSize required' });
+    }
+
+    // petit nettoyage du nom
+    const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
+
+    const resp = await drive.files.create(
+      {
+        requestBody: { name: safeName, parents: [GDRIVE_FOLDER_ID], mimeType },
+        media: undefined,
+        fields: 'id',
+      },
+      {
+        params: { uploadType: 'resumable' },
+        headers: {
+          'X-Upload-Content-Type': mimeType,
+          'X-Upload-Content-Length': String(fileSize),
+        },
+      }
+    );
+
+    const fileId = resp.data.id;
+    const uploadUrl = resp.headers.location;
+    if (!fileId || !uploadUrl) return res.status(500).json({ error: 'Failed to create resumable session' });
+    res.json({ fileId, uploadUrl });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// 2/ Confirmer après upload complet et créer l’annonce
+app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!requireDrive(res)) return;
+
+    const { fileId, title } = req.body || {};
+    if (!fileId || !title || !String(title).trim()) {
+      return res.status(400).json({ error: 'fileId & title required' });
+    }
+
+    // Rendre le fichier accessible (optionnel : public link)
+    if (GDRIVE_PUBLIC) {
+      await drive.permissions.create({
+        fileId,
+        requestBody: { role: 'reader', type: 'anyone' },
+      });
+    }
+
+    // Récupérer le lien web
+    const meta = await drive.files.get({
+      fileId,
+      fields: 'id,name,webViewLink,webContentLink',
+    });
+
+    const url = meta.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
+
+    let created = null;
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const now = new Date().toISOString();
+      const ann = {
+        id: crypto.randomUUID(),
+        type: 'pdf',
+        title: String(title).trim(),
+        body: null,
+        url,
+        drive_file_id: fileId, // utile si tu veux plus tard supprimer aussi sur Drive
+        created_at: now,
+        created_by: req.user.sub,
+      };
+      t.announcements.unshift(ann);
+      t.updated_at = now;
+      next.tenants[code] = t;
+      created = ann;
+      return true;
+    });
+
+    // push (optionnel)
+    try {
+      const reg = await loadRegistry();
+      const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
+      const tokens = (t.devices || []).map(d => d.token);
+      if (tokens.length) {
+        await sendExpoPush(tokens, {
+          title: 'Nouvelle annonce 📢',
+          body: String(title).slice(0, 120),
+          data: { type: 'announcement' },
+        });
+      }
+    } catch {}
+
+    res.status(201).json({ ok: true, announcement: created });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
 
 
 
