@@ -1114,33 +1114,38 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     const published_at = String(req.body?.published_at || new Date().toISOString());
 
     // 1) Upload vers Drive (CLIENT GLOBAL)
-    const createRes = await drive.files.create({
-      requestBody: {
-        name: req.file.originalname || `doc_${Date.now()}.pdf`,
-        parents: [GDRIVE_FOLDER_ID],
-        mimeType: "application/pdf",
-      },
-      media: {
-        mimeType: "application/pdf",
-        body: bufferToStream(req.file.buffer),
-      },
-      fields: "id, name",
-      supportsAllDrives: true,
-    });
-
-    const fileId = createRes.data.id;
-    const fileName = createRes.data.name || "document.pdf";
-
-   // 2) Rendre accessible par lien (lecture publique par lien)
-await drive.permissions.create({
-  fileId,
-  requestBody: { role: "reader", type: "anyone" },
+    // 1) Upload vers Drive
+const createRes = await drive.files.create({
+  requestBody: {
+    name: req.file.originalname || `doc_${Date.now()}.pdf`,
+    parents: [GDRIVE_FOLDER_ID],
+    mimeType: "application/pdf",
+  },
+  media: { mimeType: "application/pdf", body: bufferToStream(req.file.buffer) },
+  fields: "id,name",
   supportsAllDrives: true,
 });
 
-// Liens pratiques
+const fileId = createRes.data.id;
+const fileName = createRes.data.name || "document.pdf";
+
+// 2) Rendre public (optionnel) — ne jamais faire planter l’upload
+try {
+  if (GDRIVE_PUBLIC) {
+    await drive.permissions.create({
+      fileId,
+      requestBody: { role: "reader", type: "anyone" },
+      supportsAllDrives: true,
+    });
+  }
+} catch (e) {
+  console.warn("[Drive perms] lien public non appliqué :", e?.message || e);
+}
+
+// Liens (même si on n’a pas pu mettre la permission publique)
 const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
 const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+
 
     // 3) Enregistrer l’annonce
     let saved = null;
