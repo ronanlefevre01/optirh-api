@@ -49,39 +49,67 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 
 // --- Google Drive (compte de service) ---
-const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;       // ID du dossier Drive
-const GDRIVE_PUBLIC    = (process.env.GDRIVE_PUBLIC || 'true') === 'true'; // lien public ?
+const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
+const GDRIVE_PUBLIC    = (process.env.GDRIVE_PUBLIC || 'true') === 'true';
 
 function getServiceAccountJSON() {
-  let raw = process.env.GDRIVE_SA_JSON || '';
-  const b64 = process.env.GDRIVE_SA_BASE64 || '';
-  if (!raw && b64) raw = Buffer.from(b64, 'base64').toString('utf8');
+  // ✅ On privilégie la version base64 (pas de problèmes de \n)
+  const b64 = (process.env.GDRIVE_SA_BASE64 || '').trim();
+  let raw = (process.env.GDRIVE_SA_JSON || '').trim();
+
+  if (!raw && b64) {
+    try {
+      raw = Buffer.from(b64, 'base64').toString('utf8');
+    } catch (e) {
+      throw new Error('Invalid GDRIVE_SA_BASE64 (base64 decode failed)');
+    }
+  }
   if (!raw) throw new Error('Missing GDRIVE_SA_JSON or GDRIVE_SA_BASE64');
 
-  const json = JSON.parse(raw);
-  if (json.private_key && json.private_key.includes('\\n')) {
-    json.private_key = json.private_key.replace(/\\n/g, '\n');
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('Invalid GDRIVE_SA_JSON (JSON.parse failed)');
+  }
+
+  // normalise la clé privée si arrivée avec "\\n"
+  if (json.private_key && typeof json.private_key === 'string') {
+    if (json.private_key.includes('\\n')) {
+      json.private_key = json.private_key.replace(/\\n/g, '\n');
+    }
+  }
+
+  if (!json.client_email || !json.private_key) {
+    throw new Error('Service account JSON missing client_email or private_key');
   }
   return json;
 }
 
 let drive = null;
-let driveAuth = null; // 👈 on garde le client d’auth pour faire driveAuth.request(...)
+let driveAuth = null;
 
 function ensureDrive() {
   if (drive && driveAuth) return { drive, driveAuth };
 
   const sa = getServiceAccountJSON();
-  // JWT = client de service qui sait signer et faire des requêtes OAuth2
   const jwt = new google.auth.JWT(
     sa.client_email,
     null,
     sa.private_key,
-    ['https://www.googleapis.com/auth/drive'] // scope complet
+    ['https://www.googleapis.com/auth/drive']
   );
 
-  driveAuth = jwt;                        // 👈 pour les requêtes manuelles (resumable init)
-  drive = google.drive({ version: 'v3', auth: jwt }); // client “drive.*”
+  driveAuth = jwt;
+  drive = google.drive({ version: 'v3', auth: jwt });
+
+  // 🔎 petit log safe pour diagnostic (pas de secrets)
+  console.log('[Drive] SA loaded:', {
+    email: sa.client_email,
+    keyLen: sa.private_key ? sa.private_key.length : 0,
+    folderIdSet: !!GDRIVE_FOLDER_ID,
+  });
+
   return { drive, driveAuth };
 }
 
@@ -89,15 +117,17 @@ function requireDrive(res) {
   try {
     const { drive: d, driveAuth: a } = ensureDrive();
     if (!d || !a || !GDRIVE_FOLDER_ID) {
-      res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64 or GDRIVE_FOLDER_ID)' });
+      res.status(500).json({ error: 'Drive not configured (GDRIVE_* envs missing)' });
       return false;
     }
     return true;
   } catch (e) {
-    res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64)' });
+    console.error('[Drive] init error:', e?.message || e);
+    res.status(500).json({ error: 'Drive not configured: ' + (e?.message || e) });
     return false;
   }
 }
+
 
 
 /** ===== UTILS ===== */
