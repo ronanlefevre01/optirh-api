@@ -233,16 +233,6 @@ function bufferToStream(buffer) {
   return stream;
 }
 
-function getDriveClient() {
-  const raw = process.env.GDRIVE_SA_JSON;
-  if (!raw) throw new Error("Missing GDRIVE_SA_JSON");
-  const creds = JSON.parse(raw);
-  const auth = new google.auth.GoogleAuth({
-    credentials: creds,
-    scopes: ["https://www.googleapis.com/auth/drive"],
-  });
-  return google.drive({ version: "v3", auth });
-}
 
 
 /** ===== HEALTH ===== */
@@ -1128,6 +1118,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
         body: bufferToStream(req.file.buffer),
       },
       fields: "id, name",
+      supportsAllDrives: true,
     });
 
     const fileId = createRes.data.id;
@@ -1226,14 +1217,18 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
     });
 
     // Efface le fichier Drive si on a un driveFileId
-    try {
-      if (removed?.type === 'pdf' && removed?.file?.driveFileId) {
-        const drive = getDriveClient();
-        await drive.files.delete({ fileId: removed.file.driveFileId });
-      }
-    } catch (e) {
-      console.warn('[Drive delete] skip:', e?.message || e);
-    }
+try {
+  if (removed?.type === 'pdf' && removed?.file?.driveFileId) {
+    const { drive } = ensureDrive();               // 👈 unifie l’accès au client
+    await drive.files.delete({
+      fileId: removed.file.driveFileId,
+      supportsAllDrives: true,                     // 👈 important en Shared drive
+    });
+  }
+} catch (e) {
+  console.warn('[Drive delete] skip:', e?.message || e);
+}
+
 
     res.json({ ok: true });
   } catch (e) {
