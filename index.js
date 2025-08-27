@@ -1252,44 +1252,69 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    // Initialisation de session RESUMABLE (oblige Drive à renvoyer Location)
-    const resp = await driveAuth.request({
-      url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=UTF-8',
-        'X-Upload-Content-Type': mimeType,
-        'X-Upload-Content-Length': String(fileSize),
-      },
-      data: {
-        name: safeName,
-        parents: [GDRIVE_FOLDER_ID],
-        mimeType,
-      },
-    });
+    // ✅ 1) s’assurer d’avoir un access token frais
+    const { driveAuth } = ensureDrive();
+    await driveAuth.authorize();                           // important
+    const tokenObj = await driveAuth.getAccessToken();     // {token: 'ya29...'} OU 'ya29...'
+    const accessToken = typeof tokenObj === 'string' ? tokenObj : tokenObj?.token;
 
-    const uploadUrl = resp.headers?.location || resp.headers?.Location;
-    const fileId = resp.data?.id || null;
+    if (!accessToken) {
+      return res.status(500).json({ error: 'Failed to obtain Google access token' });
+    }
+
+    // ✅ 2) créer la session resumable “à la main” avec l’en-tête Authorization explicite
+    const initResp = await fetch(
+      'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json; charset=UTF-8',
+          'X-Upload-Content-Type': mimeType,
+          'X-Upload-Content-Length': String(fileSize),
+        },
+        body: JSON.stringify({
+          name: safeName,
+          parents: [GDRIVE_FOLDER_ID],
+          mimeType,
+        }),
+      }
+    );
+
+    if (!initResp.ok) {
+      const errBody = await initResp.text().catch(() => '');
+      console.error('[Drive resumable] init failed', initResp.status, errBody);
+      if (initResp.status === 403) return res.status(403).json({ error: 'Insufficient permissions (folder share?)' });
+      if (initResp.status === 404) return res.status(404).json({ error: 'Folder not found' });
+      return res.status(500).json({ error: 'Failed to create resumable session' });
+    }
+
+    const uploadUrl = initResp.headers.get('location') || initResp.headers.get('Location');
+    let fileId = null;
+    try {
+      const data = await initResp.json();
+      fileId = data?.id || null;
+    } catch { /* certaines réponses n’ont pas de JSON */ }
 
     if (!uploadUrl) {
       console.error('[Drive resumable] missing Location header', {
-        status: resp.status, headers: resp.headers, data: resp.data
+        status: initResp.status,
+        headers: Object.fromEntries(initResp.headers.entries())
       });
-      return res.status(500).json({
-        error: 'Failed to create resumable session (no Location). Vérifie le partage du dossier et supportsAllDrives.'
-      });
+      return res.status(500).json({ error: 'Resumable init succeeded but no Location header returned' });
     }
 
-    res.json({ fileId, uploadUrl });
+    return res.json({ fileId, uploadUrl });
   } catch (e) {
     const status = e?.response?.status;
     const data = e?.response?.data;
-    console.error('[Drive resumable] error', status, data || e);
-    if (status === 403) return res.status(403).json({ error: 'Insufficient permissions (partage du dossier ?)' });
+    console.error('[Drive resumable] error', status || '', data || e);
+    if (status === 403) return res.status(403).json({ error: 'Insufficient permissions (folder share?)' });
     if (status === 404) return res.status(404).json({ error: 'Folder not found' });
     return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
+
 
 
 // 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
