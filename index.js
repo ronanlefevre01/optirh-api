@@ -1268,7 +1268,6 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    // 1) Démarre la session d’upload (resumable)
     const resp = await driveAuth.request({
       url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
       method: 'POST',
@@ -1277,30 +1276,36 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
         'X-Upload-Content-Type': mimeType,
         'X-Upload-Content-Length': String(fileSize),
       },
-      data: {
-        name: safeName,
-        parents: [process.env.GDRIVE_FOLDER_ID],
-        mimeType,
-      },
+      data: { name: safeName, parents: [process.env.GDRIVE_FOLDER_ID], mimeType },
     });
 
-    // 2) Récupère l’URL de session (plusieurs variantes possibles suivant le proxy)
-    const h = resp?.headers || {};
-    const uploadUrl =
-      h.location ||
-      h.Location ||
-      h['x-goog-upload-url'] ||
-      h['X-Goog-Upload-URL'] ||
+    // -------- extraction robuste du header --------
+    const H = resp?.headers || {};
+    // 1) accès objet
+    let uploadUrl =
+      H.location ||
+      H.Location ||
+      H['x-goog-upload-url'] ||
+      H['X-Goog-Upload-URL'] ||
       null;
 
-    // L’init peut ne PAS renvoyer d’id. On le récupérera après le PUT final.
-    const fileId = (resp?.data && resp.data.id) ? resp.data.id : null;
+    // 2) si c’est un Headers (fetch), utiliser .get()
+    if (!uploadUrl && typeof H.get === 'function') {
+      uploadUrl =
+        H.get('location') ||
+        H.get('Location') ||
+        H.get('x-goog-upload-url') ||
+        H.get('X-Goog-Upload-URL') ||
+        null;
+    }
+
+    const fileId = resp?.data?.id ?? null; // souvent absent à l’init, c’est normal
 
     if (!uploadUrl) {
-      console.log('[Drive resumable] missing Location header', {
+      console.log('[Drive resumable] missing Location header (mais headers reçus) =>', {
         status: resp?.status,
         headers: resp?.headers,
-        data: resp?.data
+        data: resp?.data,
       });
       return res.status(500).json({ error: 'Failed to create resumable session (no Location header)' });
     }
@@ -1315,7 +1320,6 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
     return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
-
 
 
 // >>> DEBUG DRIVE – A ENLEVER APRÈS VERIF
