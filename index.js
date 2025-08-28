@@ -1693,34 +1693,27 @@ app.patch('/settings', authRequired, async (req, res) => {
 });
 
 // ===================== Bonus V3 routes (multi-formules) ===================== //
-
-// ⚠️ utilise le même middleware que pour /settings
+// ⚠️ Garde le même middleware d'auth que pour /settings
 // const { authRequired } = require('./auth');
 // const { computeBonusV3 } = require('./bonusMathV3');
 // const { monthKey } = require('./utils/dates');
 
-function roleOf(req) {
-  const r = req.user?.role;
-  return typeof r === 'string' ? r.toUpperCase() : '';
-}
-function companyCodeOf(req) {
-  return req.user?.company_code || req.user?.companyCode;
-}
-function userIdOf(req) {
-  return req.user?.user_id || req.user?.id || req.user?.sub || req.user?.email;
-}
+// Helpers avec noms uniques (évite les collisions)
+const bonusRoleOf = (req) => String(req.user?.role || '').toUpperCase();
+const bonusCompanyCodeOf = (req) => req.user?.company_code || req.user?.companyCode;
+const bonusUserIdOf = (req) => req.user?.user_id || req.user?.id || req.user?.sub || req.user?.email;
 
-function requireOwner(req, res, next) {
-  if (roleOf(req) === 'OWNER') return next();
+function bonusRequireOwner(req, res, next) {
+  if (bonusRoleOf(req) === 'OWNER') return next();
   return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
 }
-function requireEmployeeOrOwner(req, res, next) {
-  const r = roleOf(req);
+function bonusRequireEmployeeOrOwner(req, res, next) {
+  const r = bonusRoleOf(req);
   if (r === 'EMPLOYEE' || r === 'OWNER') return next();
   return res.status(403).json({ error: 'FORBIDDEN_EMPLOYEE' });
 }
 
-function ensureBonusV3(t) {
+function bonusEnsureStruct(t) {
   t.bonusV3 = t.bonusV3 || {};
   t.bonusV3.formulas = t.bonusV3.formulas || { byId: {}, order: [] };
   t.bonusV3.entries  = t.bonusV3.entries  || {}; // { [YYYY-MM]: { [empId]: [ {formulaId, sale, bonus, at} ] } }
@@ -1729,9 +1722,9 @@ function ensureBonusV3(t) {
 }
 
 // 1) LISTER les formules (OWNER)
-app.get('/bonusV3/formulas', authRequired, requireOwner, (req, res) => {
-  const code = companyCodeOf(req);
-  const t = ensureBonusV3(getTenant(code));
+app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const t = bonusEnsureStruct(getTenant(code));
   const list = (t.bonusV3.formulas.order || [])
     .map(id => t.bonusV3.formulas.byId[id])
     .filter(Boolean);
@@ -1739,9 +1732,9 @@ app.get('/bonusV3/formulas', authRequired, requireOwner, (req, res) => {
 });
 
 // 2) CRÉER une formule (OWNER)
-app.post('/bonusV3/formulas', authRequired, requireOwner, (req, res) => {
-  const code = companyCodeOf(req);
-  const t = ensureBonusV3(getTenant(code));
+app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const t = bonusEnsureStruct(getTenant(code));
 
   const f = req.body || {};
   if (f.version !== 3) f.version = 3;
@@ -1755,10 +1748,10 @@ app.post('/bonusV3/formulas', authRequired, requireOwner, (req, res) => {
 });
 
 // 3) METTRE À JOUR une formule (OWNER)
-app.put('/bonusV3/formulas/:id', authRequired, requireOwner, (req, res) => {
-  const code = companyCodeOf(req);
+app.put('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
   const id = String(req.params.id || '');
-  const t = ensureBonusV3(getTenant(code));
+  const t = bonusEnsureStruct(getTenant(code));
   if (!id || !t.bonusV3.formulas.byId[id]) return res.status(404).json({ error: 'NOT_FOUND' });
 
   const f = req.body || {};
@@ -1772,10 +1765,10 @@ app.put('/bonusV3/formulas/:id', authRequired, requireOwner, (req, res) => {
 });
 
 // 4) SUPPRIMER une formule (OWNER)
-app.delete('/bonusV3/formulas/:id', authRequired, requireOwner, (req, res) => {
-  const code = companyCodeOf(req);
+app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
   const id = String(req.params.id || '');
-  const t = ensureBonusV3(getTenant(code));
+  const t = bonusEnsureStruct(getTenant(code));
   if (!id || !t.bonusV3.formulas.byId[id]) return res.status(404).json({ error: 'NOT_FOUND' });
 
   delete t.bonusV3.formulas.byId[id];
@@ -1786,13 +1779,13 @@ app.delete('/bonusV3/formulas/:id', authRequired, requireOwner, (req, res) => {
 });
 
 // 5) SAISIE d'une vente (EMPLOYEE ou OWNER)
-app.post('/bonusV3/sale', authRequired, requireEmployeeOrOwner, (req, res) => {
-  const code = companyCodeOf(req);
-  const empId = userIdOf(req);
+app.post('/bonusV3/sale', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const empId = bonusUserIdOf(req);
   if (!empId) return res.status(400).json({ error: 'NO_USER' });
 
   const { formulaId, sale } = req.body || {};
-  const t = ensureBonusV3(getTenant(code));
+  const t = bonusEnsureStruct(getTenant(code));
   const m = monthKey();
 
   if (t.bonusV3.ledger?.[m]?.frozenAt) {
@@ -1814,13 +1807,13 @@ app.post('/bonusV3/sale', authRequired, requireEmployeeOrOwner, (req, res) => {
 });
 
 // 6) COMPTEUR employé (EMPLOYEE ou OWNER)
-app.get('/bonusV3/my-total', authRequired, requireEmployeeOrOwner, (req, res) => {
-  const code = companyCodeOf(req);
-  const empId = userIdOf(req);
+app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const empId = bonusUserIdOf(req);
   if (!empId) return res.status(400).json({ error: 'NO_USER' });
 
   const m = String(req.query.month || monthKey());
-  const t = ensureBonusV3(getTenant(code));
+  const t = bonusEnsureStruct(getTenant(code));
 
   const list = t.bonusV3.entries?.[m]?.[empId] || [];
   const total = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
@@ -1828,10 +1821,10 @@ app.get('/bonusV3/my-total', authRequired, requireEmployeeOrOwner, (req, res) =>
 });
 
 // 7) RÉCAP Patron (OWNER)
-app.get('/bonusV3/summary', authRequired, requireOwner, (req, res) => {
-  const code = companyCodeOf(req);
+app.get('/bonusV3/summary', authRequired, bonusRequireOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
   const m = String(req.query.month || monthKey());
-  const t = ensureBonusV3(getTenant(code));
+  const t = bonusEnsureStruct(getTenant(code));
 
   const byEmp = t.bonusV3.entries?.[m] || {};
   const byEmployee = {};
@@ -1849,10 +1842,10 @@ app.get('/bonusV3/summary', authRequired, requireOwner, (req, res) => {
 });
 
 // 8) FIGER la période (OWNER)
-app.post('/bonusV3/freeze', authRequired, requireOwner, (req, res) => {
-  const code = companyCodeOf(req);
+app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
   const m = String(req.query.month || monthKey());
-  const t = ensureBonusV3(getTenant(code));
+  const t = bonusEnsureStruct(getTenant(code));
 
   const byEmp = t.bonusV3.entries?.[m] || {};
   const ledgerEmp = {};
@@ -1867,7 +1860,7 @@ app.post('/bonusV3/freeze', authRequired, requireOwner, (req, res) => {
   t.bonusV3.ledger[m] = {
     frozenAt: new Date().toISOString(),
     byEmployee: ledgerEmp,
-    byFormula: ledgerFormula
+    byFormula: ledgerFormula,
   };
   t.bonusV3.entries[m] = {}; // reset pour le mois courant
 
