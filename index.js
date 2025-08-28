@@ -1721,6 +1721,16 @@ function bonusEnsureStruct(t) {
   return t;
 }
 
+// --- Bonus V3: s'assurer que la structure existe dans le tenant ---
+function ensureBonusV3(t) {
+  t = (t && typeof t === 'object') ? t : {};
+  t.bonusV3 = t.bonusV3 || {};
+  t.bonusV3.formulas = t.bonusV3.formulas || { byId: {}, order: [] };
+  t.bonusV3.entries  = t.bonusV3.entries  || {}; // { [YYYY-MM]: { [empId]: [ {formulaId, sale, bonus, at} ] } }
+  t.bonusV3.ledger   = t.bonusV3.ledger   || {}; // { [YYYY-MM]: { frozenAt, byEmployee, byFormula } }
+  return t;
+}
+
 // 1) LISTER les formules (OWNER)
 app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, (req, res) => {
   const code = bonusCompanyCodeOf(req);
