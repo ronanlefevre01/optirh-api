@@ -1920,6 +1920,37 @@ app.get('/whoami', authRequired, (req, res) => {
   res.json({ role: req.user?.role, user: req.user?.user_id, company: req.user?.company_code });
 });
 
+// === Détail par employé (OWNER) ===
+// Liste des ventes d’un employé pour un mois (non figé)
+app.get('/bonusV3/employee-entries', authRequired, requireOwner, (req, res) => {
+  const code = req.user.company_code;
+  const empId = String(req.query.empId || '').trim();
+  const m = String(req.query.month || monthKey());
+  const t = ensureBonusV3(getTenant(code));
+
+  if (!empId) return res.status(400).json({ error: 'MISSING_EMP_ID' });
+
+  const list = t.bonusV3?.entries?.[m]?.[empId] || [];
+  // du plus récent au plus ancien
+  const sorted = [...list].sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
+  res.json({ month: m, empId, entries: sorted });
+});
+
+// Historique figé (totaux par mois) pour un employé
+app.get('/bonusV3/employee-history', authRequired, requireOwner, (req, res) => {
+  const code = req.user.company_code;
+  const empId = String(req.query.empId || '').trim();
+  const t = ensureBonusV3(getTenant(code));
+  if (!empId) return res.status(400).json({ error: 'MISSING_EMP_ID' });
+
+  const hist = Object.entries(t.bonusV3.ledger || {}).map(([month, led]) => {
+    const total = Number((led.byEmployee && led.byEmployee[empId]) || 0);
+    return { month, total, frozenAt: led.frozenAt };
+  }).filter(x => x.total > 0);
+
+  hist.sort((a, b) => b.month.localeCompare(a.month)); // décroissant
+  res.json({ empId, history: hist });
+});
 
 
 
