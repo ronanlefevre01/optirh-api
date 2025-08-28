@@ -1259,7 +1259,7 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
     if (!(await requireDrive(res))) return;
 
-    const { driveAuth } = await ensureDrive(); // on utilise le client HTTP signé
+    const { driveAuth } = await ensureDrive();
 
     const { fileName, mimeType, fileSize } = req.body || {};
     if (!fileName || !mimeType || typeof fileSize !== 'number') {
@@ -1268,31 +1268,39 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    // ⚠️ Requête HTTP brute → crée une session resumable
+    // 1) Démarre la session d’upload (resumable)
     const resp = await driveAuth.request({
       url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json; charset=UTF-8',
         'X-Upload-Content-Type': mimeType,
-        'X-Upload-Content-Length': String(fileSize), // facultatif mais utile
+        'X-Upload-Content-Length': String(fileSize),
       },
       data: {
         name: safeName,
         parents: [process.env.GDRIVE_FOLDER_ID],
         mimeType,
       },
-      // validateStatus: () => true, // optionnel si tu veux logger même en cas d'erreur
     });
 
-    const uploadUrl = resp?.headers?.location || resp?.headers?.Location || null;
-    const fileId = resp?.data?.id || null;
+    // 2) Récupère l’URL de session (plusieurs variantes possibles suivant le proxy)
+    const h = resp?.headers || {};
+    const uploadUrl =
+      h.location ||
+      h.Location ||
+      h['x-goog-upload-url'] ||
+      h['X-Goog-Upload-URL'] ||
+      null;
+
+    // L’init peut ne PAS renvoyer d’id. On le récupérera après le PUT final.
+    const fileId = (resp?.data && resp.data.id) ? resp.data.id : null;
 
     if (!uploadUrl) {
       console.log('[Drive resumable] missing Location header', {
         status: resp?.status,
         headers: resp?.headers,
-        data: resp?.data,
+        data: resp?.data
       });
       return res.status(500).json({ error: 'Failed to create resumable session (no Location header)' });
     }
@@ -1307,6 +1315,7 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
     return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
+
 
 
 // >>> DEBUG DRIVE – A ENLEVER APRÈS VERIF
