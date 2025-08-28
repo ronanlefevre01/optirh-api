@@ -52,6 +52,9 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
 const GDRIVE_PUBLIC    = (process.env.GDRIVE_PUBLIC || 'true') === 'true';
 
+let drive = null;      // client google.drive
+let driveAuth = null;  // client JWT pour driveAuth.request()
+
 function getServiceAccountJSON() {
   let raw = process.env.GDRIVE_SA_JSON || '';
   const b64 = process.env.GDRIVE_SA_BASE64 || '';
@@ -59,51 +62,46 @@ function getServiceAccountJSON() {
   if (!raw) throw new Error('Missing GDRIVE_SA_JSON or GDRIVE_SA_BASE64');
 
   const json = JSON.parse(raw);
-  // Si la clé arrive avec \\n littéraux (copier/coller), on normalise.
   if (json.private_key && json.private_key.includes('\\n')) {
     json.private_key = json.private_key.replace(/\\n/g, '\n');
   }
   return json;
 }
 
-let drive = null;      // client google.drive
-let driveAuth = null;  // client JWT
-
 async function ensureDrive() {
   if (drive && driveAuth) return { drive, driveAuth };
 
   const sa = getServiceAccountJSON();
-  console.log('[Drive] SA email=', sa.client_email, ' keyLen=', (sa.private_key || '').length, ' folderIdSet=', !!GDRIVE_FOLDER_ID);
+  console.log('[Drive] SA email=', sa.client_email, ' keyLen=', (sa.private_key || '').length, ' folderIdSet=', !!process.env.GDRIVE_FOLDER_ID);
 
-  const jwtClient = new google.auth.JWT(
-    sa.client_email,
-    null,
-    sa.private_key,
-    ['https://www.googleapis.com/auth/drive']
-  );
+  // ⬇️ constructeur OBJET (évite "No key or keyFile set")
+  const authClient = new google.auth.JWT({
+    email: sa.client_email,
+    key: sa.private_key,                           // <- la clé privée
+    scopes: ['https://www.googleapis.com/auth/drive'],
+  });
 
-  // ⚠️ on force la création du jeton ici : si ça échoue, on le saura tout de suite
-  await jwtClient.authorize();
-
-  driveAuth = jwtClient;
-  drive = google.drive({ version: 'v3', auth: jwtClient });
+  driveAuth = authClient;
+  drive = google.drive({ version: 'v3', auth: authClient });
   return { drive, driveAuth };
 }
 
+
 async function requireDrive(res) {
   try {
-    await ensureDrive();
-    if (!GDRIVE_FOLDER_ID) {
-      res.status(500).json({ error: 'Drive not configured (GDRIVE_FOLDER_ID)' });
+    const ok = await ensureDrive();
+    if (!ok || !process.env.GDRIVE_FOLDER_ID) {
+      res.status(500).json({ error: 'Drive not configured (service account or GDRIVE_FOLDER_ID)' });
       return false;
     }
     return true;
   } catch (e) {
     console.error('[Drive] ensure failed:', e?.message || e);
-    res.status(500).json({ error: 'Drive not configured (SA json / token)' });
+    res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64)' });
     return false;
   }
 }
+
 
 /** ===== UTILS ===== */
 const sign = (payload) =>
