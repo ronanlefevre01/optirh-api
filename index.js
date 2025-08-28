@@ -1868,6 +1868,37 @@ app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
   res.json({ success: true });
 });
 
+// 9) LISTE des ventes d’un employé pour un mois (OWNER)
+app.get('/bonusV3/entries', authRequired, requireOwner, (req, res) => {
+  const code = req.user.company_code;
+  const empId = String(req.query.empId || '');
+  const m = String(req.query.month || monthKey());
+  if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
+
+  const t = ensureBonusV3(getTenant(code));
+  const list = t.bonusV3.entries?.[m]?.[empId] || [];
+  res.json({ month: m, empId, entries: list });
+});
+
+// 10) HISTORIQUE figé d’un employé (OWNER)
+app.get('/bonusV3/history', authRequired, requireOwner, (req, res) => {
+  const code = req.user.company_code;
+  const empId = String(req.query.empId || '');
+  if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
+
+  const t = ensureBonusV3(getTenant(code));
+  const hist = [];
+  for (const [mon, led] of Object.entries(t.bonusV3.ledger || {})) {
+    const tot = Number((led.byEmployee || {})[empId] || 0);
+    if (tot || (led.byEmployee && Object.prototype.hasOwnProperty.call(led.byEmployee, empId))) {
+      hist.push({ month: mon, total: tot, frozenAt: led.frozenAt });
+    }
+  }
+  hist.sort((a, b) => (a.month < b.month ? 1 : -1)); // plus récent d’abord
+  res.json({ empId, history: hist });
+});
+
+
 // Liste des formules visibles côté Employé (lecture seule)
 app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
   const code = bonusCompanyCodeOf(req);
