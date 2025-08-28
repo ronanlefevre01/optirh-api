@@ -67,45 +67,43 @@ function getServiceAccountJSON() {
 }
 
 let drive = null;      // client google.drive
-let driveAuth = null;  // client JWT pour .request()
+let driveAuth = null;  // client JWT
 
-function ensureDrive() {
+async function ensureDrive() {
   if (drive && driveAuth) return { drive, driveAuth };
-  const sa = getServiceAccountJSON();
 
-  // LOG SANITISÉ (ne montre pas la clé) — garde-le le temps du debug
+  const sa = getServiceAccountJSON();
   console.log('[Drive] SA email=', sa.client_email, ' keyLen=', (sa.private_key || '').length, ' folderIdSet=', !!GDRIVE_FOLDER_ID);
 
-  // ⬇️ si sa.private_key est vide ici, c’est *le* problème (env).
-  const jwt = new google.auth.JWT(
+  const jwtClient = new google.auth.JWT(
     sa.client_email,
     null,
     sa.private_key,
-    ['https://www.googleapis.com/auth/drive'] // scope complet
+    ['https://www.googleapis.com/auth/drive']
   );
 
-  driveAuth = jwt;
-  drive = google.drive({ version: 'v3', auth: jwt });
+  // ⚠️ on force la création du jeton ici : si ça échoue, on le saura tout de suite
+  await jwtClient.authorize();
+
+  driveAuth = jwtClient;
+  drive = google.drive({ version: 'v3', auth: jwtClient });
   return { drive, driveAuth };
 }
 
-function requireDrive(res) {
+async function requireDrive(res) {
   try {
-    const ok = ensureDrive();
-    if (!ok || !GDRIVE_FOLDER_ID) {
-      res.status(500).json({ error: 'Drive not configured (service account or GDRIVE_FOLDER_ID)' });
+    await ensureDrive();
+    if (!GDRIVE_FOLDER_ID) {
+      res.status(500).json({ error: 'Drive not configured (GDRIVE_FOLDER_ID)' });
       return false;
     }
     return true;
   } catch (e) {
     console.error('[Drive] ensure failed:', e?.message || e);
-    res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64)' });
+    res.status(500).json({ error: 'Drive not configured (SA json / token)' });
     return false;
   }
 }
-
-
-
 
 /** ===== UTILS ===== */
 const sign = (payload) =>
@@ -1112,7 +1110,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     if (!folderId) return res.status(500).json({ error: "Drive not configured (GDRIVE_FOLDER_ID)" });
 
     // Client Drive basé sur le JWT du service account
-    const { drive, driveAuth } = ensureDrive(); // driveAuth OK, mais on n'appelle PAS authorize()
+    const { drive } = await ensureDrive();
     const title = String(req.body?.title || "Document");
     const published_at = String(req.body?.published_at || new Date().toISOString());
 
@@ -1234,7 +1232,7 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
 
     try {
       if (removed?.type === 'pdf' && removed?.file?.driveFileId) {
-        const { drive, driveAuth } = ensureDrive();
+        const { drive } = await ensureDrive();
         // pas d'authorize() ici non plus
         await drive.files.delete({
           // auth: driveAuth, // facultatif
@@ -1261,9 +1259,10 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
 app.post('/announcements/upload-url', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
-    if (!requireDrive(res)) return;
+    if (!(await requireDrive(res))) return;
 
-    const { driveAuth } = ensureDrive();
+
+    const { driveAuth } = await ensureDrive();
     const { fileName, mimeType, fileSize } = req.body || {};
     if (!fileName || !mimeType || typeof fileSize !== 'number') {
       return res.status(400).json({ error: 'fileName, mimeType, fileSize required' });
@@ -1318,16 +1317,51 @@ app.get('/__drive/debug', (req, res) => {
   }
 });
 
-
-
+app.get("/__drive/selftest", async (req, res) => {
+  try {
+    const { drive, driveAuth } = await ensureDrive();
+    const { token } = await driveAuth.getAccessToken();
+    const about = await drive.about.get({ fields: "user,emailAddress" });
+    const list = await drive.files.list({
+      q: `'${GDRIVE_FOLDER_ID}' in parents`,
+      pageSize: 1,
+      fields: "files(id,name)",
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: "allDrives",
+    });
+    res.json({
+      ok: true,
+      tokenSample: token ? token.slice(0, 16) + "…" : null,
+      saUser: about.data.user || null,
+      folderId: GDRIVE_FOLDER_ID || null,
+      firstFile: list.data.files?.[0] || null,
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      message: e?.message || String(e),
+      status: e?.response?.status || null,
+      data: e?.response?.data || null,
+    });
+  }
+});
 
 
 
 // 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
+// 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
 app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
-    if (!requireDrive(res)) return;
+    if (req.user.role !== 'OWNER') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // ⬅️ requireDrive est ASYNC maintenant
+    if (!(await requireDrive(res))) return;
+
+    // ⬅️ on récupère explicitement le client Drive
+    const { drive } = await ensureDrive();
 
     const { fileId, title } = req.body || {};
     if (!fileId || !title || !String(title).trim()) {
@@ -1339,23 +1373,21 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
       if (GDRIVE_PUBLIC) {
         await drive.permissions.create({
           fileId,
-          requestBody: { role: 'reader', type: 'anyone' },
           supportsAllDrives: true,
+          requestBody: { role: 'reader', type: 'anyone' },
         });
       }
     } catch (e) {
-      // Ne bloque pas l'opération, mais log l'info (utile si la politique Workspace interdit "anyone")
       console.warn('[Drive perms] set public failed:', e?.message || e);
     }
 
     // Métadonnées + liens
     const meta = await drive.files.get({
       fileId,
-      fields: 'id,name,webViewLink,webContentLink',
       supportsAllDrives: true,
+      fields: 'id,name,webViewLink',
     });
 
-    // Lien affichable + lien direct téléchargement
     const url = meta.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
     const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
     const fileName = meta.data.name || 'document.pdf';
@@ -1373,9 +1405,9 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
         type: 'pdf',
         title: String(title).trim(),
         body: null,
-        url,                 // lien d'affichage (web)
+        url, // lien d'affichage (web)
         drive_file_id: fileId,
-        file: {              // infos utiles pour l'app et pour une éventuelle suppression
+        file: {
           driveFileId: fileId,
           name: fileName,
           mime: 'application/pdf',
@@ -1411,7 +1443,8 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
 
     return res.status(201).json({ ok: true, announcement: created });
   } catch (e) {
-    return res.status(500).json({ error: String(e.message || e) });
+    console.error('[announcements/confirm-upload] error:', e?.response?.status, e?.response?.data || e);
+    return res.status(500).json({ error: 'Failed to confirm upload' });
   }
 });
 
