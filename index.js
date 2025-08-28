@@ -1257,9 +1257,15 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
 app.post('/announcements/upload-url', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
-    if (!requireDrive(res)) return;
+    if (!requireDrive(res)) return; // initialise si besoin et vérifie le FOLDER_ID
 
-    const { drive } = ensureDrive();
+    // ⚠️ Récupère explicitement le client Drive
+    const { drive: driveClient } = ensureDrive();
+    if (!driveClient || typeof driveClient.files?.create !== 'function') {
+      console.error('[Drive resumable] drive client not ready', { hasClient: !!driveClient });
+      return res.status(500).json({ error: 'Drive client not initialized' });
+    }
+
     const { fileName, mimeType, fileSize } = req.body || {};
     if (!fileName || !mimeType || typeof fileSize !== 'number') {
       return res.status(400).json({ error: 'fileName, mimeType, fileSize required' });
@@ -1267,8 +1273,10 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    // IMPORTANT: utiliser le client googleapis + params uploadType=resumable
-    const resp = await drive.files.create(
+    // ✅ Utilise le client googleapis pour créer la session "resumable"
+    console.log('[Drive resumable] client ok?', !!driveClient, Object.keys(driveClient || {}));
+
+    const resp = await driveClient.files.create(
       {
         supportsAllDrives: true,
         requestBody: {
@@ -1276,8 +1284,7 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
           parents: [GDRIVE_FOLDER_ID],
           mimeType,
         },
-        // media.mimeType suffit pour le handshake; le contenu sera PUT ensuite
-        media: { mimeType },
+        media: { mimeType }, // pas de contenu ici, juste pour le handshake
         fields: 'id',
       },
       {
@@ -1295,9 +1302,7 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     if (!uploadUrl) {
       console.error('[Drive resumable] Missing Location header', {
-        status: resp?.status,
-        headers: resp?.headers,
-        data: resp?.data,
+        status: resp?.status, headers: resp?.headers, data: resp?.data,
       });
       return res.status(500).json({ error: 'Failed to create resumable session (no Location header)' });
     }
@@ -1312,6 +1317,7 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
     return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
+
 
 
 // >>> DEBUG DRIVE – A ENLEVER APRÈS VERIF
