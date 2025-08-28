@@ -1257,14 +1257,9 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
 app.post('/announcements/upload-url', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
-    if (!requireDrive(res)) return; // initialise si besoin et vérifie le FOLDER_ID
+    if (!(await requireDrive(res))) return;
 
-    // ⚠️ Récupère explicitement le client Drive
-    const { drive: driveClient } = ensureDrive();
-    if (!driveClient || typeof driveClient.files?.create !== 'function') {
-      console.error('[Drive resumable] drive client not ready', { hasClient: !!driveClient });
-      return res.status(500).json({ error: 'Drive client not initialized' });
-    }
+    const { drive: driveClient } = await ensureDrive();
 
     const { fileName, mimeType, fileSize } = req.body || {};
     if (!fileName || !mimeType || typeof fileSize !== 'number') {
@@ -1273,24 +1268,17 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    // ✅ Utilise le client googleapis pour créer la session "resumable"
-    console.log('[Drive resumable] client ok?', !!driveClient, Object.keys(driveClient || {}));
-
+    // crée une session resumable → Location dans les headers
     const resp = await driveClient.files.create(
       {
         supportsAllDrives: true,
-        requestBody: {
-          name: safeName,
-          parents: [GDRIVE_FOLDER_ID],
-          mimeType,
-        },
-        media: { mimeType }, // pas de contenu ici, juste pour le handshake
+        requestBody: { name: safeName, parents: [process.env.GDRIVE_FOLDER_ID], mimeType },
+        media: { mimeType },  // on ne met PAS le body ici (c'est pour l'étape suivante)
         fields: 'id',
       },
       {
         params: { uploadType: 'resumable' },
         headers: {
-          'Content-Type': 'application/json; charset=UTF-8',
           'X-Upload-Content-Type': mimeType,
           'X-Upload-Content-Length': String(fileSize),
         },
@@ -1301,13 +1289,11 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
     const fileId = resp?.data?.id || null;
 
     if (!uploadUrl) {
-      console.error('[Drive resumable] Missing Location header', {
-        status: resp?.status, headers: resp?.headers, data: resp?.data,
-      });
+      console.error('[Drive resumable] missing Location header', { status: resp?.status, headers: resp?.headers });
       return res.status(500).json({ error: 'Failed to create resumable session (no Location header)' });
     }
 
-    return res.json({ fileId, uploadUrl });
+    res.json({ fileId, uploadUrl });
   } catch (e) {
     const status = e?.response?.status;
     console.error('[Drive resumable] error', status, e?.response?.data || e);
@@ -1317,7 +1303,6 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
     return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
-
 
 
 // >>> DEBUG DRIVE – A ENLEVER APRÈS VERIF
@@ -1390,33 +1375,26 @@ app.get('/__drive/check-folder', async (req, res) => {
 
 
 
-
-// 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
 // 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
 app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    // ⬅️ requireDrive est ASYNC maintenant
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
     if (!(await requireDrive(res))) return;
 
-    // ⬅️ on récupère explicitement le client Drive
-    const { drive } = await ensureDrive();
+    const { drive: driveClient } = await ensureDrive();
 
     const { fileId, title } = req.body || {};
     if (!fileId || !title || !String(title).trim()) {
       return res.status(400).json({ error: 'fileId & title required' });
     }
 
-    // Rendre le fichier accessible par lien (si activé)
+    // Rendre le fichier accessible par lien (optionnel)
     try {
-      if (GDRIVE_PUBLIC) {
-        await drive.permissions.create({
+      if ((process.env.GDRIVE_PUBLIC || 'true') === 'true') {
+        await driveClient.permissions.create({
           fileId,
-          supportsAllDrives: true,
           requestBody: { role: 'reader', type: 'anyone' },
+          supportsAllDrives: true,
         });
       }
     } catch (e) {
@@ -1424,10 +1402,10 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
     }
 
     // Métadonnées + liens
-    const meta = await drive.files.get({
+    const meta = await driveClient.files.get({
       fileId,
+      fields: 'id,name,webViewLink,webContentLink',
       supportsAllDrives: true,
-      fields: 'id,name,webViewLink',
     });
 
     const url = meta.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
