@@ -1693,21 +1693,32 @@ app.patch('/settings', authRequired, async (req, res) => {
 });
 
 // ===================== Bonus V3 routes (multi-formules) ===================== //
+
+// ⚠️ utilise le même middleware que pour /settings
+// const { authRequired } = require('./auth');
+// const { computeBonusV3 } = require('./bonusMathV3');
+// const { monthKey } = require('./utils/dates');
+
+function roleOf(req) {
+  const r = req.user?.role;
+  return typeof r === 'string' ? r.toUpperCase() : '';
+}
+function companyCodeOf(req) {
+  return req.user?.company_code || req.user?.companyCode;
+}
+function userIdOf(req) {
+  return req.user?.user_id || req.user?.id || req.user?.sub || req.user?.email;
+}
+
 function requireOwner(req, res, next) {
-  if (req.user && req.user.role === 'OWNER') return next();
+  if (roleOf(req) === 'OWNER') return next();
   return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
 }
 function requireEmployeeOrOwner(req, res, next) {
-  if (req.user && (req.user.role === 'EMPLOYEE' || req.user.role === 'OWNER')) return next();
+  const r = roleOf(req);
+  if (r === 'EMPLOYEE' || r === 'OWNER') return next();
   return res.status(403).json({ error: 'FORBIDDEN_EMPLOYEE' });
 }
-
-
-// 1) LISTE des formules (OWNER)
-// --- helpers à avoir en haut du fichier (si pas déjà) ---
-// const { authRequired } = require('./auth');               // ⬅️ remplace par ton middleware réel
-// const { computeBonusV3 } = require('./bonusMathV3');      // déjà présent chez toi
-// const { monthKey } = require('./utils/dates');            // déjà présent chez toi
 
 function ensureBonusV3(t) {
   t.bonusV3 = t.bonusV3 || {};
@@ -1719,7 +1730,7 @@ function ensureBonusV3(t) {
 
 // 1) LISTER les formules (OWNER)
 app.get('/bonusV3/formulas', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
+  const code = companyCodeOf(req);
   const t = ensureBonusV3(getTenant(code));
   const list = (t.bonusV3.formulas.order || [])
     .map(id => t.bonusV3.formulas.byId[id])
@@ -1729,7 +1740,7 @@ app.get('/bonusV3/formulas', authRequired, requireOwner, (req, res) => {
 
 // 2) CRÉER une formule (OWNER)
 app.post('/bonusV3/formulas', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
+  const code = companyCodeOf(req);
   const t = ensureBonusV3(getTenant(code));
 
   const f = req.body || {};
@@ -1745,7 +1756,7 @@ app.post('/bonusV3/formulas', authRequired, requireOwner, (req, res) => {
 
 // 3) METTRE À JOUR une formule (OWNER)
 app.put('/bonusV3/formulas/:id', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
+  const code = companyCodeOf(req);
   const id = String(req.params.id || '');
   const t = ensureBonusV3(getTenant(code));
   if (!id || !t.bonusV3.formulas.byId[id]) return res.status(404).json({ error: 'NOT_FOUND' });
@@ -1762,7 +1773,7 @@ app.put('/bonusV3/formulas/:id', authRequired, requireOwner, (req, res) => {
 
 // 4) SUPPRIMER une formule (OWNER)
 app.delete('/bonusV3/formulas/:id', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
+  const code = companyCodeOf(req);
   const id = String(req.params.id || '');
   const t = ensureBonusV3(getTenant(code));
   if (!id || !t.bonusV3.formulas.byId[id]) return res.status(404).json({ error: 'NOT_FOUND' });
@@ -1776,8 +1787,10 @@ app.delete('/bonusV3/formulas/:id', authRequired, requireOwner, (req, res) => {
 
 // 5) SAISIE d'une vente (EMPLOYEE ou OWNER)
 app.post('/bonusV3/sale', authRequired, requireEmployeeOrOwner, (req, res) => {
-  const code = req.user.company_code;
-  const empId = req.user.user_id;
+  const code = companyCodeOf(req);
+  const empId = userIdOf(req);
+  if (!empId) return res.status(400).json({ error: 'NO_USER' });
+
   const { formulaId, sale } = req.body || {};
   const t = ensureBonusV3(getTenant(code));
   const m = monthKey();
@@ -1802,8 +1815,10 @@ app.post('/bonusV3/sale', authRequired, requireEmployeeOrOwner, (req, res) => {
 
 // 6) COMPTEUR employé (EMPLOYEE ou OWNER)
 app.get('/bonusV3/my-total', authRequired, requireEmployeeOrOwner, (req, res) => {
-  const code = req.user.company_code;
-  const empId = req.user.user_id;
+  const code = companyCodeOf(req);
+  const empId = userIdOf(req);
+  if (!empId) return res.status(400).json({ error: 'NO_USER' });
+
   const m = String(req.query.month || monthKey());
   const t = ensureBonusV3(getTenant(code));
 
@@ -1814,7 +1829,7 @@ app.get('/bonusV3/my-total', authRequired, requireEmployeeOrOwner, (req, res) =>
 
 // 7) RÉCAP Patron (OWNER)
 app.get('/bonusV3/summary', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
+  const code = companyCodeOf(req);
   const m = String(req.query.month || monthKey());
   const t = ensureBonusV3(getTenant(code));
 
@@ -1835,7 +1850,7 @@ app.get('/bonusV3/summary', authRequired, requireOwner, (req, res) => {
 
 // 8) FIGER la période (OWNER)
 app.post('/bonusV3/freeze', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
+  const code = companyCodeOf(req);
   const m = String(req.query.month || monthKey());
   const t = ensureBonusV3(getTenant(code));
 
@@ -1849,12 +1864,17 @@ app.post('/bonusV3/freeze', authRequired, requireOwner, (req, res) => {
       ledgerFormula[it.formulaId] = (ledgerFormula[it.formulaId] || 0) + Number(it.bonus || 0);
     }
   }
-  t.bonusV3.ledger[m] = { frozenAt: new Date().toISOString(), byEmployee: ledgerEmp, byFormula: ledgerFormula };
+  t.bonusV3.ledger[m] = {
+    frozenAt: new Date().toISOString(),
+    byEmployee: ledgerEmp,
+    byFormula: ledgerFormula
+  };
   t.bonusV3.entries[m] = {}; // reset pour le mois courant
 
   saveTenant(code, t);
   res.json({ success: true });
 });
+
 
 app.get('/whoami', authRequired, (req, res) => {
   res.json({ role: req.user?.role, user: req.user?.user_id, company: req.user?.company_code });
