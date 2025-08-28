@@ -1101,24 +1101,29 @@ app.patch('/announcements/:id', authRequired, async (req, res) => {
   }
 });
 
-// POST /announcements/upload
-// FormData: title (string), published_at? (ISO), pdf (file: application/pdf)
+// ========== UPLOAD ==========
 app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req, res) => {
   try {
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
     if (!req.file) return res.status(400).json({ error: "PDF manquant" });
-    if (req.file.mimetype !== "application/pdf") return res.status(400).json({ error: "Seuls les PDF sont acceptés" });
+    if (req.file.mimetype !== "application/pdf") {
+      return res.status(400).json({ error: "Seuls les PDF sont acceptés" });
+    }
 
     const folderId = process.env.GDRIVE_FOLDER_ID;
     if (!folderId) return res.status(500).json({ error: "Drive not configured (GDRIVE_FOLDER_ID)" });
 
-    const { drive } = ensureDrive(); // récupère le client Drive déjà initialisé
+    // 👇 Client + auth, et on force l’obtention d’un access_token
+    const { drive, driveAuth } = ensureDrive();
+    await driveAuth.authorize();
+
     const title = String(req.body?.title || "Document");
     const published_at = String(req.body?.published_at || new Date().toISOString());
 
-    // 1) Upload vers Drive
+    // 1) Upload vers Drive (Shared Drives ok)
     const createRes = await drive.files.create({
-      supportsAllDrives: true, // ✅ important pour les dossiers partagés
+      auth: driveAuth,
+      supportsAllDrives: true,
       requestBody: {
         name: req.file.originalname || `doc_${Date.now()}.pdf`,
         parents: [folderId],
@@ -1134,10 +1139,11 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     const fileId = createRes.data.id;
     const fileName = createRes.data.name || "document.pdf";
 
-    // 2) Rendre accessible par lien (optionnel)
+    // 2) Lien public (optionnel)
     try {
       if ((process.env.GDRIVE_PUBLIC || "true") === "true") {
         await drive.permissions.create({
+          auth: driveAuth,
           fileId,
           supportsAllDrives: true,
           requestBody: { role: "reader", type: "anyone" },
@@ -1150,7 +1156,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
     const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
-    // 3) Enregistrer l’annonce
+    // 3) Enregistrement de l’annonce
     let saved = null;
     await withRegistryUpdate((next) => {
       const code = req.user.company_code;
@@ -1163,7 +1169,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
         id: crypto.randomUUID(),
         type: "pdf",
         title: title.trim(),
-        url: webViewLink, // compat côté app
+        url: webViewLink,
         file: {
           driveFileId: fileId,
           name: fileName,
@@ -1200,7 +1206,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
       console.warn("[push] announcement skipped", e?.message || e);
     }
 
-    return res.status(201).json({ ok: true, announcement: saved }); // ✅
+    return res.status(201).json({ ok: true, announcement: saved });
   } catch (e) {
     console.error("[announcements/upload] drive error:", e?.response?.status, e?.response?.data || e);
     return res.status(500).json({ error: "Upload Google Drive impossible" });
@@ -1208,8 +1214,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
 });
 
 
-
-// Supprimer (OWNER) + effacer dans Drive si l’annonce vient de l’upload
+// ========== DELETE ==========
 app.delete('/announcements/:id', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
@@ -1232,19 +1237,20 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
       return true;
     });
 
-    // Efface le fichier Drive si on a un driveFileId
-try {
-  if (removed?.type === 'pdf' && removed?.file?.driveFileId) {
-    const { drive } = ensureDrive();               // 👈 unifie l’accès au client
-    await drive.files.delete({
-      fileId: removed.file.driveFileId,
-      supportsAllDrives: true,                     // 👈 important en Shared drive
-    });
-  }
-} catch (e) {
-  console.warn('[Drive delete] skip:', e?.message || e);
-}
-
+    // Efface le fichier Drive, si présent
+    try {
+      if (removed?.type === 'pdf' && removed?.file?.driveFileId) {
+        const { drive, driveAuth } = ensureDrive();
+        await driveAuth.authorize();
+        await drive.files.delete({
+          auth: driveAuth,
+          fileId: removed.file.driveFileId,
+          supportsAllDrives: true,
+        });
+      }
+    } catch (e) {
+      console.warn('[Drive delete] skip:', e?.message || e);
+    }
 
     res.json({ ok: true });
   } catch (e) {
@@ -1254,6 +1260,7 @@ try {
     return res.status(500).json({ error: msg });
   }
 });
+
 
 // 1/ Démarrer une session d’upload Drive (resumable) et retourner l'uploadUrl
 app.post('/announcements/upload-url', authRequired, async (req, res) => {
