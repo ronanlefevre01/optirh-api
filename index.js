@@ -1259,7 +1259,7 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
     if (!(await requireDrive(res))) return;
 
-    const { drive: driveClient } = await ensureDrive();
+    const { driveAuth } = await ensureDrive(); // on utilise le client HTTP signé
 
     const { fileName, mimeType, fileSize } = req.body || {};
     if (!fileName || !mimeType || typeof fileSize !== 'number') {
@@ -1268,32 +1268,36 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    // crée une session resumable → Location dans les headers
-    const resp = await driveClient.files.create(
-      {
-        supportsAllDrives: true,
-        requestBody: { name: safeName, parents: [process.env.GDRIVE_FOLDER_ID], mimeType },
-        media: { mimeType },  // on ne met PAS le body ici (c'est pour l'étape suivante)
-        fields: 'id',
+    // ⚠️ Requête HTTP brute → crée une session resumable
+    const resp = await driveAuth.request({
+      url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': mimeType,
+        'X-Upload-Content-Length': String(fileSize), // facultatif mais utile
       },
-      {
-        params: { uploadType: 'resumable' },
-        headers: {
-          'X-Upload-Content-Type': mimeType,
-          'X-Upload-Content-Length': String(fileSize),
-        },
-      }
-    );
+      data: {
+        name: safeName,
+        parents: [process.env.GDRIVE_FOLDER_ID],
+        mimeType,
+      },
+      // validateStatus: () => true, // optionnel si tu veux logger même en cas d'erreur
+    });
 
     const uploadUrl = resp?.headers?.location || resp?.headers?.Location || null;
     const fileId = resp?.data?.id || null;
 
     if (!uploadUrl) {
-      console.error('[Drive resumable] missing Location header', { status: resp?.status, headers: resp?.headers });
+      console.log('[Drive resumable] missing Location header', {
+        status: resp?.status,
+        headers: resp?.headers,
+        data: resp?.data,
+      });
       return res.status(500).json({ error: 'Failed to create resumable session (no Location header)' });
     }
 
-    res.json({ fileId, uploadUrl });
+    return res.json({ fileId, uploadUrl });
   } catch (e) {
     const status = e?.response?.status;
     console.error('[Drive resumable] error', status, e?.response?.data || e);
