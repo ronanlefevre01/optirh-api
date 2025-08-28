@@ -1208,9 +1208,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
 // ========== DELETE ==========
 app.delete('/announcements/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
     const id = String(req.params.id);
 
     let removed = null;
@@ -1230,47 +1228,98 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
       return true;
     });
 
-    // --- Effacement Drive (si PDF uploadé)
+    // --- Effacement sur Drive si c'est un PDF Drive
     try {
-      // gère ancien / nouveau schéma
-      const fileId =
-        removed?.file?.driveFileId ||
-        removed?.drive_file_id ||
-        null;
-
-      if (removed?.type === 'pdf' && fileId) {
+      if (removed?.type === 'pdf') {
         const { drive } = await ensureDrive();
 
-        try {
-          // tentative suppression définitive
-          await drive.files.delete({
-            fileId,
-            supportsAllDrives: true,
-          });
-          console.log('[Drive delete] permanently deleted', fileId);
-        } catch (err) {
-          const status = err?.response?.status;
-          const reason =
-            err?.response?.data?.error?.errors?.[0]?.reason ||
-            err?.errors?.[0]?.reason ||
-            err?.message;
+        // 1) Construire toutes les pistes d’ID possibles
+        const ids = new Set();
 
-          console.warn('[Drive delete] hard delete failed', { status, reason });
+        const add = (v) => { if (v && typeof v === 'string') ids.add(v); };
 
-          if (status === 404) {
-            // déjà supprimé → on considère OK
-            console.log('[Drive delete] already gone', fileId);
-          } else if (status === 403 || status === 400) {
-            // pas le rôle “Gestionnaire de contenu” ? → on met à la corbeille
-            await drive.files.update({
-              fileId,
-              supportsAllDrives: true,
-              requestBody: { trashed: true },
-            });
-            console.log('[Drive delete] moved to trash', fileId);
-          } else {
-            throw err; // autre erreur → laisser remonter au catch suivant
+        add(removed?.file?.driveFileId);
+        add(removed?.drive_file_id);
+
+        const grabIdFromLink = (link) => {
+          if (!link) return null;
+          // https://drive.google.com/file/d/<ID>/view?...  (webViewLink / url)
+          const m = String(link).match(/\/file\/d\/([^/]+)/);
+          return m ? m[1] : null;
+        };
+        add(grabIdFromLink(removed?.url));
+        add(grabIdFromLink(removed?.file?.webViewLink));
+
+        // 2) Tentative de delete/trash par ID
+        const tryDeleteById = async (fileId) => {
+          if (!fileId) return false;
+          try {
+            await drive.files.delete({ fileId, supportsAllDrives: true });
+            console.log('[Drive delete] permanently deleted', fileId);
+            return true;
+          } catch (err) {
+            const status = err?.response?.status;
+            const reason =
+              err?.response?.data?.error?.errors?.[0]?.reason ||
+              err?.errors?.[0]?.reason || err?.message;
+
+            console.warn('[Drive delete] hard delete failed', { status, reason });
+
+            if (status === 404) {
+              // introuvable pour le SA → on dira "OK" seulement si on le retrouve plus tard par recherche
+              return false;
+            }
+            if (status === 403 || status === 400) {
+              // pas le droit de delete définitif → corbeille
+              await drive.files.update({
+                fileId,
+                supportsAllDrives: true,
+                requestBody: { trashed: true },
+              });
+              console.log('[Drive delete] moved to trash', fileId);
+              return true;
+            }
+            throw err;
           }
+        };
+
+        let deleted = false;
+        for (const fid of ids) {
+          // stop dès que l’un des IDs a fonctionné
+          // eslint-disable-next-line no-await-in-loop
+          if (await tryDeleteById(fid)) { deleted = true; break; }
+        }
+
+        // 3) Fallback – recherche par nom dans le dossier partagé
+        if (!deleted) {
+          const name = removed?.file?.name || (removed?.title ? `${removed.title}` : null);
+          if (name) {
+            const q = [
+              `name = '${name.replace(/'/g, "\\'")}'`,
+              `'${process.env.GDRIVE_FOLDER_ID}' in parents`,
+              `mimeType = 'application/pdf'`,
+            ].join(' and ');
+
+            const list = await drive.files.list({
+              q,
+              corpora: 'drive',
+              driveId: process.env.GDRIVE_DRIVE_ID || undefined, // optionnel si tu l’as
+              includeItemsFromAllDrives: true,
+              supportsAllDrives: true,
+              pageSize: 10,
+              fields: 'files(id, name, trashed, parents)',
+            });
+
+            const found = list?.data?.files || [];
+            for (const f of found) {
+              // eslint-disable-next-line no-await-in-loop
+              if (await tryDeleteById(f.id)) { deleted = true; break; }
+            }
+          }
+        }
+
+        if (!deleted) {
+          console.warn('[Drive delete] no matching file could be deleted (not found/permissions).');
         }
       }
     } catch (e) {
