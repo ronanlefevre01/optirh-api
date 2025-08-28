@@ -1257,10 +1257,9 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
 app.post('/announcements/upload-url', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
-    if (!(await requireDrive(res))) return;
+    if (!requireDrive(res)) return;
 
-
-    const { driveAuth } = await ensureDrive();
+    const { drive } = ensureDrive();
     const { fileName, mimeType, fileSize } = req.body || {};
     if (!fileName || !mimeType || typeof fileSize !== 'number') {
       return res.status(400).json({ error: 'fileName, mimeType, fileSize required' });
@@ -1268,36 +1267,52 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
 
-    const resp = await driveAuth.request({
-      url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=UTF-8',
-        'X-Upload-Content-Type': mimeType,
-        'X-Upload-Content-Length': String(fileSize),
+    // IMPORTANT: utiliser le client googleapis + params uploadType=resumable
+    const resp = await drive.files.create(
+      {
+        supportsAllDrives: true,
+        requestBody: {
+          name: safeName,
+          parents: [GDRIVE_FOLDER_ID],
+          mimeType,
+        },
+        // media.mimeType suffit pour le handshake; le contenu sera PUT ensuite
+        media: { mimeType },
+        fields: 'id',
       },
-      data: { name: safeName, parents: [GDRIVE_FOLDER_ID], mimeType },
-    });
+      {
+        params: { uploadType: 'resumable' },
+        headers: {
+          'Content-Type': 'application/json; charset=UTF-8',
+          'X-Upload-Content-Type': mimeType,
+          'X-Upload-Content-Length': String(fileSize),
+        },
+      }
+    );
 
-    const uploadUrl = resp.headers?.location || resp.headers?.Location;
-    const fileId = resp.data?.id || null;
+    const uploadUrl = resp?.headers?.location || resp?.headers?.Location || null;
+    const fileId = resp?.data?.id || null;
 
     if (!uploadUrl) {
-      console.error('[Drive resumable] missing Location header', {
-        status: resp.status, headers: resp.headers, data: resp.data
+      console.error('[Drive resumable] Missing Location header', {
+        status: resp?.status,
+        headers: resp?.headers,
+        data: resp?.data,
       });
       return res.status(500).json({ error: 'Failed to create resumable session (no Location header)' });
     }
-    res.json({ fileId, uploadUrl });
+
+    return res.json({ fileId, uploadUrl });
   } catch (e) {
     const status = e?.response?.status;
     console.error('[Drive resumable] error', status, e?.response?.data || e);
-    if (status === 401) return res.status(401).json({ error: 'UNAUTHENTICATED (clé service account manquante)'}); // ← cas actuel
-    if (status === 403) return res.status(403).json({ error: 'Insufficient permissions (partage du dossier ?)'}); 
+    if (status === 401) return res.status(401).json({ error: 'UNAUTHENTICATED (clé service account manquante)' });
+    if (status === 403) return res.status(403).json({ error: 'Insufficient permissions (partage du dossier ?)' });
     if (status === 404) return res.status(404).json({ error: 'Folder not found' });
     return res.status(500).json({ error: 'Failed to create resumable session' });
   }
 });
+
 
 // >>> DEBUG DRIVE – A ENLEVER APRÈS VERIF
 app.get('/__drive/debug', (req, res) => {
