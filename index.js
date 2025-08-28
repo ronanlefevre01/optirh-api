@@ -1208,7 +1208,9 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
 // ========== DELETE ==========
 app.delete('/announcements/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (req.user.role !== 'OWNER') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const id = String(req.params.id);
 
     let removed = null;
@@ -1228,21 +1230,54 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
       return true;
     });
 
+    // --- Effacement Drive (si PDF uploadé)
     try {
-      if (removed?.type === 'pdf' && removed?.file?.driveFileId) {
+      // gère ancien / nouveau schéma
+      const fileId =
+        removed?.file?.driveFileId ||
+        removed?.drive_file_id ||
+        null;
+
+      if (removed?.type === 'pdf' && fileId) {
         const { drive } = await ensureDrive();
-        // pas d'authorize() ici non plus
-        await drive.files.delete({
-          // auth: driveAuth, // facultatif
-          fileId: removed.file.driveFileId,
-          supportsAllDrives: true,
-        });
+
+        try {
+          // tentative suppression définitive
+          await drive.files.delete({
+            fileId,
+            supportsAllDrives: true,
+          });
+          console.log('[Drive delete] permanently deleted', fileId);
+        } catch (err) {
+          const status = err?.response?.status;
+          const reason =
+            err?.response?.data?.error?.errors?.[0]?.reason ||
+            err?.errors?.[0]?.reason ||
+            err?.message;
+
+          console.warn('[Drive delete] hard delete failed', { status, reason });
+
+          if (status === 404) {
+            // déjà supprimé → on considère OK
+            console.log('[Drive delete] already gone', fileId);
+          } else if (status === 403 || status === 400) {
+            // pas le rôle “Gestionnaire de contenu” ? → on met à la corbeille
+            await drive.files.update({
+              fileId,
+              supportsAllDrives: true,
+              requestBody: { trashed: true },
+            });
+            console.log('[Drive delete] moved to trash', fileId);
+          } else {
+            throw err; // autre erreur → laisser remonter au catch suivant
+          }
+        }
       }
     } catch (e) {
       console.warn('[Drive delete] skip:', e?.message || e);
     }
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
     const msg = String(e.message || e);
     if (msg.includes('Announcement not found')) return res.status(404).json({ error: msg });
