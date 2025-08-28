@@ -1112,7 +1112,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     const folderId = process.env.GDRIVE_FOLDER_ID;
     if (!folderId) return res.status(500).json({ error: "Drive not configured (GDRIVE_FOLDER_ID)" });
 
-    const drive = getDriveClient(); // ✅ client avec GoogleAuth
+    const { drive } = ensureDrive(); // récupère le client Drive déjà initialisé
     const title = String(req.body?.title || "Document");
     const published_at = String(req.body?.published_at || new Date().toISOString());
 
