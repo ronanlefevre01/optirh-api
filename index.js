@@ -1868,6 +1868,22 @@ app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
   res.json({ success: true });
 });
 
+// Liste des formules visibles côté Employé (lecture seule)
+app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const t = bonusEnsureStruct(getTenant(code));
+  const list = (t.bonusV3.formulas.order || [])
+    .map(id => t.bonusV3.formulas.byId[id])
+    .filter(Boolean)
+    .map(f => ({
+      id: f.id,
+      title: f.title,
+      // côté employé on a besoin des champs pour afficher le formulaire
+      fields: f.fields || [],
+    }));
+  res.json(list);
+});
+
 
 app.get('/whoami', authRequired, (req, res) => {
   res.json({ role: req.user?.role, user: req.user?.user_id, company: req.user?.company_code });
