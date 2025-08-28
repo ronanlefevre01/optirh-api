@@ -299,6 +299,12 @@ function bufferToStream(buffer) {
   return stream;
 }
 
+// Activer un faux utilisateur en dev pour tester facilement les routes
+// parse JSON tôt si pas déjà fait
+app.use(express.json());
+
+// ✅ ping sans auth
+app.get('/ping', (_req, res) => res.type('text').send('pong'));
 
 
 /** ===== HEALTH ===== */

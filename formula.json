@@ -1,0 +1,12 @@
+{
+  "version": 3,
+  "id": "demo-1",
+  "title": "Démo 20% HT",
+  "fields": [
+    { "key": "totalTTC", "label": "Total TTC", "type": "money_ttc", "required": true, "defaultVAT": 0.20, "vatKey": "totalVAT" },
+    { "key": "totalVAT", "label": "TVA",       "type": "vat",       "required": true, "default": 0.20 }
+  ],
+  "rules": [
+    { "type": "percent", "rate": 0.20, "base": { "kind": "field", "key": "totalTTC", "mode": "HT", "vatKey": "totalVAT" } }
+  ]
+}
