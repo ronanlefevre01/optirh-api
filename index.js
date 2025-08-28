@@ -159,7 +159,7 @@ async function withRegistryUpdate(mutator, maxRetry = 3) {
 
 /** ===== HELPERS AGENDA & PUSH ===== */
 
-// S'assure que les tableaux existent dans le tenant
+
 // S'assure que les champs de base existent dans le tenant
 function ensureTenantDefaults(t) {
   const obj = (t && typeof t === 'object') ? t : {};
@@ -175,8 +175,25 @@ function ensureTenantDefaults(t) {
     obj.settings.leave_count_mode = 'ouvres'; // 'ouvres' ou 'ouvrables'
   }
 
+  // ✅ Ventes bonifiées v3 (multi-formules)
+  if (!obj.bonusV3) {
+    obj.bonusV3 = {
+      formulas: { byId: {}, order: [] }, // plusieurs formules gérées par id
+      entries: {},                        // { "YYYY-MM": { [empId]: [ { formulaId, sale, bonus, at } ] } }
+      ledger: {},                         // { "YYYY-MM": { frozenAt, byEmployee:{}, byFormula:{} } }
+    };
+  } else {
+    // robustesse si des clés manquent déjà
+    obj.bonusV3.formulas = obj.bonusV3.formulas || { byId: {}, order: [] };
+    obj.bonusV3.formulas.byId = obj.bonusV3.formulas.byId || {};
+    obj.bonusV3.formulas.order = Array.isArray(obj.bonusV3.formulas.order) ? obj.bonusV3.formulas.order : [];
+    obj.bonusV3.entries = obj.bonusV3.entries || {};
+    obj.bonusV3.ledger = obj.bonusV3.ledger || {};
+  }
+
   return obj;
 }
+
 
 
 // Chevauchement de périodes "YYYY-MM-DD"
