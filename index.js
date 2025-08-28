@@ -1106,23 +1106,19 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
   try {
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
     if (!req.file) return res.status(400).json({ error: "PDF manquant" });
-    if (req.file.mimetype !== "application/pdf") {
-      return res.status(400).json({ error: "Seuls les PDF sont acceptés" });
-    }
+    if (req.file.mimetype !== "application/pdf") return res.status(400).json({ error: "Seuls les PDF sont acceptés" });
 
     const folderId = process.env.GDRIVE_FOLDER_ID;
     if (!folderId) return res.status(500).json({ error: "Drive not configured (GDRIVE_FOLDER_ID)" });
 
-    // 👇 Client + auth, et on force l’obtention d’un access_token
-    const { drive, driveAuth } = ensureDrive();
-    await driveAuth.authorize();
-
+    // Client Drive basé sur le JWT du service account
+    const { drive, driveAuth } = ensureDrive(); // driveAuth OK, mais on n'appelle PAS authorize()
     const title = String(req.body?.title || "Document");
     const published_at = String(req.body?.published_at || new Date().toISOString());
 
-    // 1) Upload vers Drive (Shared Drives ok)
+    // 1) Upload (Shared Drives OK)
     const createRes = await drive.files.create({
-      auth: driveAuth,
+      // auth: driveAuth, // optionnel car le client 'drive' est déjà créé avec ce JWT
       supportsAllDrives: true,
       requestBody: {
         name: req.file.originalname || `doc_${Date.now()}.pdf`,
@@ -1143,7 +1139,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     try {
       if ((process.env.GDRIVE_PUBLIC || "true") === "true") {
         await drive.permissions.create({
-          auth: driveAuth,
+          // auth: driveAuth, // idem, facultatif
           fileId,
           supportsAllDrives: true,
           requestBody: { role: "reader", type: "anyone" },
@@ -1156,7 +1152,7 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
     const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
-    // 3) Enregistrement de l’annonce
+    // 3) Enregistrer l’annonce
     let saved = null;
     await withRegistryUpdate((next) => {
       const code = req.user.company_code;
@@ -1213,7 +1209,6 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
   }
 });
 
-
 // ========== DELETE ==========
 app.delete('/announcements/:id', authRequired, async (req, res) => {
   try {
@@ -1237,13 +1232,12 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
       return true;
     });
 
-    // Efface le fichier Drive, si présent
     try {
       if (removed?.type === 'pdf' && removed?.file?.driveFileId) {
         const { drive, driveAuth } = ensureDrive();
-        await driveAuth.authorize();
+        // pas d'authorize() ici non plus
         await drive.files.delete({
-          auth: driveAuth,
+          // auth: driveAuth, // facultatif
           fileId: removed.file.driveFileId,
           supportsAllDrives: true,
         });
@@ -1260,6 +1254,7 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
 
 
 // 1/ Démarrer une session d’upload Drive (resumable) et retourner l'uploadUrl
