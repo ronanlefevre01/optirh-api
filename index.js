@@ -1108,46 +1108,47 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
     if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
     if (!req.file) return res.status(400).json({ error: "PDF manquant" });
     if (req.file.mimetype !== "application/pdf") return res.status(400).json({ error: "Seuls les PDF sont acceptés" });
-    if (!requireDrive(res)) return;
 
+    const folderId = process.env.GDRIVE_FOLDER_ID;
+    if (!folderId) return res.status(500).json({ error: "Drive not configured (GDRIVE_FOLDER_ID)" });
+
+    const drive = getDriveClient(); // ✅ client avec GoogleAuth
     const title = String(req.body?.title || "Document");
     const published_at = String(req.body?.published_at || new Date().toISOString());
 
-    // 1) Upload vers Drive (IMPORTANT: supportsAllDrives)
-const createRes = await drive.files.create({
-  supportsAllDrives: true,                          
-  requestBody: {
-    name: req.file.originalname || `doc_${Date.now()}.pdf`,
-    parents: [GDRIVE_FOLDER_ID],
-    mimeType: "application/pdf",
-  },
-  media: {
-    mimeType: "application/pdf",
-    body: bufferToStream(req.file.buffer),
-  },
-  fields: "id,name",
-});
-
-const fileId = createRes.data.id;
-const fileName = createRes.data.name || "document.pdf";
-
-// 2) Rendre public (optionnel) — ne jamais faire planter l’upload
-try {
-  if (GDRIVE_PUBLIC) {
-    await drive.permissions.create({
-      fileId,
-      requestBody: { role: "reader", type: "anyone" },
-      supportsAllDrives: true,                       // 👈 garde-le aussi ici
+    // 1) Upload vers Drive
+    const createRes = await drive.files.create({
+      supportsAllDrives: true, // ✅ important pour les dossiers partagés
+      requestBody: {
+        name: req.file.originalname || `doc_${Date.now()}.pdf`,
+        parents: [folderId],
+        mimeType: "application/pdf",
+      },
+      media: {
+        mimeType: "application/pdf",
+        body: bufferToStream(req.file.buffer),
+      },
+      fields: "id,name",
     });
-  }
-} catch (e) {
-  console.warn("[Drive perms] lien public non appliqué :", e?.message || e);
-}
 
-// Liens
-const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
-const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+    const fileId = createRes.data.id;
+    const fileName = createRes.data.name || "document.pdf";
 
+    // 2) Rendre accessible par lien (optionnel)
+    try {
+      if ((process.env.GDRIVE_PUBLIC || "true") === "true") {
+        await drive.permissions.create({
+          fileId,
+          supportsAllDrives: true,
+          requestBody: { role: "reader", type: "anyone" },
+        });
+      }
+    } catch (e) {
+      console.warn("[Drive perms] lien public non appliqué:", e?.message || e);
+    }
+
+    const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
+    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
     // 3) Enregistrer l’annonce
     let saved = null;
@@ -1166,7 +1167,7 @@ const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
         file: {
           driveFileId: fileId,
           name: fileName,
-          size: req.file.size || null,
+          size: req.file.size ?? null,
           mime: "application/pdf",
           webViewLink,
           downloadUrl,
@@ -1183,7 +1184,7 @@ const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
       return true;
     });
 
-    // Push optionnel
+    // 4) Push (optionnel)
     try {
       const reg = await loadRegistry();
       const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
@@ -1199,12 +1200,13 @@ const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
       console.warn("[push] announcement skipped", e?.message || e);
     }
 
-    return res.status(201).json({ ok: true, announcement: saved });
+    return res.status(201).json({ ok: true, announcement: saved }); // ✅
   } catch (e) {
-  console.error("[announcements/upload] drive error:", e?.code, e?.message, e?.errors || e?.response?.data || e);
-  return res.status(500).json({ error: "Upload Google Drive impossible" });
-}
+    console.error("[announcements/upload] drive error:", e?.response?.status, e?.response?.data || e);
+    return res.status(500).json({ error: "Upload Google Drive impossible" });
+  }
 });
+
 
 
 // Supprimer (OWNER) + effacer dans Drive si l’annonce vient de l’upload
