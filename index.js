@@ -1345,6 +1345,29 @@ app.get("/__drive/selftest", async (req, res) => {
   }
 });
 
+app.get('/__drive/check-folder', async (req, res) => {
+  try {
+    const { drive } = await ensureDrive();
+    const folderId = process.env.GDRIVE_FOLDER_ID;
+    const meta = await drive.files.get({
+      fileId: folderId,
+      fields: 'id,name,mimeType,driveId,parents',
+      supportsAllDrives: true,
+    });
+    res.json({
+      ok: true,
+      id: meta.data.id,
+      name: meta.data.name,
+      mimeType: meta.data.mimeType,
+      driveId: meta.data.driveId,
+      inSharedDrive: !!meta.data.driveId
+    });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e?.message || e });
+  }
+});
+
+
 
 
 // 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
