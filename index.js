@@ -104,70 +104,6 @@ async function requireDrive(res) {
     return false;
   }
 }
-// ==== BONUS V3 HELPERS — à garder UNE seule fois ====
-
-// Index du personnel depuis le tenant
-function bonusGetStaffIndex(t) {
-  const list = Array.isArray(t.employees) ? t.employees
-            : Array.isArray(t.staff)      ? t.staff
-            : [];
-
-  const byId = Object.create(null);
-  const emailToId = Object.create(null);
-  const displayById = Object.create(null);
-  const roleById = Object.create(null);
-
-  for (const p of list) {
-    const id = String(p.user_id ?? p.id ?? p._id ?? p.code ?? p.email ?? '').trim();
-    if (!id) continue;
-
-    byId[id] = p;
-
-    const email = p.email ? String(p.email).trim().toLowerCase() : null;
-    if (email) emailToId[email] = id;
-
-    const first = p.first_name ?? p.firstName ?? p.given_name ?? p.givenName;
-    const last  = p.last_name  ?? p.lastName  ?? p.family_name ?? p.familyName;
-    const name  = [first, last].filter(Boolean).join(' ').trim()
-               || p.name || p.full_name || p.displayName || p.email || id;
-
-    displayById[id] = { id, name, email: p.email ?? null };
-    roleById[id]    = (p.role || p.user_role || p.type || '').toUpperCase() || null;
-  }
-
-  return { byId, emailToId, displayById, roleById };
-}
-
-// Normalisation d’un identifiant employé
-function bonusCanonicalEmpId(t, raw) {
-  if (raw == null) return null;
-  const s = String(raw).trim();
-  if (!s || s === 'undefined' || s === 'null') return null;
-
-  const { emailToId } = bonusGetStaffIndex(t);
-  const isEmail = s.includes('@') && !s.includes(' ');
-  if (isEmail) {
-    const id = emailToId[s.toLowerCase()];
-    if (id) return id;
-  }
-  return s;
-}
-
-// Récupérer l’ID employé depuis la requête
-function bonusEmpIdFromReq(req, t) {
-  const u = req.user || {};
-  const hdr = req.headers || {};
-  const raw =
-    u.user_id ?? u.id ?? u._id ?? u.uid ?? u.sub ??
-    hdr['x-user-id'] ?? hdr['x-user'] ??
-    u.email ?? u.username ?? u.code;
-
-  return bonusCanonicalEmpId(t, raw); // -> string | null
-}
-
-// (facultatif) alias si du vieux code appelle encore canonicalEmpId()
-const canonicalEmpId = (t, raw) => bonusCanonicalEmpId(t, raw);
-
 
 
 /** ===== UTILS ===== */
@@ -1756,14 +1692,13 @@ app.patch('/settings', authRequired, async (req, res) => {
   }
 });
 
-// ===================== Bonus V3 routes (multi-formules) ===================== //
+// =========================== BONUS V3 — HELPERS ===========================
 
-
-// Helpers avec noms uniques (évite les collisions)
+// Rôles / infos de base
 const bonusRoleOf = (req) => String(req.user?.role || '').toUpperCase();
 const bonusCompanyCodeOf = (req) => req.user?.company_code || req.user?.companyCode;
-const bonusUserIdOf = (req) => req.user?.user_id || req.user?.id || req.user?.sub || req.user?.email;
 
+// Middlewares
 function bonusRequireOwner(req, res, next) {
   if (bonusRoleOf(req) === 'OWNER') return next();
   return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
@@ -1774,6 +1709,7 @@ function bonusRequireEmployeeOrOwner(req, res, next) {
   return res.status(403).json({ error: 'FORBIDDEN_EMPLOYEE' });
 }
 
+// Squelette Bonus V3 sur le tenant
 function bonusEnsureStruct(t) {
   t.bonusV3 = t.bonusV3 || {};
   t.bonusV3.formulas = t.bonusV3.formulas || { byId: {}, order: [] };
@@ -1782,15 +1718,75 @@ function bonusEnsureStruct(t) {
   return t;
 }
 
-// --- Bonus V3: s'assurer que la structure existe dans le tenant ---
-function ensureBonusV3(t) {
-  t = (t && typeof t === 'object') ? t : {};
-  t.bonusV3 = t.bonusV3 || {};
-  t.bonusV3.formulas = t.bonusV3.formulas || { byId: {}, order: [] };
-  t.bonusV3.entries  = t.bonusV3.entries  || {}; // { [YYYY-MM]: { [empId]: [ {formulaId, sale, bonus, at} ] } }
-  t.bonusV3.ledger   = t.bonusV3.ledger   || {}; // { [YYYY-MM]: { frozenAt, byEmployee, byFormula } }
-  return t;
+// Index du personnel (id/email/affichage)
+function bonusGetStaffIndex(t) {
+  const list = Array.isArray(t.employees) ? t.employees
+            : Array.isArray(t.staff)      ? t.staff
+            : [];
+
+  const byId = Object.create(null);
+  const emailToId = Object.create(null);
+  const displayById = Object.create(null);
+  const roleById = Object.create(null);
+
+  for (const p of list) {
+    const id = String(p.user_id ?? p.id ?? p._id ?? p.code ?? p.email ?? '').trim();
+    if (!id) continue;
+
+    byId[id] = p;
+
+    const email = p.email ? String(p.email).trim().toLowerCase() : null;
+    if (email) emailToId[email] = id;
+
+    const first = p.first_name ?? p.firstName ?? p.given_name ?? p.givenName;
+    const last  = p.last_name  ?? p.lastName  ?? p.family_name ?? p.familyName;
+    const name  =
+      [first, last].filter(Boolean).join(' ').trim() ||
+      p.name || p.full_name || p.displayName || p.email || id;
+
+    displayById[id] = { id, name, email: p.email ?? null };
+    roleById[id] = (p.role || p.user_role || p.type || '').toUpperCase() || null;
+  }
+  return { byId, emailToId, displayById, roleById };
 }
+
+// Normalise un identifiant employé (email -> id connu)
+function bonusCanonicalEmpId(t, raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s || s === 'undefined' || s === 'null') return null;
+  const { emailToId } = bonusGetStaffIndex(t);
+  const isEmail = s.includes('@') && !s.includes(' ');
+  return isEmail ? (emailToId[s.toLowerCase()] || s) : s;
+}
+
+// Récupère l'id employé depuis req + normalisation
+function bonusEmpIdFromReq(req, t) {
+  const u = req.user || {};
+  const hdr = req.headers || {};
+  const raw =
+    u.user_id ?? u.id ?? u._id ?? u.uid ?? u.sub ??
+    hdr['x-user-id'] ?? hdr['x-user'] ??
+    u.email ?? u.username ?? u.code;
+  return bonusCanonicalEmpId(t, raw);
+}
+
+// (optionnel) Petite migration pour fusionner emails -> ids dans entries
+function bonusMigrateEntriesKeys(t) {
+  const months = Object.keys(t?.bonusV3?.entries || {});
+  for (const m of months) {
+    const src = t.bonusV3.entries[m] || {};
+    const dst = {};
+    for (const k of Object.keys(src)) {
+      const canon = bonusCanonicalEmpId(t, k);
+      if (!canon) continue;
+      (dst[canon] = dst[canon] || []).push(...(src[k] || []));
+    }
+    t.bonusV3.entries[m] = dst;
+  }
+}
+
+// =========================== BONUS V3 — ROUTES ===========================
 
 // 1) LISTER les formules (OWNER)
 app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, (req, res) => {
@@ -1850,24 +1846,60 @@ app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, (req, res) 
 });
 
 // 5) SAISIE d'une vente (EMPLOYEE ou OWNER)
-// Saisie d'une vente
+app.post('/bonusV3/sale', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+  try {
+    const code = bonusCompanyCodeOf(req);
+    const t = bonusEnsureStruct(getTenant(code));
+    const m = monthKey();
 
+    // période figée ?
+    if (t.bonusV3.ledger?.[m]?.frozenAt) {
+      return res.status(409).json({ error: 'MONTH_FROZEN' });
+    }
 
-// Compteur employé
-app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const t = bonusEnsureStruct(getTenant(code));
+    // id employé normalisé
+    const empId = bonusEmpIdFromReq(req, t);
+    if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
 
-  const empId = bonusEmpIdFromReq(req, t);
-  if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+    const { formulaId, sale } = req.body || {};
+    if (!formulaId || typeof sale !== 'object') {
+      return res.status(400).json({ error: 'BAD_REQUEST' });
+    }
 
-  const m = String(req.query.month || monthKey());
-  const list = t.bonusV3.entries?.[m]?.[empId] || [];
-  const total = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
-  res.json({ month: m, total, count: list.length });
+    const formula = t.bonusV3.formulas?.byId?.[formulaId];
+    if (!formula) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
+
+    const bonus = Number(computeBonusV3(formula, sale) || 0);
+
+    if (!t.bonusV3.entries[m]) t.bonusV3.entries[m] = {};
+    if (!t.bonusV3.entries[m][empId]) t.bonusV3.entries[m][empId] = [];
+    t.bonusV3.entries[m][empId].push({ formulaId, sale, bonus, at: new Date().toISOString() });
+
+    saveTenant(code, t);
+    res.json({ success: true, bonus });
+  } catch (e) {
+    console.error('POST /bonusV3/sale failed', e);
+    res.status(500).json({ error: 'INTERNAL' });
+  }
 });
 
+// 6) COMPTEUR employé (EMPLOYEE ou OWNER)
+app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+  try {
+    const code = bonusCompanyCodeOf(req);
+    const t = bonusEnsureStruct(getTenant(code));
+    const empId = bonusEmpIdFromReq(req, t);
+    if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
 
+    const m = String(req.query.month || monthKey());
+    const list = t.bonusV3.entries?.[m]?.[empId] || [];
+    const total = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
+    res.json({ month: m, total, count: list.length });
+  } catch (e) {
+    console.error('GET /bonusV3/my-total failed', e);
+    res.status(500).json({ error: 'INTERNAL' });
+  }
+});
 
 // 7) RÉCAP Patron (OWNER)
 app.get('/bonusV3/summary', authRequired, bonusRequireOwner, (req, res) => {
@@ -1875,42 +1907,40 @@ app.get('/bonusV3/summary', authRequired, bonusRequireOwner, (req, res) => {
   const m = String(req.query.month || monthKey());
   const t = bonusEnsureStruct(getTenant(code));
 
-  const rawByEmp = t.bonusV3.entries?.[m] || {};
+  // migration légère (fusion email -> id) si besoin
+  bonusMigrateEntriesKeys(t);
 
-  // 1) Fusionne les clés e-mail -> id canonique
-  const mergedByEmp = {};
-  for (const rawId of Object.keys(rawByEmp)) {
-    const id = bonusCanonicalEmpId(t, rawId);
-    if (!mergedByEmp[id]) mergedByEmp[id] = [];
-    mergedByEmp[id].push(...(rawByEmp[rawId] || []));
-  }
-
-  // 2) Agrégats
+  const byEmpRaw = t.bonusV3.entries?.[m] || {};
   const byEmployee = {};
   const byFormula = {};
-  for (const empId of Object.keys(mergedByEmp)) {
-    const list = mergedByEmp[empId] || [];
-    const tot = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
-    byEmployee[empId] = { total: tot, count: list.length };
+
+  for (const rawKey of Object.keys(byEmpRaw)) {
+    const canon = bonusCanonicalEmpId(t, rawKey);
+    if (!canon) continue;
+
+    const list = byEmpRaw[rawKey] || [];
+    const total = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
+
+    if (!byEmployee[canon]) byEmployee[canon] = { total: 0, count: 0 };
+    byEmployee[canon].total += total;
+    byEmployee[canon].count += list.length;
+
     for (const it of list) {
       byFormula[it.formulaId] = (byFormula[it.formulaId] || 0) + Number(it.bonus || 0);
     }
   }
 
-  // 3) Données d’affichage (nom/prénom/email)
   const { displayById } = bonusGetStaffIndex(t);
   const employees = {};
   for (const id of Object.keys(byEmployee)) {
     employees[id] = displayById[id] || { id, name: id, email: null };
   }
 
-  // 4) État et total global
   const frozen = Boolean(t.bonusV3.ledger?.[m]?.frozenAt);
   const totalAll = Object.values(byEmployee).reduce((s, x) => s + (x.total || 0), 0);
 
   res.json({ month: m, totalAll, byEmployee, byFormula, employees, frozen });
 });
-
 
 // 8) FIGER la période (OWNER)
 app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
@@ -1918,7 +1948,10 @@ app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
   const m = String(req.query.month || monthKey());
   const t = bonusEnsureStruct(getTenant(code));
 
+  // fusion des clés avant figer
+  bonusMigrateEntriesKeys(t);
   const byEmp = t.bonusV3.entries?.[m] || {};
+
   const ledgerEmp = {};
   const ledgerFormula = {};
   for (const empId of Object.keys(byEmp)) {
@@ -1928,91 +1961,45 @@ app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
       ledgerFormula[it.formulaId] = (ledgerFormula[it.formulaId] || 0) + Number(it.bonus || 0);
     }
   }
+
   t.bonusV3.ledger[m] = {
     frozenAt: new Date().toISOString(),
     byEmployee: ledgerEmp,
     byFormula: ledgerFormula,
   };
-  t.bonusV3.entries[m] = {}; // reset pour le mois courant
+  t.bonusV3.entries[m] = {}; // ré-initialise le mois courant
 
   saveTenant(code, t);
   res.json({ success: true });
 });
 
-// 9) LISTE des ventes d’un employé pour un mois (OWNER)
-app.get('/bonusV3/entries', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
-  const empId = String(req.query.empId || '');
-  const m = String(req.query.month || monthKey());
-  if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
-
-  const t = ensureBonusV3(getTenant(code));
-  const list = t.bonusV3.entries?.[m]?.[empId] || [];
-  res.json({ month: m, empId, entries: list });
-});
-
-// 10) HISTORIQUE figé d’un employé (OWNER)
-app.get('/bonusV3/history', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
-  const empId = String(req.query.empId || '');
-  if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
-
-  const t = ensureBonusV3(getTenant(code));
-  const hist = [];
-  for (const [mon, led] of Object.entries(t.bonusV3.ledger || {})) {
-    const tot = Number((led.byEmployee || {})[empId] || 0);
-    if (tot || (led.byEmployee && Object.prototype.hasOwnProperty.call(led.byEmployee, empId))) {
-      hist.push({ month: mon, total: tot, frozenAt: led.frozenAt });
-    }
-  }
-  hist.sort((a, b) => (a.month < b.month ? 1 : -1)); // plus récent d’abord
-  res.json({ empId, history: hist });
-});
-
-
-// Liste des formules visibles côté Employé (lecture seule)
-app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+// 9) LISTE des ventes d’un employé pour un mois (OWNER) — route principale
+app.get('/bonusV3/entries', authRequired, bonusRequireOwner, (req, res) => {
   const code = bonusCompanyCodeOf(req);
   const t = bonusEnsureStruct(getTenant(code));
-  const list = (t.bonusV3.formulas.order || [])
-    .map(id => t.bonusV3.formulas.byId[id])
-    .filter(Boolean)
-    .map(f => ({
-      id: f.id,
-      title: f.title,
-      // côté employé on a besoin des champs pour afficher le formulaire
-      fields: f.fields || [],
-    }));
-  res.json(list);
-});
 
+  const rawEmp = String(req.query.empId || '').trim();
+  if (!rawEmp) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
 
-app.get('/whoami', authRequired, (req, res) => {
-  res.json({ role: req.user?.role, user: req.user?.user_id, company: req.user?.company_code });
-});
-
-// === Détail par employé (OWNER) ===
-// Liste des ventes d’un employé pour un mois (non figé)
-app.get('/bonusV3/employee-entries', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
-  const empId = String(req.query.empId || '').trim();
+  const empId = bonusCanonicalEmpId(t, rawEmp);
   const m = String(req.query.month || monthKey());
-  const t = ensureBonusV3(getTenant(code));
 
-  if (!empId) return res.status(400).json({ error: 'MISSING_EMP_ID' });
-
-  const list = t.bonusV3?.entries?.[m]?.[empId] || [];
-  // du plus récent au plus ancien
-  const sorted = [...list].sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
+  const list = t.bonusV3.entries?.[m]?.[empId] || [];
+  const sorted = [...list].sort((a, b) =>
+    String(b.at || '').localeCompare(String(a.at || ''))
+  );
   res.json({ month: m, empId, entries: sorted });
 });
 
-// Historique figé (totaux par mois) pour un employé
-app.get('/bonusV3/employee-history', authRequired, requireOwner, (req, res) => {
-  const code = req.user.company_code;
-  const empId = String(req.query.empId || '').trim();
-  const t = ensureBonusV3(getTenant(code));
-  if (!empId) return res.status(400).json({ error: 'MISSING_EMP_ID' });
+// 10) HISTORIQUE figé d’un employé (OWNER) — route principale
+app.get('/bonusV3/history', authRequired, bonusRequireOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const t = bonusEnsureStruct(getTenant(code));
+
+  const rawEmp = String(req.query.empId || '').trim();
+  if (!rawEmp) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
+
+  const empId = bonusCanonicalEmpId(t, rawEmp);
 
   const hist = Object.entries(t.bonusV3.ledger || {}).map(([month, led]) => {
     const total = Number((led.byEmployee && led.byEmployee[empId]) || 0);
@@ -2022,6 +2009,33 @@ app.get('/bonusV3/employee-history', authRequired, requireOwner, (req, res) => {
   hist.sort((a, b) => b.month.localeCompare(a.month)); // décroissant
   res.json({ empId, history: hist });
 });
+
+// 11) Liste des formules visibles côté Employé (lecture seule)
+app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const t = bonusEnsureStruct(getTenant(code));
+  const list = (t.bonusV3.formulas.order || [])
+    .map(id => t.bonusV3.formulas.byId[id])
+    .filter(Boolean)
+    .map(f => ({ id: f.id, title: f.title, fields: f.fields || [] }));
+  res.json(list);
+});
+
+// (optionnel) debug
+app.get('/whoami', authRequired, (req, res) => {
+  res.json({ role: req.user?.role, user: req.user?.user_id, company: req.user?.company_code });
+});
+
+// ----- Alias de compatibilité (si ton front appelle encore ces chemins) -----
+app.get('/bonusV3/employee-entries', authRequired, bonusRequireOwner, (req, res) => {
+  req.url = req.url.replace('/employee-entries', '/entries');
+  return app._router.handle(req, res, () => {});
+});
+app.get('/bonusV3/employee-history', authRequired, bonusRequireOwner, (req, res) => {
+  req.url = req.url.replace('/employee-history', '/history');
+  return app._router.handle(req, res, () => {});
+});
+
 
 
 
