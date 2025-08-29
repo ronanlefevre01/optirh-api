@@ -15,7 +15,6 @@ import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 
 
-
 const app = express();
 
 /** ===== CORS (whitelist) ===== */
@@ -423,6 +422,7 @@ app.post("/auth/activate-licence", async (req, res) => {
 });
 
 // Login Patron/Employé
+// Login Patron/Employé (hybride bcrypt + scrypt)
 app.post("/auth/login", async (req, res) => {
   try {
     const { company_code, email, password } = req.body || {};
@@ -434,18 +434,103 @@ app.post("/auth/login", async (req, res) => {
     if (!tenant) return res.status(404).json({ error: "Unknown company" });
 
     const users = tenant.users || {};
-    const user = Object.values(users).find(u => String(u.email).toLowerCase() === String(email).toLowerCase());
+    const user = Object.values(users).find(
+      (u) => String(u.email).toLowerCase() === String(email).toLowerCase()
+    );
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-    const ok = await bcrypt.compare(password, user.password_hash);
+    // --- vérif mdp : d'abord scrypt (nouveau coffre), sinon bcrypt (legacy)
+    let ok = false;
+    const empId = String(user.id);
+    const recById   = tenant?.auth?.byId?.[empId];
+    const recByMail = tenant?.auth?.byId?.[String(user.email || '').toLowerCase()];
+    const vault = recById || recByMail || null;
+
+    if (vault?.password) ok = pwdVerify(vault.password, password);
+    if (!ok && user.password_hash) ok = await bcrypt.compare(password, user.password_hash);
+
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-    const token = jwt.sign({ sub: user.id, company_code, role: user.role }, JWT_SECRET, { expiresIn: "30d" });
+    const token = jwt.sign(
+      { sub: user.id, company_code, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
     return res.json({ token, role: user.role });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
+// Changer son email de connexion (EMPLOYEE/OWNER)
+app.post('/auth/change-email', authRequired, async (req, res) => {
+  try {
+    const { currentPassword, newEmail } = req.body || {};
+    const code = req.user.company_code;
+
+    const email = String(newEmail || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+      return res.status(400).json({ error: 'BAD_EMAIL' });
+
+    const reg = await loadRegistry();
+    const t = reg.tenants?.[code];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+
+    const uid = String(req.user.sub);
+    const user = t.users?.[uid];
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Vérif mdp (scrypt d’abord, sinon bcrypt)
+    const vault = t?.auth?.byId?.[uid] || t?.auth?.byId?.[String(user.email || '').toLowerCase()];
+    let ok = false;
+    if (vault?.password) ok = pwdVerify(vault.password, String(currentPassword || ''));
+    if (!ok && user.password_hash)
+      ok = await bcrypt.compare(String(currentPassword || ''), user.password_hash);
+    if (!ok) return res.status(400).json({ error: 'BAD_CURRENT_PASSWORD' });
+
+    // Unicité
+    const already = Object.values(t.users || {}).some(
+      (u) => String(u.email).toLowerCase() === email && String(u.id) !== uid
+    );
+    if (already) return res.status(409).json({ error: 'EMAIL_TAKEN' });
+
+    const oldEmail = String(user.email || '').toLowerCase();
+
+    await withRegistryUpdate((next) => {
+      const tt = next.tenants?.[code];
+      if (!tt || !tt.users?.[uid]) throw new Error('User not found');
+
+      // MAJ user
+      tt.users[uid].email = email;
+      tt.updated_at = new Date().toISOString();
+
+      // MAJ profils (si tu utilises employee_profiles)
+      tt.employee_profiles = tt.employee_profiles || { byId: {} };
+      const pById = tt.employee_profiles.byId;
+
+      // si un profil existe sous uid ou ancienne clé email → synchronise
+      for (const key of [uid, oldEmail]) {
+        if (key && pById[key]) {
+          pById[key] = { ...pById[key], email, updatedAt: new Date().toISOString() };
+        }
+      }
+      // si aucun profil, on crée sous uid
+      if (!pById[uid]) {
+        pById[uid] = { email, updatedAt: new Date().toISOString() };
+      }
+      // nettoie l’ancienne clé e-mail si différente
+      if (oldEmail && oldEmail !== email && pById[oldEmail]) delete pById[oldEmail];
+
+      next.tenants[code] = tt;
+      return true;
+    });
+
+    return res.json({ success: true, email });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 
 /** ===== AUTH MIDDLEWARE ===== */
 function authRequired(req, res, next) {
@@ -768,7 +853,6 @@ app.get('/calendar/events', authRequired, async (req, res) => {
   }
 });
 
-/** ===== OWNER approuve/refuse + crée l'événement + push ===== */
 /** ===== OWNER: approve/deny + edit + cancel (agenda sync + push) ===== */
 app.patch('/leaves/:id', authRequired, async (req, res) => {
   try {
@@ -952,6 +1036,114 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
+// === OWNER crée un congé pour n'importe quel salarié (ou pour lui-même) ===
+app.post('/leaves/admin', authRequired, async (req, res) => {
+  try {
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+
+    const {
+      user_id,                // optionnel: si absent => le patron lui-même
+      start_date,
+      end_date,
+      type = 'paid',         // 'paid' | 'unpaid' | ...
+      reason = null,
+      status = 'approved',   // 'approved' (par défaut) ou 'pending'
+      force = false,         // si true, on passe malgré les conflits
+    } = req.body || {};
+
+    if (!start_date || !end_date) return res.status(400).json({ error: 'start_date & end_date required' });
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    if (!re.test(start_date) || !re.test(end_date)) return res.status(400).json({ error: 'bad date format' });
+    if (start_date > end_date) return res.status(400).json({ error: 'start_date must be <= end_date' });
+
+    const reg = await loadRegistry();
+    const code = req.user.company_code;
+    const t0 = reg.tenants?.[code];
+    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
+    const t = ensureTenantDefaults(t0);
+
+    const targetId = user_id != null ? Number(user_id) : Number(req.user.sub);
+    const target = Object.values(t.users || {}).find(u => Number(u.id) === targetId);
+    if (!target) return res.status(404).json({ error: 'Target user not found' });
+
+    // Conflits (on exclut l’utilisateur cible)
+    const confl = conflictsForPeriod(t, start_date, end_date, { excludeUserId: targetId });
+    if (confl.length && !force) return res.status(409).json({ error: 'conflict', conflicts: confl });
+
+    const now = new Date().toISOString();
+    const leave = {
+      id: crypto.randomUUID(),
+      company_code: code,
+      user_id: targetId,
+      requester: {
+        email: target.email,
+        first_name: target.first_name || '',
+        last_name: target.last_name || '',
+      },
+      start_date,
+      end_date,
+      type,
+      reason,
+      status: status === 'approved' ? 'approved' : 'pending',
+      decided_by: status === 'approved' ? req.user.sub : null,
+      decided_at: status === 'approved' ? now : null,
+      created_at: now,
+    };
+
+    let createdEvent = null;
+
+    await withRegistryUpdate((next) => {
+      const tt0 = next.tenants?.[code];
+      if (!tt0) throw new Error('Tenant not found');
+      const tt = ensureTenantDefaults(tt0);
+
+      tt.leaves = tt.leaves || [];
+      tt.leaves.unshift(leave);
+
+      if (leave.status === 'approved') {
+        const label = `Congé ${(leave.requester?.first_name || '') + ' ' + (leave.requester?.last_name || '')}`.trim();
+        const ev = {
+          id: crypto.randomUUID(),
+          leave_id: leave.id,
+          title: label || 'Congé',
+          start: leave.start_date,
+          end:   leave.end_date,
+          employee_id: leave.user_id,
+          created_at: now,
+        };
+        tt.calendar_events = tt.calendar_events || [];
+        tt.calendar_events.push(ev);
+        createdEvent = ev;
+      }
+
+      tt.updated_at = now;
+      next.tenants[code] = tt;
+      return true;
+    });
+
+    // Push au salarié concerné (si ce n’est pas le patron lui-même)
+    try {
+      const reg2 = await loadRegistry();
+      const t2 = ensureTenantDefaults(reg2.tenants?.[code] || {});
+      const tokens = (t2.devices || []).filter(d => Number(d.user_id) === targetId).map(d => d.token);
+      if (tokens.length) {
+        await sendExpoPush(tokens, {
+          title: leave.status === 'approved' ? 'Congé ajouté ✅' : 'Demande ajoutée 📝',
+          body: `${start_date} → ${end_date}`,
+          data: { type: 'leave', status: leave.status, leaveId: leave.id },
+        });
+      }
+    } catch (e) {
+      console.warn('[push] admin create skipped:', e?.message || e);
+    }
+
+    return res.status(201).json({ ok: true, leave, event: createdEvent, conflicts: confl || [] });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 
 // Modifier un événement d'agenda (OWNER)
 app.patch('/calendar/events/:id', authRequired, async (req, res) => {
@@ -2330,34 +2522,51 @@ app.patch('/profile/:empId', authRequired, (req, res) => {
 });
 
 // POST /auth/change-password  (EMPLOYEE/OWNER change son propre mot de passe)
-app.post('/auth/change-password', authRequired, (req, res) => {
-  const code = req.user.company_code;
-  let t = pwdEnsureStore(getTenant(code));  // store des mdp
-  t = profEnsure(t);                        // si tu as déjà ces helpers pour les profils
+app.post('/auth/change-password', authRequired, async (req, res) => {
+  try {
+    const code = req.user.company_code;
+    const reg = await loadRegistry();
+    const t = reg.tenants?.[code];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
 
-  const empId = profCanonicalEmpId(req, t) || req.user?.user_id || req.user?.email;
-  if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+    const uid = String(req.user.sub);              // id numérique créé à l’invitation
+    const user = t.users?.[uid];
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const { currentPassword, newPassword } = req.body || {};
-  if (typeof newPassword !== 'string' || newPassword.length < 8) {
-    return res.status(400).json({ error: 'WEAK_PASSWORD', message: 'Mot de passe trop court (min 8 caractères).' });
-  }
-
-  const rec = (t.auth.byId[empId] = t.auth.byId[empId] || {});
-
-  // Si un mot de passe existe déjà, on exige l’ancien
-  if (rec.password) {
-    if (typeof currentPassword !== 'string' || !pwdVerify(rec.password, currentPassword)) {
-      return res.status(400).json({ error: 'BAD_CURRENT_PASSWORD', message: 'Ancien mot de passe incorrect.' });
+    const { currentPassword, newPassword } = req.body || {};
+    if (!newPassword || String(newPassword).length < 8) {
+      return res.status(400).json({ error: 'WEAK_PASSWORD' });
     }
+
+    // Vérifier l’ancien mdp : bcrypt d’abord, sinon legacy scrypt
+    let ok = false;
+    if (user.password_hash) {
+      ok = await bcrypt.compare(String(currentPassword || ''), String(user.password_hash));
+    }
+    if (!ok && t.auth?.byId?.[uid]?.password) {
+      ok = pwdVerify(t.auth.byId[uid].password, String(currentPassword || ''));
+    }
+    if (!ok) return res.status(401).json({ error: 'INVALID_CURRENT_PASSWORD' });
+
+    const newHash = await bcrypt.hash(String(newPassword), 10);
+
+    // Écrire le nouveau hash au bon endroit + nettoyer l’ancien store
+    await withRegistryUpdate((next) => {
+      const tt = next.tenants?.[code];
+      if (!tt?.users?.[uid]) throw new Error('User not found');
+      tt.users[uid].password_hash = newHash;
+      if (tt.auth?.byId?.[uid]) delete tt.auth.byId[uid]; // supprime l’ancien scrypt
+      tt.updated_at = new Date().toISOString();
+      next.tenants[code] = tt;
+      return true;
+    });
+
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
   }
-
-  rec.password = pwdHash(newPassword);
-  rec.updatedAt = new Date().toISOString();
-
-  saveTenant(code, t);
-  return res.json({ success: true });
 });
+
 
 
 /** ===== START ===== */
