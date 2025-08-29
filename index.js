@@ -1849,68 +1849,6 @@ app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, (req, res) 
 
 // 5) SAISIE d'une vente (EMPLOYEE ou OWNER)
 // Saisie d'une vente
-// --- Index du personnel depuis le tenant --------------------
-function bonusGetStaffIndex(t) {
-  const list = Array.isArray(t.employees) ? t.employees
-            : Array.isArray(t.staff)      ? t.staff
-            : [];
-
-  const byId = Object.create(null);
-  const emailToId = Object.create(null);
-  const displayById = Object.create(null);
-  const roleById = Object.create(null);
-
-  for (const p of list) {
-    const id = String(p.user_id ?? p.id ?? p._id ?? p.code ?? p.email ?? '').trim();
-    if (!id) continue;
-
-    byId[id] = p;
-
-    const email = p.email ? String(p.email).trim().toLowerCase() : null;
-    if (email) emailToId[email] = id;
-
-    const first = p.first_name ?? p.firstName ?? p.given_name ?? p.givenName;
-    const last  = p.last_name  ?? p.lastName  ?? p.family_name ?? p.familyName;
-    const name  = [first, last].filter(Boolean).join(' ').trim()
-               || p.name || p.full_name || p.displayName || p.email || id;
-
-    displayById[id] = { id, name, email: p.email ?? null };
-    roleById[id]    = (p.role || p.user_role || p.type || '').toUpperCase() || null;
-  }
-
-  return { byId, emailToId, displayById, roleById };
-}
-
-// --- Normalisation d'un identifiant employé -----------------
-function bonusCanonicalEmpId(t, raw) {
-  // Ne JAMAIS renvoyer 'undefined' / undefined
-  if (raw == null) return null;
-  const s = String(raw).trim();
-  if (!s || s === 'undefined' || s === 'null') return null;
-
-  // Si c'est un email et qu'on a la correspondance → retourne l'ID
-  const { emailToId } = bonusGetStaffIndex(t);
-  const isEmail = s.includes('@') && !s.includes(' ');
-  if (isEmail) {
-    const id = emailToId[s.toLowerCase()];
-    if (id) return id;
-  }
-
-  // Sinon on considère que c'est déjà un ID
-  return s;
-}
-
-// --- Récupérer l'ID employé depuis la requête ----------------
-function bonusEmpIdFromReq(req, t) {
-  const u = req.user || {};
-  const hdr = req.headers || {};
-  const raw =
-    u.user_id ?? u.id ?? u._id ?? u.uid ?? u.sub ??
-    hdr['x-user-id'] ?? hdr['x-user'] ??
-    u.email ?? u.username ?? u.code;
-
-  return bonusCanonicalEmpId(t, raw); // -> string | null
-}
 
 
 // Compteur employé
