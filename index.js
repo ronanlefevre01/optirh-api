@@ -1821,11 +1821,10 @@ app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, (req, res) 
 });
 
 // 5) SAISIE d'une vente (EMPLOYEE ou OWNER)
+// Saisie d'une vente
 app.post('/bonusV3/sale', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const empId = canonicalEmpId(t, req.user.user_id);
-  if (!empId) return res.status(400).json({ error: 'NO_USER' });
-
+  const code  = bonusCompanyCodeOf(req);
+  const empId = bonusCanonicalEmpId(req); // <-- ici
   const { formulaId, sale } = req.body || {};
   const t = bonusEnsureStruct(getTenant(code));
   const m = monthKey();
@@ -1848,12 +1847,10 @@ app.post('/bonusV3/sale', authRequired, bonusRequireEmployeeOrOwner, (req, res) 
   res.json({ success: true, bonus });
 });
 
-// 6) COMPTEUR employé (EMPLOYEE ou OWNER)
+// Compteur employé
 app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const empId = bonusUserIdOf(req);
-  if (!empId) return res.status(400).json({ error: 'NO_USER' });
-
+  const code  = bonusCompanyCodeOf(req);
+  const empId = bonusCanonicalEmpId(req); // <-- ici
   const m = String(req.query.month || monthKey());
   const t = bonusEnsureStruct(getTenant(code));
 
@@ -1861,6 +1858,7 @@ app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, (req, re
   const total = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
   res.json({ month: m, total, count: list.length });
 });
+
 
 // 7) RÉCAP Patron (OWNER)
 app.get('/bonusV3/summary', authRequired, bonusRequireOwner, (req, res) => {
