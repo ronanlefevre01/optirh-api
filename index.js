@@ -2335,46 +2335,37 @@ function profEnsure(t) {
   return t;
 }
 
-// Index "staff" (pour retrouver nom/prénom/email de l'invitation)
-function profGetStaffIndex(t) {
-  const list = Array.isArray(t.employees) ? t.employees
-            : Array.isArray(t.staff)      ? t.staff
-            : [];
-
+// --- Index "users" (source de vérité : /users) ---
+function profGetUsersIndex(t) {
+  const users = t.users || {};
   const byId = {};
   const emailToId = {};
   const displayById = {};
 
-  for (const p of list) {
-    const id = String(p.id ?? p.user_id ?? p.email ?? '').trim();
+  for (const u of Object.values(users)) {
+    const id = String(u.id);
     if (!id) continue;
-    byId[id] = p;
-    if (p.email) emailToId[String(p.email).toLowerCase()] = id;
+    const email = (u.email || '').trim() || null;
+    if (email) emailToId[email.toLowerCase()] = id;
 
-    const first = p.first_name ?? p.firstName ?? null;
-    const last  = p.last_name  ?? p.lastName  ?? null;
-    const name =
-      [first, last].filter(Boolean).join(' ').trim()
-      || p.name || p.displayName || p.email || id;
+    const first = u.first_name || '';
+    const last  = u.last_name  || '';
+    const name  = (first + ' ' + last).trim() || email || id;
 
-    displayById[id] = {
-      id,
-      name,
-      email: p.email ?? null,
-      first_name: first,
-      last_name:  last,
-    };
+    byId[id] = u;
+    displayById[id] = { id, name, email, first_name: first || null, last_name: last || null };
   }
   return { byId, emailToId, displayById };
 }
 
-// Canonicalise l'ID employé à partir du token (prend l'id, sinon l'email => id)
+// Canonicalise l'ID employé
 function profCanonicalEmpId(req, t) {
-  const raw = String(req.user?.user_id || req.user?.id || req.user?.sub || req.user?.email || '').trim();
+  const raw = String(req.user?.sub || req.user?.user_id || req.user?.email || '').trim();
   if (!raw) return '';
-  const { emailToId } = profGetStaffIndex(t);
-  return emailToId[raw.toLowerCase()] || raw;
+  const { emailToId } = profGetUsersIndex(t);
+  return emailToId[raw.toLowerCase()] || raw; // email -> id, sinon l’ID numérique du token
 }
+
 
 // ====== Changement de mot de passe (helpers) ======
 function pwdEnsureStore(t) {
@@ -2406,23 +2397,25 @@ function pwdVerify(stored, password) {
 app.get('/profile/me', authRequired, (req, res) => {
   const code = req.user.company_code;
   let t = profEnsure(getTenant(code));
-  const id = profCanonicalEmpId(req, t);
+
+  const id = profCanonicalEmpId(req, t) || String(req.user.sub);
   if (!id) return res.status(400).json({ error: 'EMP_ID_MISSING' });
 
-  const profile = t.employee_profiles.byId[id] || {};
-  const staffIdx = profGetStaffIndex(t);
-  const base = staffIdx.displayById[id] || {};
+  const users = t.users || {};
+  const base = users[id] || {};                    // source invitation / /users
+  const prof = t.employee_profiles.byId[id] || {}; // téléphone, adresse etc.
 
   res.json({
     id,
-    email: profile.email ?? base.email ?? req.user.email ?? null,
-    first_name: profile.first_name ?? base.first_name ?? null,
-    last_name:  profile.last_name  ?? base.last_name  ?? null,
-    phone: profile.phone ?? null,
-    address: profile.address ?? null,
-    updatedAt: profile.updatedAt ?? null,
+    email:      prof.email      ?? base.email      ?? null,
+    first_name: prof.first_name ?? base.first_name ?? null,
+    last_name:  prof.last_name  ?? base.last_name  ?? null,
+    phone:      prof.phone      ?? null,
+    address:    prof.address    ?? null,
+    updatedAt:  prof.updatedAt  ?? null,
   });
 });
+
 
 // PATCH /profile/me  => l’employé peut MAJ téléphone/adresse (OWNER peut aussi)
 app.patch('/profile/me', authRequired, (req, res) => {
@@ -2456,44 +2449,48 @@ app.patch('/profile/me', authRequired, (req, res) => {
 
 // OWNER: GET /profiles  => renvoie un map de tous les profils (fusion staff + profils)
 app.get('/profiles', authRequired, (req, res) => {
-  const role = String(req.user.role || '').toUpperCase();
-  if (role !== 'OWNER') return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
-
+  if (String(req.user.role).toUpperCase() !== 'OWNER') {
+    return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+  }
   const code = req.user.company_code;
   let t = profEnsure(getTenant(code));
-  const idx = profGetStaffIndex(t);
 
+  const users = t.users || {};
   const out = {};
-  for (const id of Object.keys(idx.displayById)) {
-    const base = idx.displayById[id];
-    const p = t.employee_profiles.byId[id] || {};
+
+  // base = users
+  for (const u of Object.values(users)) {
+    const id = String(u.id);
+    const p  = t.employee_profiles.byId[id] || {};
     out[id] = {
       id,
-      email: p.email ?? base.email ?? null,
-      first_name: p.first_name ?? base.first_name ?? null,
-      last_name:  p.last_name  ?? base.last_name  ?? null,
-      phone: p.phone ?? null,
-      address: p.address ?? null,
-      updatedAt: p.updatedAt ?? null,
+      email:      p.email      ?? u.email      ?? null,
+      first_name: p.first_name ?? u.first_name ?? null,
+      last_name:  p.last_name  ?? u.last_name  ?? null,
+      phone:      p.phone      ?? null,
+      address:    p.address    ?? null,
+      updatedAt:  p.updatedAt  ?? null,
     };
   }
-  // Profils orphelins (sans entrée staff)
-  for (const id of Object.keys(t.employee_profiles.byId)) {
+
+  // profils orphelins
+  for (const id of Object.keys(t.employee_profiles.byId || {})) {
     if (out[id]) continue;
     const p = t.employee_profiles.byId[id];
     out[id] = {
       id,
-      email: p.email ?? null,
+      email:      p.email      ?? null,
       first_name: p.first_name ?? null,
-      last_name:  p.last_name ?? null,
-      phone: p.phone ?? null,
-      address: p.address ?? null,
-      updatedAt: p.updatedAt ?? null,
+      last_name:  p.last_name  ?? null,
+      phone:      p.phone      ?? null,
+      address:    p.address    ?? null,
+      updatedAt:  p.updatedAt  ?? null,
     };
   }
 
   res.json({ profiles: out });
 });
+
 
 // OWNER: PATCH /profile/:empId  => MAJ d’un profil employé (tous champs)
 app.patch('/profile/:empId', authRequired, (req, res) => {
