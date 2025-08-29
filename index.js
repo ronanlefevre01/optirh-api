@@ -27,9 +27,9 @@ const ALLOWED_ORIGINS = [
 app.use((req, res, next) => { res.header("Vary", "Origin"); next(); });
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // curl/health/no-origin (ex: Expo)
+    if (!origin) return cb(null, true); // curl/health/no-origin
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
+    return cb(null, false); // CORS désactivé pour cet origin (pas d'erreur 500)
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -162,8 +162,7 @@ async function withRegistryUpdate(mutator, maxRetry = 3) {
 }
 
 if (process.env.DEBUG_BONUS === '1') {
-  const { computeBonusV3 } = await import('./bonusMathV3.js');
-
+  
   const formula = {
     version: 3,
     id: 'demo',
@@ -320,9 +319,6 @@ function bufferToStream(buffer) {
   return stream;
 }
 
-// Activer un faux utilisateur en dev pour tester facilement les routes
-// parse JSON tôt si pas déjà fait
-app.use(express.json());
 
 // ✅ ping sans auth
 app.get('/ping', (_req, res) => res.type('text').send('pong'));
@@ -795,14 +791,16 @@ app.post("/leaves", authRequired, async (req, res) => {
 // Lister les congés
 app.get("/leaves", authRequired, async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, all } = req.query;
     const reg = await loadRegistry();
     const t = reg.tenants?.[req.user.company_code];
     if (!t) return res.status(404).json({ error: "Tenant not found" });
 
     let list = t.leaves || [];
     if (req.user.role === "OWNER") {
-      if (status) list = list.filter(l => l.status === status);
+      // Compat: status=all ou all=true => renvoyer tout
+   const wantAll = String(all || '').toLowerCase() === 'true' || String(status || '').toLowerCase() === 'all';
+   if (!wantAll && status) list = list.filter(l => l.status === status);
     } else {
       list = list.filter(l => Number(l.user_id) === Number(req.user.sub));
     }
@@ -880,7 +878,16 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
     const id = String(req.params.id);
 
     // Compat : approve/deny via action ou status; edit via { edit:{...} }; cancel via action='cancel'
-    const { action, status: statusRaw, manager_note, edit } = req.body || {};
+    let { action, status: statusRaw, manager_note, edit } = req.body || {};
+    // Compat: accepter action='reschedule' avec start_date/end_date au niveau racine
+   if (action === 'reschedule' && !edit && (req.body.start_date || req.body.end_date || req.body.type)) {
+     edit = {
+       start_date: req.body.start_date,
+       end_date: req.body.end_date,
+       type: req.body.type,
+     };
+   }
+
     const normalized =
       action === 'approve' ? 'approved' :
       action === 'deny'    ? 'denied'  :
@@ -904,7 +911,7 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
 
       // --- Annulation ---
       if (action === 'cancel') {
-        if (l.status !== 'approved') throw new Error('Only approved leave can be cancelled');
+      if (!['approved','pending'].includes(l.status)) throw new Error('Only approved or pending leave can be cancelled');
         l.status = 'cancelled';
         l.manager_note = manager_note || l.manager_note || null;
         l.decided_by = req.user.sub;
@@ -1058,44 +1065,47 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
 });
 
 // === OWNER crée un congé pour n'importe quel salarié (ou pour lui-même) ===
+// OWNER crée un congé pour n'importe quel salarié (avec possibilité de forcer)
 app.post('/leaves/admin', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
 
     const {
-      user_id,                // optionnel: si absent => le patron lui-même
+      user_id,
       start_date,
       end_date,
-      type = 'paid',         // 'paid' | 'unpaid' | ...
+      type = 'paid',
       reason = null,
-      status = 'approved',   // 'approved' (par défaut) ou 'pending'
-      force = false,         // si true, on passe malgré les conflits
+      status = 'approved',
+      force = false,
     } = req.body || {};
 
-    if (!start_date || !end_date) return res.status(400).json({ error: 'start_date & end_date required' });
-    const re = /^\d{4}-\d{2}-\d{2}$/;
-    if (!re.test(start_date) || !re.test(end_date)) return res.status(400).json({ error: 'bad date format' });
-    if (start_date > end_date) return res.status(400).json({ error: 'start_date must be <= end_date' });
+    if (!user_id || !start_date || !end_date)
+      return res.status(400).json({ error: 'fields required' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date) || !/^\d{4}-\d{2}-\d{2}$/.test(end_date))
+      return res.status(400).json({ error: 'bad date format' });
+    if (String(start_date) > String(end_date))
+      return res.status(400).json({ error: 'start <= end' });
 
     const reg = await loadRegistry();
-    const code = req.user.company_code;
-    const t0 = reg.tenants?.[code];
+    const t0 = reg.tenants?.[req.user.company_code];
     if (!t0) return res.status(404).json({ error: 'Tenant not found' });
     const t = ensureTenantDefaults(t0);
 
-    const targetId = user_id != null ? Number(user_id) : Number(req.user.sub);
-    const target = Object.values(t.users || {}).find(u => Number(u.id) === targetId);
-    if (!target) return res.status(404).json({ error: 'Target user not found' });
+    const target = t.users?.[String(user_id)];
+    if (!target) return res.status(404).json({ error: 'User not found' });
 
-    // Conflits (on exclut l’utilisateur cible)
-    const confl = conflictsForPeriod(t, start_date, end_date, { excludeUserId: targetId });
-    if (confl.length && !force) return res.status(409).json({ error: 'conflict', conflicts: confl });
+    // Conflits avec TOUT le monde (on n'exclut personne ici)
+    const confl = conflictsForPeriod(t, start_date, end_date, { excludeUserId: undefined });
+    if (confl.length && !force) {
+      return res.status(409).json({ error: 'conflict', conflicts: confl });
+    }
 
     const now = new Date().toISOString();
     const leave = {
       id: crypto.randomUUID(),
-      company_code: code,
-      user_id: targetId,
+      company_code: req.user.company_code,
+      user_id: Number(user_id),
       requester: {
         email: target.email,
         first_name: target.first_name || '',
@@ -1109,11 +1119,13 @@ app.post('/leaves/admin', authRequired, async (req, res) => {
       decided_by: status === 'approved' ? req.user.sub : null,
       decided_at: status === 'approved' ? now : null,
       created_at: now,
+      created_by_owner: true,
     };
 
     let createdEvent = null;
 
     await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
       const tt0 = next.tenants?.[code];
       if (!tt0) throw new Error('Tenant not found');
       const tt = ensureTenantDefaults(tt0);
@@ -1122,17 +1134,16 @@ app.post('/leaves/admin', authRequired, async (req, res) => {
       tt.leaves.unshift(leave);
 
       if (leave.status === 'approved') {
-        const label = `Congé ${(leave.requester?.first_name || '') + ' ' + (leave.requester?.last_name || '')}`.trim();
+        const label = `Congé ${(leave.requester.first_name + ' ' + leave.requester.last_name).trim()}` || 'Congé';
         const ev = {
           id: crypto.randomUUID(),
           leave_id: leave.id,
-          title: label || 'Congé',
+          title: label,
           start: leave.start_date,
-          end:   leave.end_date,
+          end: leave.end_date,
           employee_id: leave.user_id,
           created_at: now,
         };
-        tt.calendar_events = tt.calendar_events || [];
         tt.calendar_events.push(ev);
         createdEvent = ev;
       }
@@ -1142,27 +1153,28 @@ app.post('/leaves/admin', authRequired, async (req, res) => {
       return true;
     });
 
-    // Push au salarié concerné (si ce n’est pas le patron lui-même)
+    // Push à l'employé
     try {
       const reg2 = await loadRegistry();
-      const t2 = ensureTenantDefaults(reg2.tenants?.[code] || {});
-      const tokens = (t2.devices || []).filter(d => Number(d.user_id) === targetId).map(d => d.token);
+      const t2 = ensureTenantDefaults(reg2.tenants?.[req.user.company_code] || {});
+      const tokens = (t2.devices || []).filter(d => Number(d.user_id) === Number(user_id)).map(d => d.token);
       if (tokens.length) {
         await sendExpoPush(tokens, {
-          title: leave.status === 'approved' ? 'Congé ajouté ✅' : 'Demande ajoutée 📝',
-          body: `${start_date} → ${end_date}`,
+          title: leave.status === 'approved' ? 'Congé ajouté ✅' : 'Demande ajoutée 🕒',
+          body: `Du ${leave.start_date} au ${leave.end_date}`,
           data: { type: 'leave', status: leave.status, leaveId: leave.id },
         });
       }
     } catch (e) {
-      console.warn('[push] admin create skipped:', e?.message || e);
+      console.warn('[push] skipped:', e?.message || e);
     }
 
-    return res.status(201).json({ ok: true, leave, event: createdEvent, conflicts: confl || [] });
+    return res.status(201).json({ ok: true, leave, event: createdEvent });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 // Modifier un événement d'agenda (OWNER)
@@ -2389,7 +2401,7 @@ function profGetStaffIndex(t) {
 function profCanonicalEmpId(req, t) {
   const raw = String(req.user?.sub || req.user?.user_id || req.user?.email || '').trim();
   if (!raw) return '';
-  const { emailToId } = profGetUsersIndex(t);
+  const { emailToId } = profGetStaffIndex(t);
   return emailToId[raw.toLowerCase()] || raw; // email -> id, sinon l’ID numérique du token
 }
 
