@@ -186,35 +186,55 @@ if (process.env.DEBUG_BONUS === '1') {
 function ensureTenantDefaults(t) {
   const obj = (t && typeof t === 'object') ? t : {};
 
-  obj.leaves = Array.isArray(obj.leaves) ? obj.leaves : [];
-  obj.calendar_events = Array.isArray(obj.calendar_events) ? obj.calendar_events : [];
-  obj.devices = Array.isArray(obj.devices) ? obj.devices : [];
-  obj.announcements = Array.isArray(obj.announcements) ? obj.announcements : []; // 👈 NEW
+  // Collections de base
+  obj.leaves           = Array.isArray(obj.leaves) ? obj.leaves : [];
+  obj.calendar_events  = Array.isArray(obj.calendar_events) ? obj.calendar_events : [];
+  obj.devices          = Array.isArray(obj.devices) ? obj.devices : [];
+  obj.announcements    = Array.isArray(obj.announcements) ? obj.announcements : [];
 
-  // Réglages d'entreprise (par défaut : jours ouvrés)
+  // Réglages d'entreprise
   obj.settings = obj.settings || {};
-  if (!obj.settings.leave_count_mode) {
+  if (!('leave_count_mode' in obj.settings)) {
     obj.settings.leave_count_mode = 'ouvres'; // 'ouvres' ou 'ouvrables'
   }
+  // Affichage de l’onglet "Ventes bonifiées" côté employé (true par défaut)
+  if (!('show_employee_bonuses' in obj.settings)) {
+    obj.settings.show_employee_bonuses = true;
+  }
+  // Optionnel : semaine de travail (laisser tel quel si déjà défini)
+  if (!Array.isArray(obj.settings.workweek)) {
+    // ne force pas de valeur par défaut, garde undefined si non configuré
+  }
 
-  // ✅ Ventes bonifiées v3 (multi-formules)
-  if (!obj.bonusV3) {
-    obj.bonusV3 = {
-      formulas: { byId: {}, order: [] }, // plusieurs formules gérées par id
-      entries: {},                        // { "YYYY-MM": { [empId]: [ { formulaId, sale, bonus, at } ] } }
-      ledger: {},                         // { "YYYY-MM": { frozenAt, byEmployee:{}, byFormula:{} } }
-    };
-  } else {
-    // robustesse si des clés manquent déjà
-    obj.bonusV3.formulas = obj.bonusV3.formulas || { byId: {}, order: [] };
-    obj.bonusV3.formulas.byId = obj.bonusV3.formulas.byId || {};
-    obj.bonusV3.formulas.order = Array.isArray(obj.bonusV3.formulas.order) ? obj.bonusV3.formulas.order : [];
-    obj.bonusV3.entries = obj.bonusV3.entries || {};
-    obj.bonusV3.ledger = obj.bonusV3.ledger || {};
+  // Profils employés (données coordonnées/identité étendues)
+  obj.employee_profiles = obj.employee_profiles || { byId: {} };
+  if (!obj.employee_profiles.byId) obj.employee_profiles.byId = {};
+
+  // Store auth (mots de passe custom par employé)
+  obj.auth = obj.auth || { byId: {} };
+  if (!obj.auth.byId) obj.auth.byId = {};
+
+  // Ventes bonifiées v3
+  obj.bonusV3 = obj.bonusV3 || {};
+  obj.bonusV3.formulas = obj.bonusV3.formulas || { byId: {}, order: [] };
+  obj.bonusV3.formulas.byId = obj.bonusV3.formulas.byId || {};
+  obj.bonusV3.formulas.order = Array.isArray(obj.bonusV3.formulas.order) ? obj.bonusV3.formulas.order : [];
+  obj.bonusV3.entries = obj.bonusV3.entries || {};
+  obj.bonusV3.ledger  = obj.bonusV3.ledger  || {};
+
+  // Migration éventuelle du ledger ancien schéma -> nouveau {freezes:[]}
+  for (const [month, led] of Object.entries(obj.bonusV3.ledger)) {
+    if (led && typeof led === 'object' && !Array.isArray(led.freezes)) {
+      const snap = (led.frozenAt)
+        ? [{ frozenAt: led.frozenAt, byEmployee: led.byEmployee || {}, byFormula: led.byFormula || {} }]
+        : [];
+      obj.bonusV3.ledger[month] = { freezes: snap };
+    }
   }
 
   return obj;
 }
+
 
 // --- Helpers d'accès (dev en mémoire) ---
 globalThis.__TENANTS = globalThis.__TENANTS || {}; // { [company_code]: tenantObj }
@@ -1853,12 +1873,15 @@ app.patch('/settings', authRequired, async (req, res) => {
   try {
     if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
 
-    const { leave_count_mode, workweek } = req.body || {};
+    const { leave_count_mode, workweek, show_employee_bonuses } = req.body || {};
     if (leave_count_mode && !['ouvres', 'ouvrables'].includes(leave_count_mode)) {
       return res.status(400).json({ error: 'leave_count_mode must be "ouvres" or "ouvrables"' });
     }
     if (workweek && !Array.isArray(workweek)) {
       return res.status(400).json({ error: 'workweek must be an array of numbers (0..6)' });
+    }
+    if (show_employee_bonuses !== undefined && typeof show_employee_bonuses !== 'boolean') {
+      return res.status(400).json({ error: 'show_employee_bonuses must be boolean' });
     }
 
     let out = null;
@@ -1871,6 +1894,7 @@ app.patch('/settings', authRequired, async (req, res) => {
       t.settings = t.settings || {};
       if (leave_count_mode) t.settings.leave_count_mode = leave_count_mode;
       if (Array.isArray(workweek)) t.settings.workweek = workweek;
+      if (typeof show_employee_bonuses === 'boolean') t.settings.show_employee_bonuses = show_employee_bonuses; // ⬅️ NEW
 
       t.updated_at = new Date().toISOString();
       next.tenants[code] = t;
@@ -1885,6 +1909,7 @@ app.patch('/settings', authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
 
 // =========================== BONUS V3 — HELPERS ===========================
 
