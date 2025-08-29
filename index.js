@@ -2361,27 +2361,29 @@ function profEnsure(t) {
 }
 
 // --- Index "users" (source de vérité : /users) ---
-function profGetUsersIndex(t) {
-  const users = t.users || {};
-  const byId = {};
-  const emailToId = {};
-  const displayById = {};
-
-  for (const u of Object.values(users)) {
+// remplace profGetStaffIndex par ceci
+function profGetStaffIndex(t) {
+  const arr = Object.values(t?.users || {}); // 👈 lit bien le map users
+  const byId = {}, emailToId = {}, displayById = {};
+  for (const u of arr) {
     const id = String(u.id);
     if (!id) continue;
-    const email = (u.email || '').trim() || null;
-    if (email) emailToId[email.toLowerCase()] = id;
-
-    const first = u.first_name || '';
-    const last  = u.last_name  || '';
-    const name  = (first + ' ' + last).trim() || email || id;
-
     byId[id] = u;
-    displayById[id] = { id, name, email, first_name: first || null, last_name: last || null };
+    const email = (u.email || '').toLowerCase();
+    if (email) emailToId[email] = id;
+    const first = u.first_name || null;
+    const last  = u.last_name  || null;
+    displayById[id] = {
+      id,
+      email: u.email || null,
+      first_name: first,
+      last_name:  last,
+      name: [first, last].filter(Boolean).join(' ').trim() || u.email || id,
+    };
   }
   return { byId, emailToId, displayById };
 }
+
 
 // Canonicalise l'ID employé
 function profCanonicalEmpId(req, t) {
@@ -2419,129 +2421,182 @@ function pwdVerify(stored, password) {
 }
 
 // GET /profile/me  => profil de l'utilisateur connecté (EMPLOYEE/OWNER)
-app.get('/profile/me', authRequired, (req, res) => {
-  const code = req.user.company_code;
-  let t = profEnsure(getTenant(code));
+app.get('/profile/me', authRequired, async (req, res) => {
+  try {
+    const code = req.user.company_code;
+    const reg = await loadRegistry();
+    const t0  = reg.tenants?.[code];
+    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
+    const t   = ensureTenantDefaults(t0);
 
-  const id = profCanonicalEmpId(req, t) || String(req.user.sub);
-  if (!id) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+    const id = String(req.user.sub);                    // id JWT
+    const idx = profGetStaffIndex(t);
+    const base = idx.displayById[id] || {};             // ⬅️ prénom/nom/email de l’invitation
+    const profile = (t.employee_profiles?.byId?.[id]) || {};
 
-  const users = t.users || {};
-  const base = users[id] || {};                    // source invitation / /users
-  const prof = t.employee_profiles.byId[id] || {}; // téléphone, adresse etc.
-
-  res.json({
-    id,
-    email:      prof.email      ?? base.email      ?? null,
-    first_name: prof.first_name ?? base.first_name ?? null,
-    last_name:  prof.last_name  ?? base.last_name  ?? null,
-    phone:      prof.phone      ?? null,
-    address:    prof.address    ?? null,
-    updatedAt:  prof.updatedAt  ?? null,
-  });
+    return res.json({
+      id,
+      email:      profile.email      ?? base.email ?? null,
+      first_name: profile.first_name ?? base.first_name ?? null,
+      last_name:  profile.last_name  ?? base.last_name  ?? null,
+      phone:      profile.phone      ?? null,
+      address:    profile.address    ?? null,
+      updatedAt:  profile.updatedAt  ?? null,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
 });
+
 
 
 // PATCH /profile/me  => l’employé peut MAJ téléphone/adresse (OWNER peut aussi)
-app.patch('/profile/me', authRequired, (req, res) => {
-  const code = req.user.company_code;
-  let t = profEnsure(getTenant(code));
-  const id = profCanonicalEmpId(req, t);
-  if (!id) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+app.patch('/profile/me', authRequired, async (req, res) => {
+  try {
+    const code = req.user.company_code;
+    const role = String(req.user.role || '').toUpperCase();
+    const id   = String(req.user.sub);
 
-  const body = req.body || {};
-  const role = String(req.user.role || '').toUpperCase();
-  const patch = {};
+    await withRegistryUpdate((next) => {
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t  = ensureTenantDefaults(t0);
 
-  // Employé : téléphone/adresse — Patron : tout
-  if (role === 'OWNER') {
-    if ('first_name' in body) patch.first_name = String(body.first_name || '');
-    if ('last_name'  in body) patch.last_name  = String(body.last_name  || '');
-    if ('email'      in body) patch.email      = String(body.email      || '');
+      const body = req.body || {};
+      const patch = {};
+
+      // Employé : peut MAJ phone/address ; Patron : peut tout (et refléter dans users)
+      if (role === 'OWNER') {
+        if ('first_name' in body) patch.first_name = String(body.first_name || '');
+        if ('last_name'  in body) patch.last_name  = String(body.last_name  || '');
+        if ('email'      in body) patch.email      = String(body.email      || '');
+        // miroir dans users si fourni
+        t.users = t.users || {};
+        if (t.users[id]) {
+          if ('first_name' in body) t.users[id].first_name = patch.first_name;
+          if ('last_name'  in body) t.users[id].last_name  = patch.last_name;
+          if ('email'      in body) t.users[id].email      = patch.email;
+        }
+      }
+      if ('phone'   in body) patch.phone   = String(body.phone   || '');
+      if ('address' in body) patch.address = String(body.address || '');
+
+      t.employee_profiles.byId[id] = {
+        ...(t.employee_profiles.byId[id] || {}),
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      };
+
+      next.tenants[code] = t;
+      return true;
+    });
+
+    return res.json({ success: true });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
   }
-  if ('phone' in body)   patch.phone   = String(body.phone || '');
-  if ('address' in body) patch.address = String(body.address || '');
-
-  t.employee_profiles.byId[id] = {
-    ...(t.employee_profiles.byId[id] || {}),
-    ...patch,
-    updatedAt: new Date().toISOString(),
-  };
-
-  saveTenant(code, t);
-  res.json({ success: true });
 });
+
 
 // OWNER: GET /profiles  => renvoie un map de tous les profils (fusion staff + profils)
-app.get('/profiles', authRequired, (req, res) => {
-  if (String(req.user.role).toUpperCase() !== 'OWNER') {
+app.get('/profiles', authRequired, async (req, res) => {
+  if (String(req.user.role || '').toUpperCase() !== 'OWNER') {
     return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
   }
-  const code = req.user.company_code;
-  let t = profEnsure(getTenant(code));
+  try {
+    const code = req.user.company_code;
+    const reg  = await loadRegistry();
+    const t0   = reg.tenants?.[code];
+    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
+    const t    = ensureTenantDefaults(t0);
+    const idx  = profGetStaffIndex(t);
 
-  const users = t.users || {};
-  const out = {};
+    const out = {};
+    for (const id of Object.keys(idx.displayById)) {
+      const base = idx.displayById[id];
+      const p = t.employee_profiles.byId[id] || {};
+      out[id] = {
+        id,
+        email:      p.email      ?? base.email ?? null,
+        first_name: p.first_name ?? base.first_name ?? null,
+        last_name:  p.last_name  ?? base.last_name  ?? null,
+        phone:      p.phone ?? null,
+        address:    p.address ?? null,
+        updatedAt:  p.updatedAt ?? null,
+      };
+    }
+    // profils orphelins
+    for (const id of Object.keys(t.employee_profiles.byId || {})) {
+      if (out[id]) continue;
+      const p = t.employee_profiles.byId[id];
+      out[id] = {
+        id,
+        email: p.email ?? null,
+        first_name: p.first_name ?? null,
+        last_name:  p.last_name ?? null,
+        phone: p.phone ?? null,
+        address: p.address ?? null,
+        updatedAt: p.updatedAt ?? null,
+      };
+    }
 
-  // base = users
-  for (const u of Object.values(users)) {
-    const id = String(u.id);
-    const p  = t.employee_profiles.byId[id] || {};
-    out[id] = {
-      id,
-      email:      p.email      ?? u.email      ?? null,
-      first_name: p.first_name ?? u.first_name ?? null,
-      last_name:  p.last_name  ?? u.last_name  ?? null,
-      phone:      p.phone      ?? null,
-      address:    p.address    ?? null,
-      updatedAt:  p.updatedAt  ?? null,
-    };
+    return res.json({ profiles: out });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
   }
-
-  // profils orphelins
-  for (const id of Object.keys(t.employee_profiles.byId || {})) {
-    if (out[id]) continue;
-    const p = t.employee_profiles.byId[id];
-    out[id] = {
-      id,
-      email:      p.email      ?? null,
-      first_name: p.first_name ?? null,
-      last_name:  p.last_name  ?? null,
-      phone:      p.phone      ?? null,
-      address:    p.address    ?? null,
-      updatedAt:  p.updatedAt  ?? null,
-    };
-  }
-
-  res.json({ profiles: out });
 });
+
 
 
 // OWNER: PATCH /profile/:empId  => MAJ d’un profil employé (tous champs)
-app.patch('/profile/:empId', authRequired, (req, res) => {
-  const role = String(req.user.role || '').toUpperCase();
-  if (role !== 'OWNER') return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
-
-  const code = req.user.company_code;
-  let t = profEnsure(getTenant(code));
-  const empId = String(req.params.empId || '').trim();
-  if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
-
-  const body = req.body || {};
-  const patch = {};
-  for (const k of ['first_name', 'last_name', 'email', 'phone', 'address']) {
-    if (k in body) patch[k] = String(body[k] || '');
+app.patch('/profile/:empId', authRequired, async (req, res) => {
+  if (String(req.user.role || '').toUpperCase() !== 'OWNER') {
+    return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
   }
+  try {
+    const code = req.user.company_code;
+    const empId = String(req.params.empId || '').trim();
+    if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
 
-  t.employee_profiles.byId[empId] = {
-    ...(t.employee_profiles.byId[empId] || {}),
-    ...patch,
-    updatedAt: new Date().toISOString(),
-  };
+    await withRegistryUpdate((next) => {
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t  = ensureTenantDefaults(t0);
 
-  saveTenant(code, t);
-  res.json({ success: true });
+      const body = req.body || {};
+      const patch = {};
+      for (const k of ['first_name','last_name','email','phone','address']) {
+        if (k in body) patch[k] = String(body[k] || '');
+      }
+
+      // miroir nom/prénom/email dans users si présent
+      t.users = t.users || {};
+      if (t.users[empId]) {
+        if ('first_name' in patch) t.users[empId].first_name = patch.first_name;
+        if ('last_name'  in patch) t.users[empId].last_name  = patch.last_name;
+        if ('email'      in patch) t.users[empId].email      = patch.email;
+      }
+
+      t.employee_profiles.byId[empId] = {
+        ...(t.employee_profiles.byId[empId] || {}),
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      };
+
+      next.tenants[code] = t;
+      return true;
+    });
+
+    return res.json({ success: true });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
 });
+
 
 // POST /auth/change-password  (EMPLOYEE/OWNER change son propre mot de passe)
 app.post('/auth/change-password', authRequired, async (req, res) => {
