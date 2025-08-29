@@ -11,6 +11,8 @@ import { google } from "googleapis";
 import { Readable } from "stream";
 import { computeBonusV3 } from './bonusMathV3.js';
 import { monthKey } from './utils/dates.js';
+import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+
 
 
 
@@ -1786,6 +1788,40 @@ function bonusMigrateEntriesKeys(t) {
   }
 }
 
+// ---- Ledger helpers (multi-gels dans le même mois) ----
+function bonusEnsureLedgerArray(t, m) {
+  t.bonusV3 = t.bonusV3 || {};
+  t.bonusV3.ledger = t.bonusV3.ledger || {};
+  const cur = t.bonusV3.ledger[m];
+
+  // création
+  if (!cur) {
+    t.bonusV3.ledger[m] = { freezes: [] };
+    return t.bonusV3.ledger[m].freezes;
+  }
+
+  // migration ancien schéma {frozenAt, byEmployee, byFormula} -> {freezes:[...]}
+  if (!Array.isArray(cur.freezes)) {
+    const migrated = [];
+    if (cur.frozenAt) {
+      migrated.push({
+        frozenAt: cur.frozenAt,
+        byEmployee: cur.byEmployee || {},
+        byFormula: cur.byFormula || {},
+      });
+    }
+    t.bonusV3.ledger[m] = { freezes: migrated };
+  }
+  return t.bonusV3.ledger[m].freezes;
+}
+
+function bonusGetLastFreeze(t, m) {
+  const arr = t?.bonusV3?.ledger?.[m]?.freezes;
+  if (Array.isArray(arr) && arr.length > 0) return arr[arr.length - 1];
+  return null;
+}
+
+
 // =========================== BONUS V3 — ROUTES ===========================
 
 // 1) LISTER les formules (OWNER)
@@ -1901,30 +1937,28 @@ app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, (req, re
   }
 });
 
-// 7) RÉCAP Patron (OWNER)
+// 7) RÉCAP Patron (OWNER) — toujours "gelable" ; expose le dernier gel
 app.get('/bonusV3/summary', authRequired, bonusRequireOwner, (req, res) => {
   const code = bonusCompanyCodeOf(req);
   const m = String(req.query.month || monthKey());
   const t = bonusEnsureStruct(getTenant(code));
 
-  // migration légère (fusion email -> id) si besoin
-  bonusMigrateEntriesKeys(t);
+  const rawByEmp = t.bonusV3.entries?.[m] || {};
 
-  const byEmpRaw = t.bonusV3.entries?.[m] || {};
+  // fusion e-mail -> id canonique
+  const mergedByEmp = {};
+  for (const rawId of Object.keys(rawByEmp)) {
+    const id = bonusCanonicalEmpId(t, rawId);
+    if (!mergedByEmp[id]) mergedByEmp[id] = [];
+    mergedByEmp[id].push(...(rawByEmp[rawId] || []));
+  }
+
   const byEmployee = {};
   const byFormula = {};
-
-  for (const rawKey of Object.keys(byEmpRaw)) {
-    const canon = bonusCanonicalEmpId(t, rawKey);
-    if (!canon) continue;
-
-    const list = byEmpRaw[rawKey] || [];
-    const total = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
-
-    if (!byEmployee[canon]) byEmployee[canon] = { total: 0, count: 0 };
-    byEmployee[canon].total += total;
-    byEmployee[canon].count += list.length;
-
+  for (const empId of Object.keys(mergedByEmp)) {
+    const list = mergedByEmp[empId] || [];
+    const tot = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
+    byEmployee[empId] = { total: tot, count: list.length };
     for (const it of list) {
       byFormula[it.formulaId] = (byFormula[it.formulaId] || 0) + Number(it.bonus || 0);
     }
@@ -1932,28 +1966,29 @@ app.get('/bonusV3/summary', authRequired, bonusRequireOwner, (req, res) => {
 
   const { displayById } = bonusGetStaffIndex(t);
   const employees = {};
-  for (const id of Object.keys(byEmployee)) {
-    employees[id] = displayById[id] || { id, name: id, email: null };
+  for (const id of Object.keys(displayById || {})) {
+    employees[id] = displayById[id]; // {id, name, email}
   }
 
-  const frozen = Boolean(t.bonusV3.ledger?.[m]?.frozenAt);
-  const totalAll = Object.values(byEmployee).reduce((s, x) => s + (x.total || 0), 0);
+  // dernier gel du mois (s'il y en a eu)
+  const last = bonusGetLastFreeze(t, m);
+  const lastFrozenAt = last?.frozenAt || null;
 
-  res.json({ month: m, totalAll, byEmployee, byFormula, employees, frozen });
+  const totalAll = Object.values(byEmployee).reduce((s, x) => s + (x.total || 0), 0);
+  res.json({ month: m, totalAll, byEmployee, byFormula, employees, lastFrozenAt });
 });
 
-// 8) FIGER la période (OWNER)
+
+// 8) FIGER la période (OWNER) — pousse un "gel" et redémarre une nouvelle période
 app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
   const code = bonusCompanyCodeOf(req);
   const m = String(req.query.month || monthKey());
   const t = bonusEnsureStruct(getTenant(code));
 
-  // fusion des clés avant figer
-  bonusMigrateEntriesKeys(t);
   const byEmp = t.bonusV3.entries?.[m] || {};
-
   const ledgerEmp = {};
   const ledgerFormula = {};
+
   for (const empId of Object.keys(byEmp)) {
     const list = byEmp[empId] || [];
     ledgerEmp[empId] = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
@@ -1962,16 +1997,21 @@ app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
     }
   }
 
-  t.bonusV3.ledger[m] = {
+  const freezes = bonusEnsureLedgerArray(t, m);
+  const snapshot = {
     frozenAt: new Date().toISOString(),
     byEmployee: ledgerEmp,
     byFormula: ledgerFormula,
   };
-  t.bonusV3.entries[m] = {}; // ré-initialise le mois courant
+  freezes.push(snapshot);
+
+  // redémarre une nouvelle période immédiatement pour le même mois
+  t.bonusV3.entries[m] = {};
 
   saveTenant(code, t);
-  res.json({ success: true });
+  res.json({ success: true, month: m, seq: freezes.length, frozenAt: snapshot.frozenAt });
 });
+
 
 // 9) LISTE des ventes d’un employé pour un mois (OWNER) — route principale
 app.get('/bonusV3/entries', authRequired, bonusRequireOwner, (req, res) => {
@@ -1991,24 +2031,87 @@ app.get('/bonusV3/entries', authRequired, bonusRequireOwner, (req, res) => {
   res.json({ month: m, empId, entries: sorted });
 });
 
-// 10) HISTORIQUE figé d’un employé (OWNER) — route principale
+// 10) HISTORIQUE figé d’un employé (OWNER) — liste tous les gels, y compris multiples dans un mois
+app.get('/bonusV3/employee-history', authRequired, bonusRequireOwner, (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const empId = String(req.query.empId || '').trim();
+  const t = bonusEnsureStruct(getTenant(code));
+  if (!empId) return res.status(400).json({ error: 'MISSING_EMP_ID' });
+
+  const out = [];
+  for (const [month, led] of Object.entries(t.bonusV3.ledger || {})) {
+    // nouveau schéma
+    if (Array.isArray(led.freezes)) {
+      led.freezes.forEach((snap, i) => {
+        const total = Number((snap.byEmployee || {})[empId] || 0);
+        out.push({ month, total, frozenAt: snap.frozenAt, seq: i + 1 });
+      });
+    } else {
+      // ancien schéma (compat)
+      const total = Number((led.byEmployee || {})[empId] || 0);
+      if (led.frozenAt) out.push({ month, total, frozenAt: led.frozenAt, seq: 1 });
+    }
+  }
+  // on affiche tout, même total=0 (à toi de filtrer si tu préfères)
+  out.sort((a, b) => {
+    // tri par date de gel décroissante puis par mois
+    const ad = (a.frozenAt || a.month);
+    const bd = (b.frozenAt || b.month);
+    return String(bd).localeCompare(String(ad));
+  });
+
+  res.json({ empId, history: out });
+});
+
+// 10bis) HISTORIQUE figé d’un employé (OWNER) — compatible multi-gels
 app.get('/bonusV3/history', authRequired, bonusRequireOwner, (req, res) => {
   const code = bonusCompanyCodeOf(req);
+  const rawEmpId = String(req.query.empId || '').trim();
+  if (!rawEmpId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
+
   const t = bonusEnsureStruct(getTenant(code));
 
-  const rawEmp = String(req.query.empId || '').trim();
-  if (!rawEmp) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
+  // normalise l’identifiant (email -> id canonique si possible)
+  const empId = bonusCanonicalEmpId(t, rawEmpId);
 
-  const empId = bonusCanonicalEmpId(t, rawEmp);
+  const out = [];
+  const ledger = t.bonusV3.ledger || {};
 
-  const hist = Object.entries(t.bonusV3.ledger || {}).map(([month, led]) => {
-    const total = Number((led.byEmployee && led.byEmployee[empId]) || 0);
-    return { month, total, frozenAt: led.frozenAt };
-  }).filter(x => x.total > 0);
+  for (const [month, led] of Object.entries(ledger)) {
+    // Nouveau schéma: { freezes: [ { frozenAt, byEmployee, byFormula } , ... ] }
+    if (Array.isArray(led?.freezes)) {
+      led.freezes.forEach((snap, i) => {
+        const total = Number((snap.byEmployee || {})[empId] || 0);
+        out.push({
+          month,
+          total,
+          frozenAt: snap.frozenAt || null,
+          seq: i + 1, // rang du gel dans le mois
+        });
+      });
+    } else {
+      // Ancien schéma: { frozenAt, byEmployee, byFormula }
+      const total = Number((led.byEmployee || {})[empId] || 0);
+      out.push({
+        month,
+        total,
+        frozenAt: led.frozenAt || null,
+        seq: 1,
+      });
+    }
+  }
 
-  hist.sort((a, b) => b.month.localeCompare(a.month)); // décroissant
-  res.json({ empId, history: hist });
+  // Tri décroissant par date (frozenAt si présent sinon le mois), puis par seq
+  out.sort((a, b) => {
+    const ad = a.frozenAt || a.month;
+    const bd = b.frozenAt || b.month;
+    const cmp = String(bd).localeCompare(String(ad));
+    return cmp !== 0 ? cmp : (b.seq || 0) - (a.seq || 0);
+  });
+
+  res.json({ empId, history: out });
 });
+
 
 // 11) Liste des formules visibles côté Employé (lecture seule)
 app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
@@ -2031,12 +2134,230 @@ app.get('/bonusV3/employee-entries', authRequired, bonusRequireOwner, (req, res)
   req.url = req.url.replace('/employee-entries', '/entries');
   return app._router.handle(req, res, () => {});
 });
-app.get('/bonusV3/employee-history', authRequired, bonusRequireOwner, (req, res) => {
-  req.url = req.url.replace('/employee-history', '/history');
-  return app._router.handle(req, res, () => {});
+
+// ========== PROFILS EMPLOYÉS (durable côté serveur) ==========
+
+// Stockage dans le tenant (persistant comme tes autres données)
+function profEnsure(t) {
+  t.employee_profiles = t.employee_profiles || { byId: {} };
+  return t;
+}
+
+// Index "staff" (pour retrouver nom/prénom/email de l'invitation)
+function profGetStaffIndex(t) {
+  const list = Array.isArray(t.employees) ? t.employees
+            : Array.isArray(t.staff)      ? t.staff
+            : [];
+
+  const byId = {};
+  const emailToId = {};
+  const displayById = {};
+
+  for (const p of list) {
+    const id = String(p.id ?? p.user_id ?? p.email ?? '').trim();
+    if (!id) continue;
+    byId[id] = p;
+    if (p.email) emailToId[String(p.email).toLowerCase()] = id;
+
+    const first = p.first_name ?? p.firstName ?? null;
+    const last  = p.last_name  ?? p.lastName  ?? null;
+    const name =
+      [first, last].filter(Boolean).join(' ').trim()
+      || p.name || p.displayName || p.email || id;
+
+    displayById[id] = {
+      id,
+      name,
+      email: p.email ?? null,
+      first_name: first,
+      last_name:  last,
+    };
+  }
+  return { byId, emailToId, displayById };
+}
+
+// Canonicalise l'ID employé à partir du token (prend l'id, sinon l'email => id)
+function profCanonicalEmpId(req, t) {
+  const raw = String(req.user?.user_id || req.user?.id || req.user?.sub || req.user?.email || '').trim();
+  if (!raw) return '';
+  const { emailToId } = profGetStaffIndex(t);
+  return emailToId[raw.toLowerCase()] || raw;
+}
+
+// ====== Changement de mot de passe (helpers) ======
+function pwdEnsureStore(t) {
+  t.auth = t.auth || { byId: {} }; // { [empId]: { password: 'scrypt$N$r$keylen$salt$hash' } }
+  return t;
+}
+
+function pwdHash(newPassword) {
+  const salt = randomBytes(16);
+  const N = 16384, r = 8, keylen = 64; // paramètres scrypt raisonnables
+  const hash = scryptSync(newPassword, salt, keylen, { N, r, p: 1 });
+  return `scrypt$${N}$${r}$${keylen}$${salt.toString('base64')}$${hash.toString('base64')}`;
+}
+
+function pwdVerify(stored, password) {
+  try {
+    if (!stored || typeof stored !== 'string') return false;
+    const [alg, sN, sr, skeylen, ssalt, shash] = stored.split('$');
+    if (alg !== 'scrypt') return false;
+    const N = Number(sN), r = Number(sr), keylen = Number(skeylen);
+    const salt = Buffer.from(ssalt, 'base64');
+    const expected = Buffer.from(shash, 'base64');
+    const got = scryptSync(password, salt, keylen, { N, r, p: 1 });
+    return got.length === expected.length && timingSafeEqual(got, expected);
+  } catch { return false; }
+}
+
+// GET /profile/me  => profil de l'utilisateur connecté (EMPLOYEE/OWNER)
+app.get('/profile/me', authRequired, (req, res) => {
+  const code = req.user.company_code;
+  let t = profEnsure(getTenant(code));
+  const id = profCanonicalEmpId(req, t);
+  if (!id) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+
+  const profile = t.employee_profiles.byId[id] || {};
+  const staffIdx = profGetStaffIndex(t);
+  const base = staffIdx.displayById[id] || {};
+
+  res.json({
+    id,
+    email: profile.email ?? base.email ?? req.user.email ?? null,
+    first_name: profile.first_name ?? base.first_name ?? null,
+    last_name:  profile.last_name  ?? base.last_name  ?? null,
+    phone: profile.phone ?? null,
+    address: profile.address ?? null,
+    updatedAt: profile.updatedAt ?? null,
+  });
 });
 
+// PATCH /profile/me  => l’employé peut MAJ téléphone/adresse (OWNER peut aussi)
+app.patch('/profile/me', authRequired, (req, res) => {
+  const code = req.user.company_code;
+  let t = profEnsure(getTenant(code));
+  const id = profCanonicalEmpId(req, t);
+  if (!id) return res.status(400).json({ error: 'EMP_ID_MISSING' });
 
+  const body = req.body || {};
+  const role = String(req.user.role || '').toUpperCase();
+  const patch = {};
+
+  // Employé : téléphone/adresse — Patron : tout
+  if (role === 'OWNER') {
+    if ('first_name' in body) patch.first_name = String(body.first_name || '');
+    if ('last_name'  in body) patch.last_name  = String(body.last_name  || '');
+    if ('email'      in body) patch.email      = String(body.email      || '');
+  }
+  if ('phone' in body)   patch.phone   = String(body.phone || '');
+  if ('address' in body) patch.address = String(body.address || '');
+
+  t.employee_profiles.byId[id] = {
+    ...(t.employee_profiles.byId[id] || {}),
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+
+  saveTenant(code, t);
+  res.json({ success: true });
+});
+
+// OWNER: GET /profiles  => renvoie un map de tous les profils (fusion staff + profils)
+app.get('/profiles', authRequired, (req, res) => {
+  const role = String(req.user.role || '').toUpperCase();
+  if (role !== 'OWNER') return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+
+  const code = req.user.company_code;
+  let t = profEnsure(getTenant(code));
+  const idx = profGetStaffIndex(t);
+
+  const out = {};
+  for (const id of Object.keys(idx.displayById)) {
+    const base = idx.displayById[id];
+    const p = t.employee_profiles.byId[id] || {};
+    out[id] = {
+      id,
+      email: p.email ?? base.email ?? null,
+      first_name: p.first_name ?? base.first_name ?? null,
+      last_name:  p.last_name  ?? base.last_name  ?? null,
+      phone: p.phone ?? null,
+      address: p.address ?? null,
+      updatedAt: p.updatedAt ?? null,
+    };
+  }
+  // Profils orphelins (sans entrée staff)
+  for (const id of Object.keys(t.employee_profiles.byId)) {
+    if (out[id]) continue;
+    const p = t.employee_profiles.byId[id];
+    out[id] = {
+      id,
+      email: p.email ?? null,
+      first_name: p.first_name ?? null,
+      last_name:  p.last_name ?? null,
+      phone: p.phone ?? null,
+      address: p.address ?? null,
+      updatedAt: p.updatedAt ?? null,
+    };
+  }
+
+  res.json({ profiles: out });
+});
+
+// OWNER: PATCH /profile/:empId  => MAJ d’un profil employé (tous champs)
+app.patch('/profile/:empId', authRequired, (req, res) => {
+  const role = String(req.user.role || '').toUpperCase();
+  if (role !== 'OWNER') return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+
+  const code = req.user.company_code;
+  let t = profEnsure(getTenant(code));
+  const empId = String(req.params.empId || '').trim();
+  if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+
+  const body = req.body || {};
+  const patch = {};
+  for (const k of ['first_name', 'last_name', 'email', 'phone', 'address']) {
+    if (k in body) patch[k] = String(body[k] || '');
+  }
+
+  t.employee_profiles.byId[empId] = {
+    ...(t.employee_profiles.byId[empId] || {}),
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+
+  saveTenant(code, t);
+  res.json({ success: true });
+});
+
+// POST /auth/change-password  (EMPLOYEE/OWNER change son propre mot de passe)
+app.post('/auth/change-password', authRequired, (req, res) => {
+  const code = req.user.company_code;
+  let t = pwdEnsureStore(getTenant(code));  // store des mdp
+  t = profEnsure(t);                        // si tu as déjà ces helpers pour les profils
+
+  const empId = profCanonicalEmpId(req, t) || req.user?.user_id || req.user?.email;
+  if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+
+  const { currentPassword, newPassword } = req.body || {};
+  if (typeof newPassword !== 'string' || newPassword.length < 8) {
+    return res.status(400).json({ error: 'WEAK_PASSWORD', message: 'Mot de passe trop court (min 8 caractères).' });
+  }
+
+  const rec = (t.auth.byId[empId] = t.auth.byId[empId] || {});
+
+  // Si un mot de passe existe déjà, on exige l’ancien
+  if (rec.password) {
+    if (typeof currentPassword !== 'string' || !pwdVerify(rec.password, currentPassword)) {
+      return res.status(400).json({ error: 'BAD_CURRENT_PASSWORD', message: 'Ancien mot de passe incorrect.' });
+    }
+  }
+
+  rec.password = pwdHash(newPassword);
+  rec.updatedAt = new Date().toISOString();
+
+  saveTenant(code, t);
+  return res.json({ success: true });
+});
 
 
 /** ===== START ===== */
