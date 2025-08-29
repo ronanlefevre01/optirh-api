@@ -105,6 +105,38 @@ async function requireDrive(res) {
   }
 }
 
+function bonusGetStaffIndex(t) {
+  const list = Array.isArray(t.employees) ? t.employees
+            : Array.isArray(t.staff)      ? t.staff
+            : [];
+
+  const byId = {};
+  const emailToId = {};
+  const displayById = {};
+
+  for (const p of list) {
+    const id = String(p.id ?? p.user_id ?? p.email ?? '');
+    if (!id) continue;
+    byId[id] = p;
+    if (p.email) emailToId[String(p.email).toLowerCase()] = id;
+
+    const name =
+      [p.first_name, p.last_name].filter(Boolean).join(' ').trim() ||
+      p.name || p.email || id;
+
+    displayById[id] = { id, name, email: p.email ?? null };
+  }
+  return { byId, emailToId, displayById };
+}
+
+function bonusCanonicalEmpId(t, raw) {
+  if (!raw) return raw;
+  const s = String(raw);
+  const { emailToId } = bonusGetStaffIndex(t);
+  return emailToId[s.toLowerCase()] || s;
+}
+
+
 
 /** ===== UTILS ===== */
 const sign = (payload) =>
@@ -1791,7 +1823,7 @@ app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, (req, res) 
 // 5) SAISIE d'une vente (EMPLOYEE ou OWNER)
 app.post('/bonusV3/sale', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
   const code = bonusCompanyCodeOf(req);
-  const empId = bonusUserIdOf(req);
+  const empId = canonicalEmpId(t, req.user.user_id);
   if (!empId) return res.status(400).json({ error: 'NO_USER' });
 
   const { formulaId, sale } = req.body || {};
@@ -1836,20 +1868,42 @@ app.get('/bonusV3/summary', authRequired, bonusRequireOwner, (req, res) => {
   const m = String(req.query.month || monthKey());
   const t = bonusEnsureStruct(getTenant(code));
 
-  const byEmp = t.bonusV3.entries?.[m] || {};
+  const rawByEmp = t.bonusV3.entries?.[m] || {};
+
+  // 1) Fusionne les clés e-mail -> id canonique
+  const mergedByEmp = {};
+  for (const rawId of Object.keys(rawByEmp)) {
+    const id = bonusCanonicalEmpId(t, rawId);
+    if (!mergedByEmp[id]) mergedByEmp[id] = [];
+    mergedByEmp[id].push(...(rawByEmp[rawId] || []));
+  }
+
+  // 2) Agrégats
   const byEmployee = {};
   const byFormula = {};
-  for (const empId of Object.keys(byEmp)) {
-    const list = byEmp[empId] || [];
+  for (const empId of Object.keys(mergedByEmp)) {
+    const list = mergedByEmp[empId] || [];
     const tot = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
     byEmployee[empId] = { total: tot, count: list.length };
     for (const it of list) {
       byFormula[it.formulaId] = (byFormula[it.formulaId] || 0) + Number(it.bonus || 0);
     }
   }
+
+  // 3) Données d’affichage (nom/prénom/email)
+  const { displayById } = bonusGetStaffIndex(t);
+  const employees = {};
+  for (const id of Object.keys(byEmployee)) {
+    employees[id] = displayById[id] || { id, name: id, email: null };
+  }
+
+  // 4) État et total global
   const frozen = Boolean(t.bonusV3.ledger?.[m]?.frozenAt);
-  res.json({ month: m, byEmployee, byFormula, frozen });
+  const totalAll = Object.values(byEmployee).reduce((s, x) => s + (x.total || 0), 0);
+
+  res.json({ month: m, totalAll, byEmployee, byFormula, employees, frozen });
 });
+
 
 // 8) FIGER la période (OWNER)
 app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
