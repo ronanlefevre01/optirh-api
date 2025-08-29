@@ -104,7 +104,9 @@ async function requireDrive(res) {
     return false;
   }
 }
-// --- Index du personnel depuis le tenant --------------------
+// ==== BONUS V3 HELPERS — à garder UNE seule fois ====
+
+// Index du personnel depuis le tenant
 function bonusGetStaffIndex(t) {
   const list = Array.isArray(t.employees) ? t.employees
             : Array.isArray(t.staff)      ? t.staff
@@ -136,26 +138,22 @@ function bonusGetStaffIndex(t) {
   return { byId, emailToId, displayById, roleById };
 }
 
-// --- Normalisation d'un identifiant employé -----------------
+// Normalisation d’un identifiant employé
 function bonusCanonicalEmpId(t, raw) {
-  // Ne JAMAIS renvoyer 'undefined' / undefined
   if (raw == null) return null;
   const s = String(raw).trim();
   if (!s || s === 'undefined' || s === 'null') return null;
 
-  // Si c'est un email et qu'on a la correspondance → retourne l'ID
   const { emailToId } = bonusGetStaffIndex(t);
   const isEmail = s.includes('@') && !s.includes(' ');
   if (isEmail) {
     const id = emailToId[s.toLowerCase()];
     if (id) return id;
   }
-
-  // Sinon on considère que c'est déjà un ID
   return s;
 }
 
-// --- Récupérer l'ID employé depuis la requête ----------------
+// Récupérer l’ID employé depuis la requête
 function bonusEmpIdFromReq(req, t) {
   const u = req.user || {};
   const hdr = req.headers || {};
@@ -166,6 +164,10 @@ function bonusEmpIdFromReq(req, t) {
 
   return bonusCanonicalEmpId(t, raw); // -> string | null
 }
+
+// (facultatif) alias si du vieux code appelle encore canonicalEmpId()
+const canonicalEmpId = (t, raw) => bonusCanonicalEmpId(t, raw);
+
 
 
 /** ===== UTILS ===== */
