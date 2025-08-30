@@ -261,6 +261,17 @@ function requireEmployeeOrOwner(req, res, next) {
   return res.status(403).json({ error: 'Forbidden' });
 }
 
+// Légal (versions + URLs)
+obj.legal = obj.legal || {};
+obj.legal.versions = obj.legal.versions || { cgv: '1.0', cgu: '1.0', privacy: '1.0' };
+// Optionnel: liens publics vers tes pages (remplace plus tard)
+obj.legal.urls = obj.legal.urls || {
+  cgv: null, // ex: 'https://opti-admin.vercel.app/legal/cgv'
+  cgu: null, // ex: 'https://opti-admin.vercel.app/legal/cgu'
+  privacy: null // ex: 'https://opti-admin.vercel.app/legal/confidentialite'
+};
+
+
 
 // Chevauchement de périodes "YYYY-MM-DD"
 const overlaps = (aStart, aEnd, bStart, bEnd) => !(aEnd < bStart || aStart > bEnd);
@@ -2655,6 +2666,91 @@ app.post('/auth/change-password', authRequired, async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
+// Helper: retourne l'objet user + defaults
+function getTenantAndUser(reg, companyCode, uid) {
+  const t0 = reg.tenants?.[companyCode];
+  if (!t0) throw new Error('Tenant not found');
+  const t = ensureTenantDefaults(t0);
+  const user = t.users?.[String(uid)];
+  if (!user) throw new Error('User not found');
+  return { t, user };
+}
+
+// GET /legal/status  -> indique ce que l'utilisateur doit accepter
+app.get('/legal/status', authRequired, async (req, res) => {
+  try {
+    const reg = await loadRegistry();
+    const { t, user } = getTenantAndUser(reg, req.user.company_code, req.user.sub);
+    const role = String(req.user.role || '').toUpperCase();
+
+    const v = t.legal?.versions || { cgv:'1.0', cgu:'1.0', privacy:'1.0' };
+    const uacc = (user.legal_accepts || {});
+    const hasCGU = uacc.cgu && uacc.cgu.version === v.cgu;
+    const hasCGV = uacc.cgv && uacc.cgv.version === v.cgv;
+
+    const need_cgu = !hasCGU;                         // tous les rôles
+    const need_cgv = role === 'OWNER' && !hasCGV;     // patron seulement
+
+    return res.json({
+      need_cgu, need_cgv,
+      versions: v,
+      urls: t.legal?.urls || {},
+      role
+    });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    if (msg.includes('User not found'))   return res.status(404).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// POST /legal/accept  -> enregistre l’acceptation de l’utilisateur courant
+// body: { acceptCGU?: boolean, acceptCGV?: boolean }
+app.post('/legal/accept', authRequired, async (req, res) => {
+  try {
+    const { acceptCGU, acceptCGV } = req.body || {};
+    const role = String(req.user.role || '').toUpperCase();
+
+    await withRegistryUpdate((next) => {
+      const code = req.user.company_code;
+      const t0 = next.tenants?.[code];
+      if (!t0) throw new Error('Tenant not found');
+      const t = ensureTenantDefaults(t0);
+
+      const uid = String(req.user.sub);
+      if (!t.users?.[uid]) throw new Error('User not found');
+
+      const v = t.legal?.versions || { cgv:'1.0', cgu:'1.0', privacy:'1.0' };
+      t.users[uid].legal_accepts = t.users[uid].legal_accepts || {};
+
+      const now = new Date().toISOString();
+
+      if (acceptCGU) {
+        t.users[uid].legal_accepts.cgu = { version: v.cgu, at: now };
+      }
+      if (acceptCGV) {
+        if (role !== 'OWNER') throw new Error('FORBIDDEN_CGV_NON_OWNER');
+        t.users[uid].legal_accepts.cgv = { version: v.cgv, at: now };
+      }
+
+      t.updated_at = now;
+      next.tenants[code] = t;
+      return true;
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes('Tenant not found') || msg.includes('User not found'))
+      return res.status(404).json({ error: msg });
+    if (msg.includes('FORBIDDEN_CGV_NON_OWNER'))
+      return res.status(403).json({ error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
 
 
 
