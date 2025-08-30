@@ -268,13 +268,19 @@ function saveTenant(companyCode, tenant) {
   return tenant;
 }
 
-// Garde ces gardes simples; adapte si tu as déjà un auth middleware différent
+
+// Rôles "patron-like"
+const OWNER_LIKE = new Set(['OWNER', 'HR']);
+
 function requireOwner(req, res, next) {
-  if (req?.user?.role === 'OWNER') return next();
+  const r = String(req?.user?.role || '').toUpperCase();
+  if (OWNER_LIKE.has(r)) return next();
   return res.status(403).json({ error: 'Forbidden' });
 }
+
 function requireEmployeeOrOwner(req, res, next) {
-  if (['EMPLOYEE', 'OWNER'].includes(req?.user?.role)) return next();
+  const r = String(req?.user?.role || '').toUpperCase();
+  if (r === 'EMPLOYEE' || OWNER_LIKE.has(r)) return next();
   return res.status(403).json({ error: 'Forbidden' });
 }
 
@@ -584,15 +590,32 @@ function authRequired(req, res, next) {
 
 app.post("/users/invite", authRequired, async (req, res) => {
   try {
-    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
+    // Seuls OWNER ou HR peuvent inviter
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
 
-    const email = (req.body?.email || "").trim().toLowerCase();
-    const temp_password = (req.body?.temp_password || "").trim();
-    const first_name = (req.body?.first_name ?? null);
-    const last_name  = (req.body?.last_name ?? null);
-    const role = (req.body?.role || "EMPLOYEE");
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const temp_password = String(req.body?.temp_password || "").trim();
+    const first_name = req.body?.first_name ?? null;
+    const last_name  = req.body?.last_name  ?? null;
+
+    // Normalisation & validation du rôle
+    const rawRole = String(req.body?.role || "EMPLOYEE").toUpperCase();
+
+    // Support legacy : si "MANAGER" arrive encore du front, on le traite comme HR (admin).
+    let role = rawRole === 'MANAGER' ? 'HR' : rawRole;
+
+    // Rôles autorisés pour création (tu peux retirer 'OWNER' si tu ne veux pas inviter un autre patron)
+    const allowedRoles = new Set(['EMPLOYEE', 'HR', 'OWNER']);
+    if (!allowedRoles.has(role)) {
+      return res.status(400).json({ error: 'BAD_ROLE' });
+    }
 
     if (!email) return res.status(400).json({ error: "email requis" });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "email invalide" });
+    }
     if (!temp_password) return res.status(400).json({ error: "temp_password requis" });
 
     let created = null;
@@ -602,7 +625,9 @@ app.post("/users/invite", authRequired, async (req, res) => {
       const t = next.tenants?.[code];
       if (!t) throw new Error("Tenant not found");
 
-      const exists = Object.values(t.users || {}).some(u => String(u.email).toLowerCase() === String(email).toLowerCase());
+      const exists = Object.values(t.users || {}).some(
+        u => String(u.email || '').toLowerCase() === email
+      );
       if (exists) throw new Error("User already exists");
 
       const id = t.next_user_id || 1;
@@ -612,7 +637,7 @@ app.post("/users/invite", authRequired, async (req, res) => {
       t.users = t.users || {};
       t.users[String(id)] = {
         id,
-        role,
+        role,              // 'EMPLOYEE' | 'HR' | 'OWNER'
         email,
         password_hash: hash,
         first_name: first_name || null,
@@ -621,7 +646,15 @@ app.post("/users/invite", authRequired, async (req, res) => {
       };
       t.next_user_id = id + 1;
       t.updated_at = now;
-      created = { id, email, role, first_name: first_name || null, last_name: last_name || null, created_at: now };
+
+      created = {
+        id,
+        email,
+        role,
+        first_name: first_name || null,
+        last_name: last_name || null,
+        created_at: now
+      };
 
       next.tenants[code] = t;
       return true;
@@ -631,10 +664,11 @@ app.post("/users/invite", authRequired, async (req, res) => {
   } catch (e) {
     const msg = String(e.message || e);
     if (msg.includes("User already exists")) return res.status(409).json({ error: msg });
-    if (msg.includes("Tenant not found")) return res.status(404).json({ error: msg });
+    if (msg.includes("Tenant not found"))   return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
+
 
 app.get("/users", authRequired, async (req, res) => {
   try {
@@ -859,7 +893,9 @@ app.post('/devices/register', authRequired, async (req, res) => {
 /** ===== LEAVES PENDING (manager) ===== */
 app.get('/leaves/pending', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
     const reg = await loadRegistry();
     const t = reg.tenants?.[req.user.company_code];
     if (!t) return res.status(404).json({ error: 'Tenant not found' });
@@ -892,7 +928,9 @@ app.get('/calendar/events', authRequired, async (req, res) => {
 /** ===== OWNER: approve/deny + edit + cancel (agenda sync + push) ===== */
 app.patch('/leaves/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
     const id = String(req.params.id);
 
     // Compat : approve/deny via action ou status; edit via { edit:{...} }; cancel via action='cancel'
@@ -1086,7 +1124,9 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
 // OWNER crée un congé pour n'importe quel salarié (avec possibilité de forcer)
 app.post('/leaves/admin', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
 
     const {
       user_id,
@@ -1198,7 +1238,9 @@ app.post('/leaves/admin', authRequired, async (req, res) => {
 // Modifier un événement d'agenda (OWNER)
 app.patch('/calendar/events/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
 
     const { start, end, title } = req.body || {};
     if (start && !/^\d{4}-\d{2}-\d{2}$/.test(start)) return res.status(400).json({ error: 'bad start' });
@@ -1251,7 +1293,9 @@ app.patch('/calendar/events/:id', authRequired, async (req, res) => {
 // Supprimer un événement (OWNER) + annuler le congé lié si présent
 app.delete('/calendar/events/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
 
     let removed = null;
 
@@ -1317,7 +1361,9 @@ app.get('/announcements', authRequired, async (req, res) => {
 // Créer (OWNER)
 app.post('/announcements', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
 
     const { type, title, body, url } = req.body || {};
     if (!['message','pdf'].includes(type)) return res.status(400).json({ error: 'type must be message|pdf' });
@@ -1376,7 +1422,9 @@ app.post('/announcements', authRequired, async (req, res) => {
 // Éditer (OWNER) – optionnel
 app.patch('/announcements/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
     const id = String(req.params.id);
     const { title, body, url } = req.body || {};
     let updated = null;
@@ -1521,7 +1569,9 @@ app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req
 // ========== DELETE ==========
 app.delete('/announcements/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
     const id = String(req.params.id);
 
     let removed = null;
@@ -1653,7 +1703,9 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
 // 1/ Démarrer une session d’upload Drive (resumable) et retourner l'uploadUrl
 app.post('/announcements/upload-url', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
     if (!(await requireDrive(res))) return;
 
     const { driveAuth } = await ensureDrive();
@@ -1792,7 +1844,9 @@ app.get('/__drive/check-folder', async (req, res) => {
 // 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
 app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
     if (!(await requireDrive(res))) return;
 
     const { drive: driveClient } = await ensureDrive();
@@ -1901,7 +1955,9 @@ app.get('/settings', authRequired, async (req, res) => {
 // Mettre à jour les réglages (OWNER uniquement)
 app.patch('/settings', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
 
     const { leave_count_mode, workweek, show_employee_bonuses } = req.body || {};
     if (leave_count_mode && !['ouvres', 'ouvrables'].includes(leave_count_mode)) {
@@ -1947,16 +2003,22 @@ app.patch('/settings', authRequired, async (req, res) => {
 const bonusRoleOf = (req) => String(req.user?.role || '').toUpperCase();
 const bonusCompanyCodeOf = (req) => req.user?.company_code || req.user?.companyCode;
 
+// OWNER-like = OWNER ou HR
+const BONUS_OWNER_LIKE = new Set(['OWNER', 'HR']);
+
 // Middlewares
 function bonusRequireOwner(req, res, next) {
-  if (bonusRoleOf(req) === 'OWNER') return next();
+  const r = bonusRoleOf(req);
+  if (BONUS_OWNER_LIKE.has(r)) return next();
   return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
 }
+
 function bonusRequireEmployeeOrOwner(req, res, next) {
   const r = bonusRoleOf(req);
-  if (r === 'EMPLOYEE' || r === 'OWNER') return next();
+  if (r === 'EMPLOYEE' || BONUS_OWNER_LIKE.has(r)) return next();
   return res.status(403).json({ error: 'FORBIDDEN_EMPLOYEE' });
 }
+
 
 // Squelette Bonus V3 sur le tenant
 function bonusEnsureStruct(t) {
@@ -2690,20 +2752,36 @@ app.get('/legal/status', authRequired, async (req, res) => {
     const reg = await loadRegistry();
     const { t, user } = getTenantAndUser(reg, req.user.company_code, req.user.sub);
     const role = String(req.user.role || '').toUpperCase();
+    const uid  = String(req.user.sub);
 
-    const v = t.legal?.versions || { cgv:'1.0', cgu:'1.0', privacy:'1.0' };
-    const uacc = (user.legal_accepts || {});
-    const hasCGU = uacc.cgu && uacc.cgu.version === v.cgu;
-    const hasCGV = uacc.cgv && uacc.cgv.version === v.cgv;
+    // Versions + URLs avec valeurs par défaut
+    const versions = (t.legal && t.legal.versions) ? t.legal.versions : { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
+    const urls     = (t.legal && t.legal.urls)     ? t.legal.urls     : {};
 
-    const need_cgu = !hasCGU;                         // tous les rôles
-    const need_cgv = role === 'OWNER' && !hasCGV;     // patron seulement
+    // Lecture des acceptations :
+    // 1) Nouveau schéma: t.legal.acceptances.byUser[uid]
+    // 2) Legacy: user.legal_accepts (fallback)
+    const accTenant = t?.legal?.acceptances?.byUser?.[uid] || null;
+    const accLegacy = user?.legal_accepts || null;
+    const acc = accTenant || accLegacy || {};
+
+    const hasCGU     = acc.cgu     && acc.cgu.version     === versions.cgu;
+    const hasCGV     = acc.cgv     && acc.cgv.version     === versions.cgv;
+    const hasPrivacy = acc.privacy && acc.privacy.version === versions.privacy;
+
+    // Règles d’obligation
+    const need_cgu = !hasCGU;                             // CGU pour tout le monde
+    const need_cgv = role === 'OWNER' ? !hasCGV : false;  // CGV pour Patron uniquement (pas RH/Admin)
+    const need_privacy = false;                           // ← si tu ne veux PAS forcer la confidentialité
+    // Si tu veux la rendre obligatoire pour tous, remplace par: const need_privacy = !hasPrivacy;
 
     return res.json({
-      need_cgu, need_cgv,
-      versions: v,
-      urls: t.legal?.urls || {},
-      role
+      role,
+      versions,
+      urls,
+      need_cgu,
+      need_cgv,
+      need_privacy,
     });
   } catch (e) {
     const msg = String(e.message || e);
