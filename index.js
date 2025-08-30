@@ -231,12 +231,24 @@ function ensureTenantDefaults(t) {
   // === LÉGAL (versions, URLs, acceptations) ===
   obj.legal = obj.legal || {};
   obj.legal.versions = obj.legal.versions || { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
-  obj.legal.urls = obj.legal.urls || { cgu: null, cgv: null, privacy: null };
+
+  // URLs : on prend ce qui existe déjà, sinon fallback sur ENV
+  obj.legal.urls = obj.legal.urls || {
+    cgu: process.env.LEGAL_CGU_URL || null,
+    cgv: process.env.LEGAL_CGV_URL || null,
+    privacy: process.env.LEGAL_PRIVACY_URL || null,
+  };
+  // Si certaines clés manquent ou sont vides, on les complète depuis ENV sans écraser les valeurs existantes
+  if (!obj.legal.urls.cgu && process.env.LEGAL_CGU_URL) obj.legal.urls.cgu = process.env.LEGAL_CGU_URL;
+  if (!obj.legal.urls.cgv && process.env.LEGAL_CGV_URL) obj.legal.urls.cgv = process.env.LEGAL_CGV_URL;
+  if (!obj.legal.urls.privacy && process.env.LEGAL_PRIVACY_URL) obj.legal.urls.privacy = process.env.LEGAL_PRIVACY_URL;
+
   obj.legal.acceptances = obj.legal.acceptances || { byUser: {} };
   if (!obj.legal.acceptances.byUser) obj.legal.acceptances.byUser = {};
 
   return obj;
 }
+
 
 
 
@@ -2745,7 +2757,6 @@ app.post('/legal/accept', authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
-
 
 
 
