@@ -180,7 +180,6 @@ if (process.env.DEBUG_BONUS === '1') {
 
 /** ===== HELPERS AGENDA & PUSH ===== */
 
-
 // S'assure que les champs de base existent dans le tenant
 function ensureTenantDefaults(t) {
   const obj = (t && typeof t === 'object') ? t : {};
@@ -196,16 +195,14 @@ function ensureTenantDefaults(t) {
   if (!('leave_count_mode' in obj.settings)) {
     obj.settings.leave_count_mode = 'ouvres'; // 'ouvres' ou 'ouvrables'
   }
-  // Affichage de l’onglet "Ventes bonifiées" côté employé (true par défaut)
   if (!('show_employee_bonuses' in obj.settings)) {
     obj.settings.show_employee_bonuses = true;
   }
-  // Optionnel : semaine de travail (laisser tel quel si déjà défini)
   if (!Array.isArray(obj.settings.workweek)) {
-    // ne force pas de valeur par défaut, garde undefined si non configuré
+    // laisser undefined si non configuré
   }
 
-  // Profils employés (données coordonnées/identité étendues)
+  // Profils employés
   obj.employee_profiles = obj.employee_profiles || { byId: {} };
   if (!obj.employee_profiles.byId) obj.employee_profiles.byId = {};
 
@@ -231,8 +228,16 @@ function ensureTenantDefaults(t) {
     }
   }
 
+  // === LÉGAL (versions, URLs, acceptations) ===
+  obj.legal = obj.legal || {};
+  obj.legal.versions = obj.legal.versions || { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
+  obj.legal.urls = obj.legal.urls || { cgu: null, cgv: null, privacy: null };
+  obj.legal.acceptances = obj.legal.acceptances || { byUser: {} };
+  if (!obj.legal.acceptances.byUser) obj.legal.acceptances.byUser = {};
+
   return obj;
 }
+
 
 
 // --- Helpers d'accès (dev en mémoire) ---
@@ -260,16 +265,6 @@ function requireEmployeeOrOwner(req, res, next) {
   if (['EMPLOYEE', 'OWNER'].includes(req?.user?.role)) return next();
   return res.status(403).json({ error: 'Forbidden' });
 }
-
-// Légal (versions + URLs)
-obj.legal = obj.legal || {};
-obj.legal.versions = obj.legal.versions || { cgv: '1.0', cgu: '1.0', privacy: '1.0' };
-// Optionnel: liens publics vers tes pages (remplace plus tard)
-obj.legal.urls = obj.legal.urls || {
-  cgv: null, // ex: 'https://opti-admin.vercel.app/legal/cgv'
-  cgu: null, // ex: 'https://opti-admin.vercel.app/legal/cgu'
-  privacy: null // ex: 'https://opti-admin.vercel.app/legal/confidentialite'
-};
 
 
 
