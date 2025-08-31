@@ -12,11 +12,15 @@ import { Readable } from "stream";
 import { computeBonusV3 } from './bonusMathV3.js';
 import { monthKey } from './utils/dates.js';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { q } from './db.js';
+import { tenantLoad, tenantUpsert, tenantUpdate } from './tenant-store.js';
 
 
-
+const { pool } = require('./db');
 const app = express();
 
+
+function isHttpUrl(u='') { return /^https?:\/\//i.test(String(u)); }
 /** ===== CORS (whitelist) ===== */
 const ALLOWED_ORIGINS = [
   "https://opti-admin.vercel.app",
@@ -106,6 +110,13 @@ async function requireDrive(res) {
   }
 }
 
+function isPdf(m) { return String(m || '').toLowerCase() === 'application/pdf'; }
+function isHttpUrl(u = '') { return /^https?:\/\//i.test(String(u)); }
+function grabIdFromDriveLink(link) {
+  if (!link) return null;
+  const m = String(link).match(/\/file\/d\/([^/]+)/);
+  return m ? m[1] : null;
+}
 
 /** ===== UTILS ===== */
 const sign = (payload) =>
@@ -411,47 +422,52 @@ app.post("/auth/activate-licence", async (req, res) => {
     if (!licence_key || !admin_email || !admin_password)
       return res.status(400).json({ error: "fields required" });
 
+    // 1) Lire la licence sur JSONBin (inchangé)
     const reg = await loadRegistry();
     const lic = reg.licences?.[licence_key];
     if (!lic || lic.status !== "active") return res.status(403).json({ error: "Invalid licence" });
 
     const code = lic.company_code;
-    if (reg.tenants[code]) return res.status(409).json({ error: "Licence already activated" });
 
+    // 2) Vérifier si le tenant existe déjà dans Neon
+    if (await tenantLoad(code)) return res.status(409).json({ error: "Licence already activated" });
+
+    // 3) Créer le tenant dans Neon
     const now = new Date().toISOString();
     const hash = await bcrypt.hash(admin_password, 10);
 
-    await withRegistryUpdate((next) => {
-      const n = next;
-      n.tenants = n.tenants || {};
-      if (n.tenants[code]) throw new Error("Licence already activated");
-
-      n.tenants[code] = {
-        company: {
-          name: lic.company.name,
-          siret: lic.company.siret || null,
-          contact_email: lic.company.contact_email || null,
-          contact_firstname: lic.company.contact_firstname || null,
-          contact_lastname: lic.company.contact_lastname || null,
+    const tenantDoc = ensureTenantDefaults({
+      company: {
+        name: lic.company.name,
+        siret: lic.company.siret || null,
+        contact_email: lic.company.contact_email || null,
+        contact_firstname: lic.company.contact_firstname || null,
+        contact_lastname: lic.company.contact_lastname || null,
+        created_at: now,
+      },
+      licence_key,
+      users: {
+        "1": {
+          id: 1,
+          role: "OWNER",
+          email: admin_email,
+          password_hash: hash,
+          first_name: lic.company.contact_firstname || null,
+          last_name: lic.company.contact_lastname || null,
           created_at: now,
         },
-        licence_key,
-        users: {
-          "1": {
-            id: 1,
-            role: "OWNER",
-            email: admin_email,
-            password_hash: hash,
-            first_name: lic.company.contact_firstname || null,
-            last_name: lic.company.contact_lastname || null,
-            created_at: now,
-          },
-        },
-        next_user_id: 2,
-        leaves: [],
-        created_at: now,
-        updated_at: now,
-      };
+      },
+      next_user_id: 2,
+      // le reste sera complété par ensureTenantDefaults
+    });
+
+    await tenantUpsert(code, tenantDoc);
+
+    // 4) (optionnel) marquer la licence comme activée côté JSONBin
+    await withRegistryUpdate((next) => {
+      if (!next.licences?.[licence_key]) throw new Error("Licence disappeared");
+      next.licences[licence_key].activated_at = now;
+      next.updated_at = now;
       return true;
     });
 
@@ -461,7 +477,7 @@ app.post("/auth/activate-licence", async (req, res) => {
   }
 });
 
-// Login Patron/Employé
+
 // Login Patron/Employé (hybride bcrypt + scrypt)
 app.post("/auth/login", async (req, res) => {
   try {
@@ -469,26 +485,24 @@ app.post("/auth/login", async (req, res) => {
     if (!company_code || !email || !password)
       return res.status(400).json({ error: "fields required" });
 
-    const reg = await loadRegistry();
-    const tenant = reg.tenants?.[company_code];
-    if (!tenant) return res.status(404).json({ error: "Unknown company" });
+    const t = ensureTenantDefaults(await tenantLoad(company_code));
+    if (!t) return res.status(404).json({ error: "Unknown company" });
 
-    const users = tenant.users || {};
+    const users = t.users || {};
     const user = Object.values(users).find(
       (u) => String(u.email).toLowerCase() === String(email).toLowerCase()
     );
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-    // --- vérif mdp : d'abord scrypt (nouveau coffre), sinon bcrypt (legacy)
+    // vérif mdp (ton code existant, inchangé)
     let ok = false;
     const empId = String(user.id);
-    const recById   = tenant?.auth?.byId?.[empId];
-    const recByMail = tenant?.auth?.byId?.[String(user.email || '').toLowerCase()];
+    const recById   = t?.auth?.byId?.[empId];
+    const recByMail = t?.auth?.byId?.[String(user.email || '').toLowerCase()];
     const vault = recById || recByMail || null;
 
     if (vault?.password) ok = pwdVerify(vault.password, password);
     if (!ok && user.password_hash) ok = await bcrypt.compare(password, user.password_hash);
-
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
     const token = jwt.sign(
@@ -502,89 +516,80 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// Changer son email de connexion (EMPLOYEE/OWNER)
+
+// Changer son email de connexion (EMPLOYEE/OWNER) — Version Neon
 app.post('/auth/change-email', authRequired, async (req, res) => {
   try {
     const { currentPassword, newEmail } = req.body || {};
     const code = req.user.company_code;
 
     const email = String(newEmail || '').trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: 'BAD_EMAIL' });
+    }
 
-    const reg = await loadRegistry();
-    const t = reg.tenants?.[code];
-    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+    // 1) Charger le tenant depuis Neon
+    const t0 = await tenantLoad(code);
+    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
+    const t  = ensureTenantDefaults(t0);
 
-    const uid = String(req.user.sub);
+    const uid  = String(req.user.sub);
     const user = t.users?.[uid];
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Vérif mdp (scrypt d’abord, sinon bcrypt)
+    // 2) Vérifier le mot de passe (scrypt d’abord, puis bcrypt)
     const vault = t?.auth?.byId?.[uid] || t?.auth?.byId?.[String(user.email || '').toLowerCase()];
     let ok = false;
     if (vault?.password) ok = pwdVerify(vault.password, String(currentPassword || ''));
-    if (!ok && user.password_hash)
-      ok = await bcrypt.compare(String(currentPassword || ''), user.password_hash);
+    if (!ok && user.password_hash) ok = await bcrypt.compare(String(currentPassword || ''), user.password_hash);
     if (!ok) return res.status(400).json({ error: 'BAD_CURRENT_PASSWORD' });
 
-    // Unicité
+    // 3) Unicité de l'email
     const already = Object.values(t.users || {}).some(
-      (u) => String(u.email).toLowerCase() === email && String(u.id) !== uid
+      (u) => String(u.email || '').toLowerCase() === email && String(u.id) !== uid
     );
     if (already) return res.status(409).json({ error: 'EMAIL_TAKEN' });
 
     const oldEmail = String(user.email || '').toLowerCase();
 
-    await withRegistryUpdate((next) => {
-      const tt = next.tenants?.[code];
-      if (!tt || !tt.users?.[uid]) throw new Error('User not found');
+    // 4) Écrire la nouvelle valeur dans Neon (mutation atomique)
+    await tenantUpdate(code, (tt) => {
+      const now = new Date().toISOString();
+      ensureTenantDefaults(tt);
+
+      if (!tt.users?.[uid]) throw new Error('User not found');
 
       // MAJ user
       tt.users[uid].email = email;
-      tt.updated_at = new Date().toISOString();
+      tt.updated_at = now;
 
-      // MAJ profils (si tu utilises employee_profiles)
+      // MAJ profils (si présents)
       tt.employee_profiles = tt.employee_profiles || { byId: {} };
       const pById = tt.employee_profiles.byId;
 
-      // si un profil existe sous uid ou ancienne clé email → synchronise
+      // synchroniser profil sous uid et ancienne clé email si elle existe
       for (const key of [uid, oldEmail]) {
         if (key && pById[key]) {
-          pById[key] = { ...pById[key], email, updatedAt: new Date().toISOString() };
+          pById[key] = { ...pById[key], email, updatedAt: now };
         }
       }
-      // si aucun profil, on crée sous uid
-      if (!pById[uid]) {
-        pById[uid] = { email, updatedAt: new Date().toISOString() };
-      }
-      // nettoie l’ancienne clé e-mail si différente
+      // créer si absent
+      if (!pById[uid]) pById[uid] = { email, updatedAt: now };
+      // nettoyer l’ancienne entrée email si différente
       if (oldEmail && oldEmail !== email && pById[oldEmail]) delete pById[oldEmail];
 
-      next.tenants[code] = tt;
-      return true;
+      return tt; // ← tenantUpdate upserte tt vers Neon
     });
 
     return res.json({ success: true, email });
   } catch (e) {
-    return res.status(500).json({ error: String(e.message || e) });
+    const msg = String(e?.message || e);
+    if (msg.includes('User not found'))   return res.status(404).json({ error: 'User not found' });
+    if (msg.includes('Tenant not found')) return res.status(404).json({ error: 'Tenant not found' });
+    return res.status(500).json({ error: msg });
   }
 });
 
-
-/** ===== AUTH MIDDLEWARE ===== */
-function authRequired(req, res, next) {
-  try {
-    const h = req.headers.authorization || "";
-    if (!h.startsWith("Bearer ")) return res.status(401).json({ error: "Auth required" });
-    const token = h.slice(7);
-    const payload = jwt.verify(token, JWT_SECRET); // { sub, company_code, role }
-    req.user = payload;
-    next();
-  } catch {
-    return res.status(401).json({ error: "Invalid token" });
-  }
-}
 
 /** ===== USERS ===== */
 
@@ -683,61 +688,138 @@ app.get("/users", authRequired, async (req, res) => {
   }
 });
 
-app.patch("/users/:id", authRequired, async (req, res) => {
+// PATCH /users/:id — mise à jour d’un utilisateur du tenant courant
+app.patch('/users/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
-    const id = String(req.params.id);
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
+
+    const code = String(req.user.company_code || '').trim();
+    const id = Number(req.params.id);
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'BAD_ID' });
+
     const { first_name, last_name, email, role } = req.body || {};
-    let updated = null;
+    if (
+      first_name === undefined &&
+      last_name === undefined &&
+      email === undefined &&
+      role === undefined
+    ) {
+      return res.status(400).json({ error: 'NOTHING_TO_UPDATE' });
+    }
 
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t = next.tenants?.[code];
-      if (!t || !t.users?.[id]) throw new Error("User not found");
+    // validations
+    let emailNorm = undefined;
+    if (email !== undefined) {
+      emailNorm = String(email).trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+        return res.status(400).json({ error: 'BAD_EMAIL' });
+      }
+    }
+    if (role !== undefined && !['OWNER', 'EMPLOYEE', 'MANAGER'].includes(String(role))) {
+      return res.status(400).json({ error: 'BAD_ROLE' });
+    }
 
-      const u = { ...t.users[id] };
-      if (first_name !== undefined) u.first_name = first_name;
-      if (last_name  !== undefined) u.last_name  = last_name;
-      if (email      !== undefined) u.email      = email;
-      if (role       !== undefined) u.role       = role;
-      u.updated_at = new Date().toISOString();
+    // charge l'utilisateur cible
+    const cur = await pool.query(
+      'SELECT id, email, role FROM users WHERE tenant_code = $1 AND id = $2',
+      [code, id]
+    );
+    if (!cur.rows.length) return res.status(404).json({ error: 'User not found' });
+    const target = cur.rows[0];
 
-      t.users[id] = u;
-      t.updated_at = u.updated_at;
-      next.tenants[code] = t;
-      updated = { ...u };
-      delete updated.password_hash;
-      return true;
-    });
+    // empêcher de “retirer” le dernier OWNER via changement de role
+    if (role !== undefined && target.role === 'OWNER' && role !== 'OWNER') {
+      const owners = await pool.query(
+        "SELECT COUNT(*)::int AS c FROM users WHERE tenant_code=$1 AND role='OWNER' AND id <> $2",
+        [code, id]
+      );
+      if (owners.rows[0].c === 0) {
+        return res.status(400).json({ error: 'CANNOT_DEMOTE_LAST_OWNER' });
+      }
+    }
 
-    return res.json({ ok: true, user: updated });
+    // build UPDATE dynamique
+    const sets = [];
+    const params = [];
+    let i = 1;
+
+    if (first_name !== undefined) { sets.push(`first_name = $${i++}`); params.push(first_name || null); }
+    if (last_name  !== undefined) { sets.push(`last_name  = $${i++}`); params.push(last_name  || null); }
+    if (email      !== undefined) { sets.push(`email      = $${i++}`); params.push(emailNorm); }
+    if (role       !== undefined) { sets.push(`role       = $${i++}`); params.push(role); }
+
+    sets.push(`updated_at = now()`);
+
+    const sql = `
+      UPDATE users
+         SET ${sets.join(', ')}
+       WHERE tenant_code = $${i++}
+         AND id = $${i++}
+       RETURNING id, email, role, first_name, last_name, is_active, created_at, updated_at
+    `;
+    params.push(code, id);
+
+    let upd;
+    try {
+      const { rows } = await pool.query(sql, params);
+      if (!rows.length) return res.status(404).json({ error: 'User not found' });
+      upd = rows[0];
+    } catch (e) {
+      // contrainte unique (tenant_code, email)
+      if (e && e.code === '23505') {
+        return res.status(409).json({ error: 'EMAIL_ALREADY_EXISTS' });
+      }
+      throw e;
+    }
+
+    return res.json({ ok: true, user: upd });
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
-    if (msg.includes("User not found")) return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
 
-app.delete("/users/:id", authRequired, async (req, res) => {
+// DELETE /users/:id — suppression d’un utilisateur du tenant courant
+app.delete('/users/:id', authRequired, async (req, res) => {
   try {
-    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
-    const id = String(req.params.id);
-    if (Number(id) === Number(req.user.sub)) return res.status(400).json({ error: "Cannot delete yourself" });
+    if (req.user.role !== 'OWNER') return res.status(403).json({ error: 'Forbidden' });
 
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t = next.tenants?.[code];
-      if (!t || !t.users?.[id]) throw new Error("User not found");
-      delete t.users[id];
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      return true;
-    });
+    const code = String(req.user.company_code || '').trim();
+    const id = Number(req.params.id);
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'BAD_ID' });
 
+    // ne pas se supprimer soi-même
+    if (Number(id) === Number(req.user.sub)) {
+      return res.status(400).json({ error: 'Cannot delete yourself' });
+    }
+
+    // vérifier existence + rôle
+    const cur = await pool.query(
+      'SELECT id, role FROM users WHERE tenant_code = $1 AND id = $2',
+      [code, id]
+    );
+    if (!cur.rows.length) return res.status(404).json({ error: 'User not found' });
+    const target = cur.rows[0];
+
+    // ne pas supprimer le dernier OWNER
+    if (target.role === 'OWNER') {
+      const owners = await pool.query(
+        "SELECT COUNT(*)::int AS c FROM users WHERE tenant_code=$1 AND role='OWNER' AND id <> $2",
+        [code, id]
+      );
+      if (owners.rows[0].c === 0) {
+        return res.status(400).json({ error: 'CANNOT_DELETE_LAST_OWNER' });
+      }
+    }
+
+    await pool.query('DELETE FROM users WHERE tenant_code = $1 AND id = $2', [code, id]);
     return res.json({ ok: true });
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
-    if (msg.includes("User not found")) return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
@@ -747,10 +829,13 @@ app.delete("/users/:id", authRequired, async (req, res) => {
 // Pré-vérifier les conflits
 app.get('/leaves/conflicts', authRequired, async (req, res) => {
   try {
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
     const start = String(req.query.start || '');
     const end   = String(req.query.end   || '');
+    const only  = String(req.query.only || ''); // 'approved' optionnel
     const excludeParam = req.query.exclude_user_id != null ? Number(req.query.exclude_user_id) : null;
-    const only = String(req.query.only || ''); // 'approved' optionnel
 
     // Vérif formats
     const re = /^\d{4}-\d{2}-\d{2}$/;
@@ -761,81 +846,121 @@ app.get('/leaves/conflicts', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'start must be <= end' });
     }
 
-    const reg = await loadRegistry();
-    const t0 = reg.tenants?.[req.user.company_code];
-    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
-    const t = ensureTenantDefaults(t0);
+    // Par défaut : si EMPLOYEE, on exclut ses propres demandes
+    const excludeUserId = excludeParam != null
+      ? excludeParam
+      : (req.user.role === 'EMPLOYEE' ? Number(req.user.sub) : null);
 
-    // Par défaut : si l’appelant est EMPLOYEE, on exclut ses propres demandes.
-    // Si un manager veut exclure un salarié précis, il peut passer ?exclude_user_id=123
-    const excludeUserId =
-      excludeParam != null ? excludeParam :
-      (req.user.role === 'EMPLOYEE' ? Number(req.user.sub) : undefined);
+    // Overlap: l.start_date <= end ET l.end_date >= start
+    const clauses = [
+      'l.tenant_code = $1',
+      'l.start_date <= $2',
+      'l.end_date   >= $3',
+    ];
+    const params = [code, end, start];
+    let i = 4;
 
-    let conflicts = conflictsForPeriod(t, start, end, { excludeUserId });
     if (only === 'approved') {
-      conflicts = conflicts.filter(c => c.status === 'approved');
+      clauses.push("l.status = 'APPROVED'");
+    } else {
+      clauses.push("l.status IN ('PENDING','APPROVED')");
     }
 
-    return res.json({ conflicts, count: conflicts.length });
+    if (excludeUserId != null && Number.isInteger(excludeUserId)) {
+      clauses.push(`l.employee_id <> $${i++}`);
+      params.push(excludeUserId);
+    }
+
+    const sql = `
+      SELECT l.id, l.employee_id, l.type, l.status, l.start_date, l.end_date,
+             u.first_name, u.last_name, u.email
+        FROM leaves l
+        JOIN users u ON u.id = l.employee_id
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY l.start_date
+    `;
+    const { rows } = await pool.query(sql, params);
+    return res.json({ conflicts: rows, count: rows.length });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 
-// Employé crée une demande (avec blocage conflit sauf force)
-app.post("/leaves", authRequired, async (req, res) => {
+// POST /leaves — création d’une demande (bloque si conflits sauf force=true)
+app.post('/leaves', authRequired, async (req, res) => {
   try {
-    const { start_date, end_date, type = "paid", reason, force = false } = req.body || {};
-    if (!start_date || !end_date) return res.status(400).json({ error: "start_date & end_date required" });
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date) || !/^\d{4}-\d{2}-\d{2}$/.test(end_date))
-      return res.status(400).json({ error: "bad date format" });
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
-    const reg = await loadRegistry();
-    const t = reg.tenants?.[req.user.company_code];
-    if (!t) return res.status(404).json({ error: "Tenant not found" });
-    const requesterUser = t.users?.[String(req.user.sub)];
-    if (!requesterUser) return res.status(404).json({ error: "User not found" });
-
-    // check conflits (autres salariés)
-    const conflicts = conflictsForPeriod(t, start_date, end_date, { excludeUserId: req.user.sub });
-    if (conflicts.length && !force) {
-      return res.status(409).json({ error: "conflict", conflicts });
+    const { start_date, end_date, type = 'paid', reason, force = false } = req.body || {};
+    if (!start_date || !end_date) {
+      return res.status(400).json({ error: 'start_date & end_date required' });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date) || !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
+      return res.status(400).json({ error: 'bad date format' });
+    }
+    if (start_date > end_date) {
+      return res.status(400).json({ error: 'start_date must be <= end_date' });
     }
 
-    const leave = {
-      id: crypto.randomUUID(),
-      company_code: req.user.company_code,
-      user_id: req.user.sub,
+    // Vérifier que l’employé (requester) existe bien dans ce tenant
+    const requesterId = Number(req.user.sub);
+    const ures = await pool.query(
+      'SELECT id, email, first_name, last_name FROM users WHERE tenant_code=$1 AND id=$2',
+      [code, requesterId]
+    );
+    if (!ures.rows.length) return res.status(404).json({ error: 'User not found' });
+    const requester = ures.rows[0];
+
+    // Détection conflits (autres salariés) : overlap + status pertinents
+    const cClauses = [
+      'l.tenant_code = $1',
+      'l.start_date <= $2',
+      'l.end_date   >= $3',
+      "l.status IN ('PENDING','APPROVED')",
+      'l.employee_id <> $4',
+    ];
+    const cParams = [code, end_date, start_date, requesterId];
+
+    const confSQL = `
+      SELECT l.id, l.employee_id, l.type, l.status, l.start_date, l.end_date,
+             u.first_name, u.last_name, u.email
+        FROM leaves l
+        JOIN users u ON u.id = l.employee_id
+       WHERE ${cClauses.join(' AND ')}
+       ORDER BY l.start_date
+    `;
+    const { rows: conflicts } = await pool.query(confSQL, cParams);
+
+    if (conflicts.length && !force) {
+      return res.status(409).json({ error: 'conflict', conflicts });
+    }
+
+    // Création de la demande (status = PENDING)
+    const ins = await pool.query(
+      `INSERT INTO leaves (tenant_code, employee_id, type, status, start_date, end_date, comment)
+       VALUES ($1,$2,$3,'PENDING',$4,$5,$6)
+       RETURNING id, tenant_code, employee_id, type, status, start_date, end_date, comment, created_at, updated_at`,
+      [code, requesterId, type, start_date, end_date, reason || null]
+    );
+
+    const leave = ins.rows[0];
+
+    // On enrichit la réponse d’un snapshot "requester" (non stocké)
+    const responseLeave = {
+      ...leave,
       requester: {
-        email: requesterUser.email,
-        first_name: requesterUser.first_name || "",
-        last_name: requesterUser.last_name || "",
+        email: requester.email,
+        first_name: requester.first_name || '',
+        last_name: requester.last_name || '',
       },
-      start_date,
-      end_date,
-      type,
-      reason: reason || null,
-      status: "pending",
-      decided_by: null,
-      decided_at: null,
-      created_at: new Date().toISOString(),
     };
 
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const tt = next.tenants?.[code];
-      if (!tt) throw new Error("Tenant not found");
-      tt.leaves = tt.leaves || [];
-      tt.leaves.unshift(leave);
-      tt.updated_at = new Date().toISOString();
-      next.tenants[code] = tt;
-      return true;
-    });
-
-    return res.status(201).json({ ok: true, leave, conflicts: conflicts || [] });
+    return res.status(201).json({ ok: true, leave: responseLeave, conflicts });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
@@ -866,240 +991,326 @@ app.get("/leaves", authRequired, async (req, res) => {
 /** ===== DEVICES (Expo push tokens) ===== */
 app.post('/devices/register', authRequired, async (req, res) => {
   try {
+    const code = String(req.user.company_code || '').trim();
+    const userId = Number(req.user.sub);
     const { pushToken, platform } = req.body || {};
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!userId) return res.status(400).json({ error: 'USER_MISSING' });
     if (!pushToken) return res.status(400).json({ error: 'pushToken required' });
 
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t = ensureTenantDefaults(next.tenants?.[code]);
-      t.devices = t.devices.filter(d => !(Number(d.user_id) === Number(req.user.sub) && d.token === pushToken));
-      t.devices.push({
-        user_id: req.user.sub,
-        token: pushToken,
-        platform: platform || null,
-        updated_at: new Date().toISOString(),
-      });
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      return true;
-    });
+    await pool.query(
+      `INSERT INTO devices (tenant_code, user_id, token, platform, updated_at)
+       VALUES ($1,$2,$3,$4, now())
+       ON CONFLICT (tenant_code, user_id, token)
+       DO UPDATE SET platform = EXCLUDED.platform, updated_at = now()`,
+      [code, userId, pushToken, platform || null]
+    );
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-/** ===== LEAVES PENDING (manager) ===== */
+// ————————————————————————————————
+// GET /leaves/pending
+// Liste des demandes en attente (OWNER/MANAGER uniquement)
+// ————————————————————————————————
 app.get('/leaves/pending', authRequired, async (req, res) => {
   try {
-    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
-    const reg = await loadRegistry();
-    const t = reg.tenants?.[req.user.company_code];
-    if (!t) return res.status(404).json({ error: 'Tenant not found' });
-    const pending = (t.leaves || []).filter(l => l.status === 'pending')
-      .sort((a,b) => (b.created_at || '').localeCompare(a.created_at || ''));
-    res.json({ leaves: pending });
+    const role = String(req.user.role || '').toUpperCase();
+    if (!OWNER_LIKE.has(role)) return res.status(403).json({ error: 'Forbidden' });
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
+    const { rows } = await pool.query(
+      `SELECT l.*, u.first_name, u.last_name, u.email
+         FROM leaves l
+         JOIN users u ON u.id = l.employee_id
+        WHERE l.tenant_code = $1
+          AND l.status = 'PENDING'
+        ORDER BY l.created_at DESC`,
+      [code]
+    );
+
+    return res.json({ leaves: rows });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-/** ===== CALENDAR (agenda partagé) ===== */
+// ————————————————————————————————
+// GET /calendar/events?from=YYYY-MM-DD&to=YYYY-MM-DD
+// Récupère les événements qui chevauchent l’intervalle
+// ————————————————————————————————
 app.get('/calendar/events', authRequired, async (req, res) => {
   try {
-    const from = String(req.query.from || '0000-01-01');
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
+    const from = String(req.query.from || '0001-01-01');
     const to   = String(req.query.to   || '9999-12-31');
 
-    const reg = await loadRegistry();
-    const t = reg.tenants?.[req.user.company_code];
-    if (!t) return res.status(404).json({ error: 'Tenant not found' });
-    const tt = ensureTenantDefaults(t);
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    if (!re.test(from) || !re.test(to)) {
+      return res.status(400).json({ error: 'bad date format (YYYY-MM-DD)' });
+    }
+    if (from > to) {
+      return res.status(400).json({ error: 'from must be <= to' });
+    }
 
-    const list = (tt.calendar_events || []).filter(e => !(e.end < from || e.start > to)); // chevauchement
-    res.json({ events: list });
+    // Chevauchement: start <= to AND end >= from
+    const { rows } = await pool.query(
+      `SELECT id, leave_id, title, start, "end", employee_id, created_at, updated_at
+         FROM calendar_events
+        WHERE tenant_code = $1
+          AND start <= $2::date
+          AND "end" >= $3::date
+        ORDER BY start`,
+      [code, to, from]
+    );
+
+    return res.json({ events: rows });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-/** ===== OWNER: approve/deny + edit + cancel (agenda sync + push) ===== */
+
+// ————————————————————————————————
+// PATCH /leaves/:id  (approve / deny / cancel / edit)
+// - approve => crée l’événement
+// - deny (≃ rejected) => supprime l’event s’il existe
+// - cancel => supprime l’event
+// - edit (seulement si APPROVED) => met à jour l’event
+// Noter: le statut en base est UPPERCASE ('PENDING','APPROVED','REJECTED','CANCELLED')
+// ————————————————————————————————
 app.patch('/leaves/:id', authRequired, async (req, res) => {
   try {
-    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
-    const id = String(req.params.id);
+    const role = String(req.user.role || '').toUpperCase();
+    if (!OWNER_LIKE.has(role)) return res.status(403).json({ error: 'Forbidden' });
 
-    // Compat : approve/deny via action ou status; edit via { edit:{...} }; cancel via action='cancel'
+    const code = String(req.user.company_code || '').trim();
+    const leaveId = Number(req.params.id);
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(leaveId) || leaveId <= 0) return res.status(400).json({ error: 'BAD_ID' });
+
+    // Compat inputs
     let { action, status: statusRaw, manager_note, edit } = req.body || {};
-    // Compat: accepter action='reschedule' avec start_date/end_date au niveau racine
-   if (action === 'reschedule' && !edit && (req.body.start_date || req.body.end_date || req.body.type)) {
-     edit = {
-       start_date: req.body.start_date,
-       end_date: req.body.end_date,
-       type: req.body.type,
-     };
-   }
+    if (action === 'reschedule' && !edit && (req.body.start_date || req.body.end_date || req.body.type)) {
+      edit = {
+        start_date: req.body.start_date,
+        end_date: req.body.end_date,
+        type: req.body.type,
+      };
+    }
 
-    const normalized =
-      action === 'approve' ? 'approved' :
-      action === 'deny'    ? 'denied'  :
-      action === 'cancel'  ? 'cancelled' :
-      statusRaw;
+    // Normalisation des statuts
+    const toDbStatus = (s) => {
+      if (!s) return null;
+      const v = String(s).toLowerCase();
+      if (v === 'approved') return 'APPROVED';
+      if (v === 'denied')   return 'REJECTED';
+      if (v === 'rejected') return 'REJECTED';
+      if (v === 'cancelled' || v === 'canceled') return 'CANCELLED';
+      if (v === 'pending')  return 'PENDING';
+      return null;
+    };
+    const normalized = action
+      ? toDbStatus(action)   // 'approve' -> null, donc on gère plus bas
+      : toDbStatus(statusRaw);
 
-    let updated = null;
-    let createdEvent = null;
-    let employeeUserId = null;
-
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
-
-      const idx = (t.leaves || []).findIndex(l => l.id === id);
-      if (idx === -1) throw new Error('Leave not found');
-
-      const l = { ...t.leaves[idx] };
-
-      // --- Annulation ---
-      if (action === 'cancel') {
-      if (!['approved','pending'].includes(l.status)) throw new Error('Only approved or pending leave can be cancelled');
-        l.status = 'cancelled';
-        l.manager_note = manager_note || l.manager_note || null;
-        l.decided_by = req.user.sub;
-        l.decided_at = new Date().toISOString();
-
-        // supprimer l’événement lié
-        t.calendar_events = (t.calendar_events || []).filter(ev => ev.leave_id !== id);
-
-        t.leaves[idx] = l;
-        updated = l;
-        employeeUserId = l.user_id;
-
-        t.updated_at = new Date().toISOString();
-        next.tenants[code] = t;
-        return true;
+    // Validation dates pour edit
+    if (edit && typeof edit === 'object') {
+      const { start_date, end_date } = edit;
+      const re = /^\d{4}-\d{2}-\d{2}$/;
+      if (start_date && !re.test(String(start_date))) return res.status(400).json({ error: 'bad start_date' });
+      if (end_date   && !re.test(String(end_date)))   return res.status(400).json({ error: 'bad end_date' });
+      if (start_date && end_date && String(start_date) > String(end_date)) {
+        return res.status(400).json({ error: 'start_date must be <= end_date' });
       }
+    }
 
-      // --- Edition (dates/type) ---
-      if (edit && typeof edit === 'object') {
-        if (l.status !== 'approved') throw new Error('Only approved leave can be edited');
-        const { start_date, end_date, type } = edit;
+    let updated, createdEvent = null, employeeUserId = null;
 
-        if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(start_date))) throw new Error('bad start_date');
-        if (end_date   && !/^\d{4}-\d{2}-\d{2}$/.test(String(end_date)))   throw new Error('bad end_date');
-        if (start_date && end_date && String(start_date) > String(end_date)) throw new Error('start_date must be <= end_date');
+    // Transaction: verrouiller le congé, MAJ leave + event atomiquement
+    await (async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
 
-        if (start_date) l.start_date = String(start_date);
-        if (end_date)   l.end_date   = String(end_date);
-        if (type)       l.type       = String(type);
-        l.manager_note = manager_note || l.manager_note || null;
-        l.decided_by = req.user.sub;
-        l.decided_at = new Date().toISOString();
+        // Charge + lock
+        const cur = await client.query(
+          `SELECT l.*, u.first_name, u.last_name
+             FROM leaves l
+             JOIN users u ON u.id = l.employee_id
+            WHERE l.tenant_code = $1 AND l.id = $2
+            FOR UPDATE`,
+          [code, leaveId]
+        );
+        if (!cur.rows.length) {
+          throw Object.assign(new Error('Leave not found'), { status: 404 });
+        }
+        const l = cur.rows[0];
+        const labelBase = `Congé ${(l.first_name || '')} ${(l.last_name || '')}`.trim();
 
-        // MAJ de l’événement lié
-        const label = `Congé ${ (l.requester?.first_name || '') + ' ' + (l.requester?.last_name || '') }`.trim();
-        let ev = (t.calendar_events || []).find(ev => ev.leave_id === id);
-        if (ev) {
-          ev.title = label || 'Congé';
-          ev.start = l.start_date;
-          ev.end   = l.end_date;
-          ev.updated_at = new Date().toISOString();
-        } else {
-          // Older events (sans leave_id) : on recrée proprement
-          ev = {
-            id: crypto.randomUUID(),
-            leave_id: id,
-            title: label || 'Congé',
-            start: l.start_date,
-            end:   l.end_date,
-            employee_id: l.user_id,
-            created_at: new Date().toISOString(),
-          };
-          t.calendar_events.push(ev);
+        // ——— Cancel ———
+        if (action === 'cancel') {
+          if (!['APPROVED','PENDING'].includes(l.status)) {
+            throw Object.assign(new Error('Only approved or pending leave can be cancelled'), { status: 400 });
+          }
+
+          const { rows } = await client.query(
+            `UPDATE leaves
+                SET status='CANCELLED',
+                    manager_note = COALESCE($1, manager_note),
+                    decided_by = $2,
+                    decided_at = now(),
+                    updated_at = now()
+              WHERE tenant_code=$3 AND id=$4
+              RETURNING *`,
+            [manager_note || null, Number(req.user.sub), code, leaveId]
+          );
+          updated = rows[0];
+          employeeUserId = updated.employee_id;
+
+          await client.query(`DELETE FROM calendar_events WHERE tenant_code=$1 AND leave_id=$2`, [code, leaveId]);
+
+          await client.query('COMMIT');
+          return;
         }
 
-        t.leaves[idx] = l;
-        updated = l;
-        employeeUserId = l.user_id;
+        // ——— Edit (dates/type) ———
+        if (edit && typeof edit === 'object') {
+          if (l.status !== 'APPROVED') {
+            throw Object.assign(new Error('Only approved leave can be edited'), { status: 400 });
+          }
+          const newStart = edit.start_date ? String(edit.start_date) : l.start_date;
+          const newEnd   = edit.end_date   ? String(edit.end_date)   : l.end_date;
+          const newType  = edit.type       ? String(edit.type)       : l.type;
 
-        t.updated_at = new Date().toISOString();
-        next.tenants[code] = t;
-        return true;
+          const { rows } = await client.query(
+            `UPDATE leaves
+                SET start_date=$1, "end_date"=$2, type=$3,
+                    manager_note = COALESCE($4, manager_note),
+                    decided_by = $5, decided_at = now(),
+                    updated_at = now()
+              WHERE tenant_code=$6 AND id=$7
+              RETURNING *`,
+            [newStart, newEnd, newType, manager_note || null, Number(req.user.sub), code, leaveId]
+          );
+          updated = rows[0];
+          employeeUserId = updated.employee_id;
+
+          // upsert event
+          const title = labelBase || 'Congé';
+          const up = await client.query(
+            `UPDATE calendar_events
+                SET title=$1, start=$2, "end"=$3, updated_at=now()
+              WHERE tenant_code=$4 AND leave_id=$5
+              RETURNING *`,
+            [title, updated.start_date, updated.end_date, code, leaveId]
+          );
+          if (!up.rows.length) {
+            const ins = await client.query(
+              `INSERT INTO calendar_events (id, tenant_code, leave_id, title, start, "end", employee_id)
+               VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6)
+               RETURNING *`,
+              [code, leaveId, title, updated.start_date, updated.end_date, updated.employee_id]
+            );
+            createdEvent = ins.rows[0];
+          }
+
+          await client.query('COMMIT');
+          return;
+        }
+
+        // ——— Approve / Deny ———
+        // Si action explicite sans statusRaw
+        let nextStatus = normalized;
+        if (!nextStatus && action) {
+          if (action === 'approve') nextStatus = 'APPROVED';
+          else if (action === 'deny') nextStatus = 'REJECTED';
+        }
+        if (!['APPROVED','REJECTED'].includes(nextStatus || '')) {
+          throw Object.assign(new Error('invalid action/status'), { status: 400 });
+        }
+
+        const { rows } = await client.query(
+          `UPDATE leaves
+              SET status=$1,
+                  manager_note = COALESCE($2, manager_note),
+                  decided_by = $3, decided_at = now(),
+                  updated_at = now()
+            WHERE tenant_code=$4 AND id=$5
+            RETURNING *`,
+          [nextStatus, manager_note || null, Number(req.user.sub), code, leaveId]
+        );
+        updated = rows[0];
+        employeeUserId = updated.employee_id;
+
+        if (nextStatus === 'APPROVED') {
+          const title = labelBase || 'Congé';
+          const ins = await client.query(
+            `INSERT INTO calendar_events (id, tenant_code, leave_id, title, start, "end", employee_id)
+             VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6)
+             ON CONFLICT (tenant_code, leave_id)
+             DO UPDATE SET title=EXCLUDED.title, start=EXCLUDED.start, "end"=EXCLUDED."end", updated_at=now()
+             RETURNING *`,
+            [code, leaveId, title, updated.start_date, updated.end_date, updated.employee_id]
+          );
+          createdEvent = ins.rows[0];
+        } else {
+          // REJECTED => retirer un éventuel event hérité
+          await client.query(`DELETE FROM calendar_events WHERE tenant_code=$1 AND leave_id=$2`, [code, leaveId]);
+        }
+
+        await client.query('COMMIT');
+      } catch (err) {
+        try { await client.query('ROLLBACK'); } catch {}
+        throw err;
+      } finally {
+        client.release();
       }
+    })();
 
-      // --- Approve / Deny ---
-      if (!['approved', 'denied'].includes(normalized)) {
-        throw new Error('invalid action/status');
-      }
-
-      l.status = normalized;
-      l.manager_note = manager_note || l.manager_note || null;
-      l.decided_by = req.user.sub;
-      l.decided_at = new Date().toISOString();
-      employeeUserId = l.user_id;
-
-      t.leaves[idx] = l;
-      updated = l;
-
-      // create event on approve
-      if (normalized === 'approved') {
-        const label = `Congé ${ (l.requester?.first_name || '') + ' ' + (l.requester?.last_name || '') }`.trim();
-        const ev = {
-          id: crypto.randomUUID(),
-          leave_id: id, // 👈 lien vers le congé
-          title: label || 'Congé',
-          start: l.start_date, // YYYY-MM-DD
-          end:   l.end_date,
-          employee_id: l.user_id,
-          created_at: new Date().toISOString(),
-        };
-        t.calendar_events.push(ev);
-        createdEvent = ev;
-      }
-
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      return true;
-    });
-
-    // --- Push notif employé ---
+    // ——— Push notifications (facultatif si tu as déjà sendExpoPush) ———
     try {
-      const reg = await loadRegistry();
-      const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
-      const tokens = (t.devices || [])
-        .filter(d => Number(d.user_id) === Number(employeeUserId))
-        .map(d => d.token);
-
-      if (tokens.length) {
-        if (action === 'cancel') {
-          await sendExpoPush(tokens, {
-            title: 'Congé annulé ❌',
-            body: `Période supprimée : ${updated.start_date} → ${updated.end_date}`,
-            data: { type: 'leave', status: 'cancelled', leaveId: updated.id },
-          });
-        } else if (edit) {
-          await sendExpoPush(tokens, {
-            title: 'Congé modifié ✏️',
-            body: `Nouvelles dates : ${updated.start_date} → ${updated.end_date}`,
-            data: { type: 'leave', status: 'approved', leaveId: updated.id },
-          });
-        } else if (updated?.status === 'approved') {
-          await sendExpoPush(tokens, {
-            title: 'Congé approuvé ✅',
-            body: `Du ${updated.start_date} au ${updated.end_date}`,
-            data: { type: 'leave', status: 'approved', leaveId: updated.id },
-          });
-        } else if (updated?.status === 'denied') {
-          await sendExpoPush(tokens, {
-            title: 'Congé refusé ❌',
-            body: manager_note ? `Note: ${manager_note}` : 'Votre demande a été refusée',
-            data: { type: 'leave', status: 'denied', leaveId: updated.id },
-          });
+      if (employeeUserId) {
+        const { rows: tok } = await pool.query(
+          `SELECT token FROM devices WHERE tenant_code=$1 AND user_id=$2`,
+          [code, employeeUserId]
+        );
+        const tokens = tok.map(t => t.token);
+        if (tokens.length) {
+          if (action === 'cancel') {
+            await sendExpoPush(tokens, {
+              title: 'Congé annulé ❌',
+              body: `Période supprimée : ${updated.start_date} → ${updated.end_date}`,
+              data: { type: 'leave', status: 'CANCELLED', leaveId: updated.id },
+            });
+          } else if (edit) {
+            await sendExpoPush(tokens, {
+              title: 'Congé modifié ✏️',
+              body: `Nouvelles dates : ${updated.start_date} → ${updated.end_date}`,
+              data: { type: 'leave', status: updated.status, leaveId: updated.id },
+            });
+          } else if (updated?.status === 'APPROVED') {
+            await sendExpoPush(tokens, {
+              title: 'Congé approuvé ✅',
+              body: `Du ${updated.start_date} au ${updated.end_date}`,
+              data: { type: 'leave', status: 'APPROVED', leaveId: updated.id },
+            });
+          } else if (updated?.status === 'REJECTED') {
+            await sendExpoPush(tokens, {
+              title: 'Congé refusé ❌',
+              body: manager_note ? `Note: ${manager_note}` : 'Votre demande a été refusée',
+              data: { type: 'leave', status: 'REJECTED', leaveId: updated.id },
+            });
+          }
         }
       }
     } catch (e) {
@@ -1108,12 +1319,12 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
 
     return res.json({ ok: true, leave: updated, event: createdEvent || null });
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
     if (msg.includes('Leave not found')) return res.status(404).json({ error: msg });
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
     if (msg.includes('invalid action/status')) return res.status(400).json({ error: msg });
     if (msg.includes('Only approved leave')) return res.status(400).json({ error: msg });
-    if (msg.includes('bad start_date') || msg.includes('bad end_date') || msg.includes('start_date must')) {
+    if (msg.includes('start_date must') || msg.includes('bad start_date') || msg.includes('bad end_date')) {
       return res.status(400).json({ error: msg });
     }
     return res.status(500).json({ error: msg });
@@ -1125,8 +1336,11 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
 app.post('/leaves/admin', authRequired, async (req, res) => {
   try {
     if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
     const {
       user_id,
@@ -1134,207 +1348,274 @@ app.post('/leaves/admin', authRequired, async (req, res) => {
       end_date,
       type = 'paid',
       reason = null,
-      status = 'approved',
+      status = 'approved', // 'approved' ou 'pending'
       force = false,
     } = req.body || {};
 
-    if (!user_id || !start_date || !end_date)
+    const employeeId = Number(user_id);
+    if (!employeeId || !start_date || !end_date)
       return res.status(400).json({ error: 'fields required' });
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date) || !/^\d{4}-\d{2}-\d{2}$/.test(end_date))
+
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    if (!re.test(start_date) || !re.test(end_date))
       return res.status(400).json({ error: 'bad date format' });
     if (String(start_date) > String(end_date))
       return res.status(400).json({ error: 'start <= end' });
 
-    const reg = await loadRegistry();
-    const t0 = reg.tenants?.[req.user.company_code];
-    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
-    const t = ensureTenantDefaults(t0);
+    // Vérifier que l'employé existe dans ce tenant
+    const ures = await pool.query(
+      'SELECT id, email, first_name, last_name FROM users WHERE tenant_code=$1 AND id=$2',
+      [code, employeeId]
+    );
+    if (!ures.rows.length) return res.status(404).json({ error: 'User not found' });
+    const target = ures.rows[0];
 
-    const target = t.users?.[String(user_id)];
-    if (!target) return res.status(404).json({ error: 'User not found' });
-
-    // Conflits avec TOUT le monde (on n'exclut personne ici)
-    const confl = conflictsForPeriod(t, start_date, end_date, { excludeUserId: undefined });
-    if (confl.length && !force) {
-      return res.status(409).json({ error: 'conflict', conflicts: confl });
+    // Conflits avec TOUT le monde (on n'exclut personne)
+    const { rows: conflicts } = await pool.query(
+      `SELECT l.id, l.employee_id, l.type, l.status, l.start_date, l.end_date,
+              u.first_name, u.last_name, u.email
+         FROM leaves l
+         JOIN users u ON u.id = l.employee_id
+        WHERE l.tenant_code = $1
+          AND l.start_date <= $2::date
+          AND l.end_date   >= $3::date
+          AND l.status IN ('PENDING','APPROVED')
+        ORDER BY l.start_date`,
+      [code, end_date, start_date]
+    );
+    if (conflicts.length && !force) {
+      return res.status(409).json({ error: 'conflict', conflicts });
     }
 
-    const now = new Date().toISOString();
-    const leave = {
-      id: crypto.randomUUID(),
-      company_code: req.user.company_code,
-      user_id: Number(user_id),
-      requester: {
-        email: target.email,
-        first_name: target.first_name || '',
-        last_name: target.last_name || '',
-      },
-      start_date,
-      end_date,
-      type,
-      reason,
-      status: status === 'approved' ? 'approved' : 'pending',
-      decided_by: status === 'approved' ? req.user.sub : null,
-      decided_at: status === 'approved' ? now : null,
-      created_at: now,
-      created_by_owner: true,
-    };
+    const normalizedStatus = String(status).toLowerCase() === 'approved' ? 'APPROVED' : 'PENDING';
+    const decidedBy = normalizedStatus === 'APPROVED' ? Number(req.user.sub) : null;
 
-    let createdEvent = null;
+    let createdLeave, createdEvent = null;
 
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const tt0 = next.tenants?.[code];
-      if (!tt0) throw new Error('Tenant not found');
-      const tt = ensureTenantDefaults(tt0);
+    // Transaction : insert leave (+ event si APPROVED)
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-      tt.leaves = tt.leaves || [];
-      tt.leaves.unshift(leave);
+      const ins = await client.query(
+        `INSERT INTO leaves
+           (tenant_code, employee_id, type, status, start_date, end_date, comment, manager_note, decided_by, decided_at, created_at, updated_at)
+         VALUES
+           ($1,$2,$3,$4,$5,$6,$7,NULL,$8, CASE WHEN $4='APPROVED' THEN now() ELSE NULL END, now(), now())
+         RETURNING id, tenant_code, employee_id, type, status, start_date, end_date, comment, manager_note, decided_by, decided_at, created_at, updated_at`,
+        [code, employeeId, type, normalizedStatus, start_date, end_date, reason, decidedBy]
+      );
+      createdLeave = ins.rows[0];
 
-      if (leave.status === 'approved') {
-        const label = `Congé ${(leave.requester.first_name + ' ' + leave.requester.last_name).trim()}` || 'Congé';
-        const ev = {
-          id: crypto.randomUUID(),
-          leave_id: leave.id,
-          title: label,
-          start: leave.start_date,
-          end: leave.end_date,
-          employee_id: leave.user_id,
-          created_at: now,
-        };
-        tt.calendar_events.push(ev);
-        createdEvent = ev;
+      if (normalizedStatus === 'APPROVED') {
+        const title = `Congé ${(target.first_name || '')} ${(target.last_name || '')}`.trim() || 'Congé';
+        const ev = await client.query(
+          `INSERT INTO calendar_events (tenant_code, leave_id, title, start, "end", employee_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id, tenant_code, leave_id, title, start, "end", employee_id, created_at, updated_at`,
+          [code, createdLeave.id, title, start_date, end_date, employeeId]
+        );
+        createdEvent = ev.rows[0];
       }
 
-      tt.updated_at = now;
-      next.tenants[code] = tt;
-      return true;
-    });
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      client.release();
+    }
 
-    // Push à l'employé
+    // Push à l'employé (facultatif si ta fonction existe)
     try {
-      const reg2 = await loadRegistry();
-      const t2 = ensureTenantDefaults(reg2.tenants?.[req.user.company_code] || {});
-      const tokens = (t2.devices || []).filter(d => Number(d.user_id) === Number(user_id)).map(d => d.token);
+      const { rows: tok } = await pool.query(
+        `SELECT token FROM devices WHERE tenant_code=$1 AND user_id=$2`,
+        [code, employeeId]
+      );
+      const tokens = tok.map(t => t.token);
       if (tokens.length) {
+        const approved = createdLeave.status === 'APPROVED';
         await sendExpoPush(tokens, {
-          title: leave.status === 'approved' ? 'Congé ajouté ✅' : 'Demande ajoutée 🕒',
-          body: `Du ${leave.start_date} au ${leave.end_date}`,
-          data: { type: 'leave', status: leave.status, leaveId: leave.id },
+          title: approved ? 'Congé ajouté ✅' : 'Demande ajoutée 🕒',
+          body: `Du ${createdLeave.start_date} au ${createdLeave.end_date}`,
+          data: { type: 'leave', status: createdLeave.status, leaveId: createdLeave.id },
         });
       }
     } catch (e) {
       console.warn('[push] skipped:', e?.message || e);
     }
 
-    return res.status(201).json({ ok: true, leave, event: createdEvent });
+    // Réponse (avec snapshot requester pour compat)
+    const leaveResponse = {
+      ...createdLeave,
+      requester: {
+        email: target.email,
+        first_name: target.first_name || '',
+        last_name: target.last_name || '',
+      },
+      created_by_owner: true,
+    };
+
+    return res.status(201).json({ ok: true, leave: leaveResponse, event: createdEvent });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 
-
 // Modifier un événement d'agenda (OWNER)
+// PATCH /calendar/events/:id — update event (+ keep linked leave in sync)
 app.patch('/calendar/events/:id', authRequired, async (req, res) => {
   try {
     if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const code = String(req.user.company_code || '').trim();
+    const eventId = String(req.params.id || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!eventId) return res.status(400).json({ error: 'BAD_EVENT_ID' });
 
     const { start, end, title } = req.body || {};
-    if (start && !/^\d{4}-\d{2}-\d{2}$/.test(start)) return res.status(400).json({ error: 'bad start' });
-    if (end   && !/^\d{4}-\d{2}-\d{2}$/.test(end))   return res.status(400).json({ error: 'bad end' });
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    if (start && !re.test(start)) return res.status(400).json({ error: 'bad start' });
+    if (end   && !re.test(end))   return res.status(400).json({ error: 'bad end' });
+    if (start && end && String(start) > String(end)) {
+      return res.status(400).json({ error: 'start must be <= end' });
+    }
 
-    let updated = null;
+    let updatedEvent = null;
+    let updatedLeave = null;
 
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-      const idx = (t.calendar_events || []).findIndex(e => e.id === req.params.id);
-      if (idx === -1) throw new Error('Event not found');
+      // Lock l'event
+      const cur = await client.query(
+        `SELECT id, tenant_code, leave_id, title, start, "end", employee_id
+           FROM calendar_events
+          WHERE tenant_code=$1 AND id=$2
+          FOR UPDATE`,
+        [code, eventId]
+      );
+      if (!cur.rows.length) {
+        throw Object.assign(new Error('Event not found'), { status: 404 });
+      }
+      const ev = cur.rows[0];
 
-      const ev = { ...t.calendar_events[idx] };
-      if (start) ev.start = start;
-      if (end)   ev.end   = end;
-      if (title !== undefined) ev.title = title;
+      const newStart = start ?? ev.start;
+      const newEnd   = end   ?? ev["end"];
+      const newTitle = (title !== undefined) ? title : ev.title;
 
-      t.calendar_events[idx] = ev;
+      // Update event
+      const up = await client.query(
+        `UPDATE calendar_events
+            SET title=$1, start=$2, "end"=$3, updated_at=now()
+          WHERE tenant_code=$4 AND id=$5
+          RETURNING id, tenant_code, leave_id, title, start, "end", employee_id, created_at, updated_at`,
+        [newTitle, newStart, newEnd, code, eventId]
+      );
+      updatedEvent = up.rows[0];
 
-      // (optionnel) garder le leave en phase si l'event est lié à un congé
+      // Si lié à un congé, on garde les dates en phase
       if (ev.leave_id) {
-        const lidx = (t.leaves || []).findIndex(l => l.id === ev.leave_id);
-        if (lidx !== -1) {
-          const l = { ...t.leaves[lidx] };
-          if (start) l.start_date = start;
-          if (end)   l.end_date   = end;
-          t.leaves[lidx] = l;
-        }
+        const upLeave = await client.query(
+          `UPDATE leaves
+              SET start_date=$1, end_date=$2, updated_at=now()
+            WHERE tenant_code=$3 AND id=$4
+            RETURNING id, tenant_code, employee_id, type, status, start_date, end_date, updated_at`,
+          [newStart, newEnd, code, ev.leave_id]
+        );
+        if (upLeave.rows.length) updatedLeave = upLeave.rows[0];
       }
 
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      updated = ev;
-      return true;
-    });
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      if (e.status === 404) return res.status(404).json({ error: 'Event not found' });
+      throw e;
+    } finally {
+      client.release();
+    }
 
-    return res.json({ ok: true, event: updated });
+    return res.json({ ok: true, event: updatedEvent, leave: updatedLeave });
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
-    if (msg.includes('Event not found'))  return res.status(404).json({ error: msg });
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    if (/bad start|bad end|start must be/.test(msg)) return res.status(400).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
 
-// Supprimer un événement (OWNER) + annuler le congé lié si présent
+
+// DELETE /calendar/events/:id — delete event (+ cancel linked leave if any)
 app.delete('/calendar/events/:id', authRequired, async (req, res) => {
   try {
     if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
+      return res.status(403).json({ error: 'Forbidden' });
+    }
 
-    let removed = null;
+    const code = String(req.user.company_code || '').trim();
+    const eventId = String(req.params.id || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!eventId) return res.status(400).json({ error: 'BAD_EVENT_ID' });
 
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
+    let removedEvent = null;
+    let cancelledLeave = null;
 
-      const idx = (t.calendar_events || []).findIndex(e => e.id === req.params.id);
-      if (idx === -1) throw new Error('Event not found');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-      const ev = t.calendar_events[idx];
-      // retire l'event
-      t.calendar_events.splice(idx, 1);
-      removed = ev;
+      // Lock + read event
+      const cur = await client.query(
+        `SELECT id, tenant_code, leave_id, title, start, "end", employee_id
+           FROM calendar_events
+          WHERE tenant_code=$1 AND id=$2
+          FOR UPDATE`,
+        [code, eventId]
+      );
+      if (!cur.rows.length) {
+        throw Object.assign(new Error('Event not found'), { status: 404 });
+      }
+      removedEvent = cur.rows[0];
 
-      // si lié à un congé → on l'annule
-      if (ev.leave_id) {
-        const lidx = (t.leaves || []).findIndex(l => l.id === ev.leave_id);
-        if (lidx !== -1) {
-          const l = { ...t.leaves[lidx] };
-          l.status = 'cancelled';
-          l.decided_by = req.user.sub;
-          l.decided_at = new Date().toISOString();
-          t.leaves[lidx] = l;
-        }
+      // Delete event
+      await client.query(
+        `DELETE FROM calendar_events WHERE tenant_code=$1 AND id=$2`,
+        [code, eventId]
+      );
+
+      // Si lié à un congé -> annule le congé
+      if (removedEvent.leave_id) {
+        const up = await client.query(
+          `UPDATE leaves
+              SET status='CANCELLED',
+                  decided_by=$1,
+                  decided_at=now(),
+                  updated_at=now()
+            WHERE tenant_code=$2 AND id=$3
+            RETURNING id, tenant_code, employee_id, type, status, start_date, end_date, decided_by, decided_at, updated_at`,
+          [Number(req.user.sub), code, removedEvent.leave_id]
+        );
+        if (up.rows.length) cancelledLeave = up.rows[0];
       }
 
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      return true;
-    });
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      if (e.status === 404) return res.status(404).json({ error: 'Event not found' });
+      throw e;
+    } finally {
+      client.release();
+    }
 
-    return res.json({ ok: true, removed });
+    return res.json({ ok: true, removed: removedEvent, leave_cancelled: cancelledLeave });
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
-    if (msg.includes('Event not found'))  return res.status(404).json({ error: msg });
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
@@ -1344,276 +1625,284 @@ app.delete('/calendar/events/:id', authRequired, async (req, res) => {
 // Lister (OWNER & EMPLOYEE)
 app.get('/announcements', authRequired, async (req, res) => {
   try {
-    const reg = await loadRegistry();
-    const t0 = reg.tenants?.[req.user.company_code];
-    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
-    const t = ensureTenantDefaults(t0);
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
-    const list = [...(t.announcements || [])].sort(
-      (a,b) => (b.created_at || '').localeCompare(a.created_at || '')
+    const { rows } = await pool.query(
+      `SELECT id, type, title, body, url, created_by, created_at, updated_at
+         FROM announcements
+        WHERE tenant_code = $1
+        ORDER BY created_at DESC`,
+      [code]
     );
-    res.json({ announcements: list });
+    res.json({ announcements: rows });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// Créer (OWNER)
+// POST /announcements — créer (OWNER/MANAGER)
 app.post('/announcements', authRequired, async (req, res) => {
   try {
     if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
     const { type, title, body, url } = req.body || {};
     if (!['message','pdf'].includes(type)) return res.status(400).json({ error: 'type must be message|pdf' });
-    if (!title || typeof title !== 'string' || !title.trim()) return res.status(400).json({ error: 'title required' });
-    if (type === 'message' && (!body || !String(body).trim())) return res.status(400).json({ error: 'body required for message' });
-    if (type === 'pdf' && (!url || !/^https?:\/\//i.test(url))) return res.status(400).json({ error: 'valid url required for pdf' });
+    if (!title || !String(title).trim()) return res.status(400).json({ error: 'title required' });
+    if (type === 'message' && (!body || !String(body).trim())) {
+      return res.status(400).json({ error: 'body required for message' });
+    }
+    if (type === 'pdf' && (!url || !isHttpUrl(url))) {
+      return res.status(400).json({ error: 'valid url required for pdf' });
+    }
 
-    let created = null;
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
+    const { rows } = await pool.query(
+      `INSERT INTO announcements (id, tenant_code, type, title, body, url, created_by)
+       VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6)
+       RETURNING id, type, title, body, url, created_by, created_at, updated_at`,
+      [code, type, String(title).trim(), type==='message' ? String(body).trim() : null, type==='pdf' ? String(url).trim() : null, Number(req.user.sub) || null]
+    );
+    const created = rows[0];
 
-      const now = new Date().toISOString();
-      const ann = {
-        id: crypto.randomUUID(),
-        type,
-        title: String(title).trim(),
-        body: type === 'message' ? String(body).trim() : null,
-        url : type === 'pdf' ? String(url).trim() : null,
-        created_at: now,
-        created_by: req.user.sub,
-      };
-      t.announcements.push(ann);
-      t.updated_at = now;
-      next.tenants[code] = t;
-      created = ann;
-      return true;
-    });
-
-    // push à tous les devices de la société
+    // Push à tous les devices du tenant (optionnel)
     try {
-      const reg = await loadRegistry();
-      const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
-      const tokens = (t.devices || []).map(d => d.token);
+      const tok = await pool.query(
+        `SELECT token FROM devices WHERE tenant_code=$1`,
+        [code]
+      );
+      const tokens = tok.rows.map(r => r.token);
       if (tokens.length) {
         await sendExpoPush(tokens, {
           title: 'Nouvelle annonce 📢',
           body: String(title).slice(0, 120),
-          data: { type: 'announcement' },
+          data: { type: 'announcement', announcementId: created.id },
+        });
+      }
+    } catch (e) {
+      console.warn('[push] announcement skipped:', e?.message || e);
+    }
+
+    res.status(201).json({ ok: true, announcement: created });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// PATCH /announcements/:id — éditer (OWNER/MANAGER)
+app.patch('/announcements/:id', authRequired, async (req, res) => {
+  try {
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    const id   = String(req.params.id || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!id)   return res.status(400).json({ error: 'BAD_ID' });
+
+    const { title, body, url } = req.body || {};
+
+    // on récupère d’abord l’annonce pour savoir son type
+    const cur = await pool.query(
+      `SELECT id, type FROM announcements WHERE tenant_code=$1 AND id=$2`,
+      [code, id]
+    );
+    if (!cur.rows.length) return res.status(404).json({ error: 'Announcement not found' });
+    const a = cur.rows[0];
+
+    const sets = [];
+    const params = [];
+    let i = 1;
+
+    if (title !== undefined) { sets.push(`title = $${i++}`); params.push(String(title).trim()); }
+    if (a.type === 'message' && body !== undefined) {
+      const val = String(body).trim();
+      if (!val) return res.status(400).json({ error: 'body required for message' });
+      sets.push(`body = $${i++}`); params.push(val);
+    }
+    if (a.type === 'pdf' && url !== undefined) {
+      if (!isHttpUrl(url)) return res.status(400).json({ error: 'valid url required for pdf' });
+      sets.push(`url = $${i++}`); params.push(String(url).trim());
+    }
+
+    if (!sets.length) return res.status(400).json({ error: 'NOTHING_TO_UPDATE' });
+    sets.push(`updated_at = now()`);
+
+    const sql = `
+      UPDATE announcements
+         SET ${sets.join(', ')}
+       WHERE tenant_code = $${i++} AND id = $${i++}
+       RETURNING id, type, title, body, url, created_by, created_at, updated_at
+    `;
+    params.push(code, id);
+
+    const up = await pool.query(sql, params);
+    if (!up.rows.length) return res.status(404).json({ error: 'Announcement not found' });
+
+    res.json({ ok: true, announcement: up.rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// ========== UPLOAD ==========
+app.post('/announcements/upload', authRequired, upload.single('pdf'), async (req, res) => {
+  try {
+    // OWNER only (si tu veux MANAGER aussi, remplace par OWNER_LIKE)
+    if (String(req.user.role || '').toUpperCase() !== 'OWNER') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
+    if (!req.file) return res.status(400).json({ error: 'PDF manquant' });
+    if (!isPdf(req.file.mimetype)) return res.status(400).json({ error: 'Seuls les PDF sont acceptés' });
+
+    const folderId = process.env.GDRIVE_FOLDER_ID;
+    if (!folderId) return res.status(500).json({ error: 'Drive not configured (GDRIVE_FOLDER_ID)' });
+
+    const { drive } = await ensureDrive();
+    const title = String(req.body?.title || 'Document');
+    const published_at = req.body?.published_at ? new Date(String(req.body.published_at)) : new Date();
+
+    // 1) Upload vers Drive
+    const createRes = await drive.files.create({
+      supportsAllDrives: true,
+      requestBody: {
+        name: req.file.originalname || `doc_${Date.now()}.pdf`,
+        parents: [folderId],
+        mimeType: 'application/pdf',
+      },
+      media: {
+        mimeType: 'application/pdf',
+        body: bufferToStream(req.file.buffer),
+      },
+      fields: 'id,name,size,mimeType',
+    });
+
+    const fileId = createRes.data.id;
+    const fileName = createRes.data.name || 'document.pdf';
+    const fileSize = createRes.data.size ? Number(createRes.data.size) : req.file.size || null;
+    const fileMime = createRes.data.mimeType || 'application/pdf';
+
+    // 2) Rendre lisible (optionnel)
+    try {
+      if ((process.env.GDRIVE_PUBLIC || 'true') === 'true') {
+        await drive.permissions.create({
+          fileId,
+          supportsAllDrives: true,
+          requestBody: { role: 'reader', type: 'anyone' },
+        });
+      }
+    } catch (e) {
+      console.warn('[Drive perms] lien public non appliqué:', e?.message || e);
+    }
+
+    const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
+    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+
+    // 3) Enregistrer l’annonce en base (type = pdf)
+    const { rows } = await pool.query(
+      `INSERT INTO announcements
+         (id, tenant_code, type, title, body, url, created_by,
+          published_at, drive_file_id, file_name, file_size, file_mime, web_view_link, download_url)
+       VALUES
+         (gen_random_uuid()::text, $1, 'pdf', $2, NULL, $3, $4,
+          $5, $6, $7, $8, $9, $10, $11)
+       RETURNING id, tenant_code, type, title, body, url, created_by,
+                 published_at, drive_file_id, file_name, file_size, file_mime, web_view_link, download_url,
+                 created_at, updated_at`,
+      [
+        code,
+        title.trim(),
+        webViewLink,                            // url (satisfait la contrainte existante)
+        Number(req.user.sub) || null,
+        published_at.toISOString(),
+        fileId, fileName, fileSize, fileMime, webViewLink, downloadUrl,
+      ]
+    );
+    const created = rows[0];
+
+    // 4) Push à tous les devices du tenant (optionnel)
+    try {
+      const tok = await pool.query(
+        `SELECT token FROM devices WHERE tenant_code=$1`,
+        [code]
+      );
+      const tokens = tok.rows.map(r => r.token);
+      if (tokens.length) {
+        await sendExpoPush(tokens, {
+          title: 'Nouvelle annonce 📢',
+          body: String(title).slice(0, 120),
+          data: { type: 'announcement', announcementId: created.id },
         });
       }
     } catch (e) {
       console.warn('[push] announcement skipped', e?.message || e);
     }
 
-    res.status(201).json({ ok: true, announcement: created });
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
-
-
-// Éditer (OWNER) – optionnel
-app.patch('/announcements/:id', authRequired, async (req, res) => {
-  try {
-    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
-    const id = String(req.params.id);
-    const { title, body, url } = req.body || {};
-    let updated = null;
-
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
-
-      const idx = t.announcements.findIndex(a => a.id === id);
-      if (idx === -1) throw new Error('Announcement not found');
-
-      const a = { ...t.announcements[idx] };
-      if (title !== undefined) a.title = String(title).trim();
-      if (a.type === 'message' && body !== undefined) a.body = String(body).trim();
-      if (a.type === 'pdf' && url  !== undefined) a.url  = String(url).trim();
-
-      t.announcements[idx] = a;
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      updated = a;
-      return true;
-    });
-
-    res.json({ ok: true, announcement: updated });
-  } catch (e) {
-    const msg = String(e.message || e);
-    if (msg.includes('Announcement not found')) return res.status(404).json({ error: msg });
-    res.status(500).json({ error: msg });
-  }
-});
-
-// ========== UPLOAD ==========
-app.post("/announcements/upload", authRequired, upload.single("pdf"), async (req, res) => {
-  try {
-    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
-    if (!req.file) return res.status(400).json({ error: "PDF manquant" });
-    if (req.file.mimetype !== "application/pdf") return res.status(400).json({ error: "Seuls les PDF sont acceptés" });
-
-    const folderId = process.env.GDRIVE_FOLDER_ID;
-    if (!folderId) return res.status(500).json({ error: "Drive not configured (GDRIVE_FOLDER_ID)" });
-
-    // Client Drive basé sur le JWT du service account
-    const { drive } = await ensureDrive();
-    const title = String(req.body?.title || "Document");
-    const published_at = String(req.body?.published_at || new Date().toISOString());
-
-    // 1) Upload (Shared Drives OK)
-    const createRes = await drive.files.create({
-      // auth: driveAuth, // optionnel car le client 'drive' est déjà créé avec ce JWT
-      supportsAllDrives: true,
-      requestBody: {
-        name: req.file.originalname || `doc_${Date.now()}.pdf`,
-        parents: [folderId],
-        mimeType: "application/pdf",
-      },
-      media: {
-        mimeType: "application/pdf",
-        body: bufferToStream(req.file.buffer),
-      },
-      fields: "id,name",
-    });
-
-    const fileId = createRes.data.id;
-    const fileName = createRes.data.name || "document.pdf";
-
-    // 2) Lien public (optionnel)
-    try {
-      if ((process.env.GDRIVE_PUBLIC || "true") === "true") {
-        await drive.permissions.create({
-          // auth: driveAuth, // idem, facultatif
-          fileId,
-          supportsAllDrives: true,
-          requestBody: { role: "reader", type: "anyone" },
-        });
-      }
-    } catch (e) {
-      console.warn("[Drive perms] lien public non appliqué:", e?.message || e);
-    }
-
-    const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
-    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-
-    // 3) Enregistrer l’annonce
-    let saved = null;
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error("Tenant not found");
-      const t = ensureTenantDefaults(t0);
-
-      const now = new Date().toISOString();
-      const ann = {
-        id: crypto.randomUUID(),
-        type: "pdf",
-        title: title.trim(),
-        url: webViewLink,
+    // Réponse : garde la forme avec un bloc "file" (compat front)
+    res.status(201).json({
+      ok: true,
+      announcement: {
+        ...created,
         file: {
-          driveFileId: fileId,
-          name: fileName,
-          size: req.file.size ?? null,
-          mime: "application/pdf",
-          webViewLink,
-          downloadUrl,
+          driveFileId: created.drive_file_id,
+          name: created.file_name,
+          size: created.file_size,
+          mime: created.file_mime,
+          webViewLink: created.web_view_link,
+          downloadUrl: created.download_url,
         },
-        published_at,
-        created_at: now,
-        created_by: req.user.sub,
-      };
-
-      t.announcements.unshift(ann);
-      t.updated_at = now;
-      next.tenants[code] = t;
-      saved = ann;
-      return true;
+      },
     });
-
-    // 4) Push (optionnel)
-    try {
-      const reg = await loadRegistry();
-      const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
-      const tokens = (t.devices || []).map(d => d.token);
-      if (tokens.length) {
-        await sendExpoPush(tokens, {
-          title: "Nouvelle annonce 📢",
-          body: title.slice(0, 120),
-          data: { type: "announcement" },
-        });
-      }
-    } catch (e) {
-      console.warn("[push] announcement skipped", e?.message || e);
-    }
-
-    return res.status(201).json({ ok: true, announcement: saved });
   } catch (e) {
-    console.error("[announcements/upload] drive error:", e?.response?.status, e?.response?.data || e);
-    return res.status(500).json({ error: "Upload Google Drive impossible" });
+    console.error('[announcements/upload] drive error:', e?.response?.status, e?.response?.data || e);
+    return res.status(500).json({ error: 'Upload Google Drive impossible' });
   }
 });
 
-// ========== DELETE ==========
+// =====================
+// DELETE /announcements/:id (OWNER/MANAGER possible)
+// =====================
 app.delete('/announcements/:id', authRequired, async (req, res) => {
   try {
     if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
-    const id = String(req.params.id);
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    const id   = String(req.params.id || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!id)   return res.status(400).json({ error: 'BAD_ID' });
 
-    let removed = null;
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
+    // 1) Récupère l’annonce
+    const cur = await pool.query(
+      `SELECT id, type, title, url, drive_file_id, file_name, web_view_link
+         FROM announcements
+        WHERE tenant_code=$1 AND id=$2`,
+      [code, id]
+    );
+    if (!cur.rows.length) return res.status(404).json({ error: 'Announcement not found' });
+    const ann = cur.rows[0];
 
-      const idx = (t.announcements || []).findIndex(a => a.id === id);
-      if (idx === -1) throw new Error('Announcement not found');
-
-      removed = t.announcements[idx];
-      t.announcements.splice(idx, 1);
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      return true;
-    });
-
-    // --- Effacement sur Drive si c'est un PDF Drive
-    try {
-      if (removed?.type === 'pdf') {
+    // 2) Essaye de supprimer côté Drive si PDF
+    if (ann.type === 'pdf') {
+      try {
         const { drive } = await ensureDrive();
-
-        // 1) Construire toutes les pistes d’ID possibles
         const ids = new Set();
-
         const add = (v) => { if (v && typeof v === 'string') ids.add(v); };
 
-        add(removed?.file?.driveFileId);
-        add(removed?.drive_file_id);
+        add(ann.drive_file_id);
+        add(grabIdFromDriveLink(ann.url));
+        add(grabIdFromDriveLink(ann.web_view_link));
 
-        const grabIdFromLink = (link) => {
-          if (!link) return null;
-          // https://drive.google.com/file/d/<ID>/view?...  (webViewLink / url)
-          const m = String(link).match(/\/file\/d\/([^/]+)/);
-          return m ? m[1] : null;
-        };
-        add(grabIdFromLink(removed?.url));
-        add(grabIdFromLink(removed?.file?.webViewLink));
-
-        // 2) Tentative de delete/trash par ID
         const tryDeleteById = async (fileId) => {
           if (!fileId) return false;
           try {
@@ -1625,15 +1914,10 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
             const reason =
               err?.response?.data?.error?.errors?.[0]?.reason ||
               err?.errors?.[0]?.reason || err?.message;
-
             console.warn('[Drive delete] hard delete failed', { status, reason });
 
-            if (status === 404) {
-              // introuvable pour le SA → on dira "OK" seulement si on le retrouve plus tard par recherche
-              return false;
-            }
+            if (status === 404) return false;
             if (status === 403 || status === 400) {
-              // pas le droit de delete définitif → corbeille
               await drive.files.update({
                 fileId,
                 supportsAllDrives: true,
@@ -1648,71 +1932,76 @@ app.delete('/announcements/:id', authRequired, async (req, res) => {
 
         let deleted = false;
         for (const fid of ids) {
-          // stop dès que l’un des IDs a fonctionné
           // eslint-disable-next-line no-await-in-loop
           if (await tryDeleteById(fid)) { deleted = true; break; }
         }
 
-        // 3) Fallback – recherche par nom dans le dossier partagé
-        if (!deleted) {
-          const name = removed?.file?.name || (removed?.title ? `${removed.title}` : null);
-          if (name) {
-            const q = [
-              `name = '${name.replace(/'/g, "\\'")}'`,
-              `'${process.env.GDRIVE_FOLDER_ID}' in parents`,
-              `mimeType = 'application/pdf'`,
-            ].join(' and ');
+        // Fallback : recherche par nom dans le dossier (si besoin)
+        if (!deleted && ann.file_name && process.env.GDRIVE_FOLDER_ID) {
+          const q = [
+            `name = '${String(ann.file_name).replace(/'/g, "\\'")}'`,
+            `'${process.env.GDRIVE_FOLDER_ID}' in parents`,
+            `mimeType = 'application/pdf'`,
+          ].join(' and ');
 
-            const list = await drive.files.list({
-              q,
-              corpora: 'drive',
-              driveId: process.env.GDRIVE_DRIVE_ID || undefined, // optionnel si tu l’as
-              includeItemsFromAllDrives: true,
-              supportsAllDrives: true,
-              pageSize: 10,
-              fields: 'files(id, name, trashed, parents)',
-            });
+          const list = await drive.files.list({
+            q,
+            corpora: 'drive',
+            driveId: process.env.GDRIVE_DRIVE_ID || undefined,
+            includeItemsFromAllDrives: true,
+            supportsAllDrives: true,
+            pageSize: 10,
+            fields: 'files(id, name, trashed, parents)',
+          });
 
-            const found = list?.data?.files || [];
-            for (const f of found) {
-              // eslint-disable-next-line no-await-in-loop
-              if (await tryDeleteById(f.id)) { deleted = true; break; }
-            }
+          for (const f of (list?.data?.files || [])) {
+            // eslint-disable-next-line no-await-in-loop
+            if (await tryDeleteById(f.id)) { deleted = true; break; }
           }
+          if (!deleted) console.warn('[Drive delete] no matching file could be deleted.');
         }
-
-        if (!deleted) {
-          console.warn('[Drive delete] no matching file could be deleted (not found/permissions).');
-        }
+      } catch (e) {
+        console.warn('[Drive delete] skip:', e?.message || e);
       }
-    } catch (e) {
-      console.warn('[Drive delete] skip:', e?.message || e);
     }
+
+    // 3) Supprime l’annonce en base
+    await pool.query(
+      `DELETE FROM announcements WHERE tenant_code=$1 AND id=$2`,
+      [code, id]
+    );
 
     return res.json({ ok: true });
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
     if (msg.includes('Announcement not found')) return res.status(404).json({ error: msg });
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
 
-
-
 // 1/ Démarrer une session d’upload Drive (resumable) et retourner l'uploadUrl
+// 1) Démarrer un upload "resumable" vers Google Drive
 app.post('/announcements/upload-url', authRequired, async (req, res) => {
   try {
     if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
     if (!(await requireDrive(res))) return;
+    const folderId = process.env.GDRIVE_FOLDER_ID;
+    if (!folderId) return res.status(500).json({ error: 'Drive not configured (GDRIVE_FOLDER_ID)' });
 
     const { driveAuth } = await ensureDrive();
 
     const { fileName, mimeType, fileSize } = req.body || {};
     if (!fileName || !mimeType || typeof fileSize !== 'number') {
       return res.status(400).json({ error: 'fileName, mimeType, fileSize required' });
+    }
+    if (!isPdf(mimeType)) {
+      return res.status(400).json({ error: 'Only application/pdf is allowed' });
     }
 
     const safeName = String(fileName).replace(/[^\w\- .()]/g, '').slice(0, 120) || 'document.pdf';
@@ -1725,37 +2014,20 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
         'X-Upload-Content-Type': mimeType,
         'X-Upload-Content-Length': String(fileSize),
       },
-      data: { name: safeName, parents: [process.env.GDRIVE_FOLDER_ID], mimeType },
+      data: { name: safeName, parents: [folderId], mimeType },
     });
 
-    // -------- extraction robuste du header --------
     const H = resp?.headers || {};
-    // 1) accès objet
     let uploadUrl =
-      H.location ||
-      H.Location ||
-      H['x-goog-upload-url'] ||
-      H['X-Goog-Upload-URL'] ||
-      null;
-
-    // 2) si c’est un Headers (fetch), utiliser .get()
+      H.location || H.Location || H['x-goog-upload-url'] || H['X-Goog-Upload-URL'] || null;
     if (!uploadUrl && typeof H.get === 'function') {
       uploadUrl =
-        H.get('location') ||
-        H.get('Location') ||
-        H.get('x-goog-upload-url') ||
-        H.get('X-Goog-Upload-URL') ||
-        null;
+        H.get('location') || H.get('Location') || H.get('x-goog-upload-url') || H.get('X-Goog-Upload-URL') || null;
     }
 
-    const fileId = resp?.data?.id ?? null; // souvent absent à l’init, c’est normal
+    const fileId = resp?.data?.id ?? null; // souvent absent ici, c'est normal
 
     if (!uploadUrl) {
-      console.log('[Drive resumable] missing Location header (mais headers reçus) =>', {
-        status: resp?.status,
-        headers: resp?.headers,
-        data: resp?.data,
-      });
       return res.status(500).json({ error: 'Failed to create resumable session (no Location header)' });
     }
 
@@ -1771,92 +2043,131 @@ app.post('/announcements/upload-url', authRequired, async (req, res) => {
 });
 
 
-// >>> DEBUG DRIVE – A ENLEVER APRÈS VERIF
-app.get('/__drive/debug', (req, res) => {
+// 2) Finaliser : créer l’annonce en base APRÈS l’upload Drive
+//    Appelé par le front quand le PUT résumable a terminé.
+//    Body: { fileId, title, published_at }  (fileId obligatoire)
+app.post('/announcements/finalize-resumable', authRequired, async (req, res) => {
   try {
-    const sa = getServiceAccountJSON();      // lit GDRIVE_SA_JSON ou GDRIVE_SA_BASE64
-    ensureDrive();
-    res.json({
-      ok: true,
-      client_email: sa.client_email || null,
-      keyLen: sa.private_key ? sa.private_key.length : 0,
-      folderIdSet: !!GDRIVE_FOLDER_ID
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
-app.get("/__drive/selftest", async (req, res) => {
-  try {
-    const { drive, driveAuth } = await ensureDrive();
-    const { token } = await driveAuth.getAccessToken();
-    const about = await drive.about.get({ fields: "user,emailAddress" });
-    const list = await drive.files.list({
-      q: `'${GDRIVE_FOLDER_ID}' in parents`,
-      pageSize: 1,
-      fields: "files(id,name)",
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      corpora: "allDrives",
-    });
-    res.json({
-      ok: true,
-      tokenSample: token ? token.slice(0, 16) + "…" : null,
-      saUser: about.data.user || null,
-      folderId: GDRIVE_FOLDER_ID || null,
-      firstFile: list.data.files?.[0] || null,
-    });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      message: e?.message || String(e),
-      status: e?.response?.status || null,
-      data: e?.response?.data || null,
-    });
-  }
-});
+    const { fileId, title, published_at } = req.body || {};
+    if (!fileId) return res.status(400).json({ error: 'fileId required' });
+    if (!title || !String(title).trim()) return res.status(400).json({ error: 'title required' });
 
-app.get('/__drive/check-folder', async (req, res) => {
-  try {
     const { drive } = await ensureDrive();
-    const folderId = process.env.GDRIVE_FOLDER_ID;
+
+    // Récupère les métadonnées du fichier tout juste uploadé
     const meta = await drive.files.get({
-      fileId: folderId,
-      fields: 'id,name,mimeType,driveId,parents',
+      fileId,
+      fields: 'id, name, size, mimeType',
       supportsAllDrives: true,
     });
-    res.json({
+
+    const fileName = meta?.data?.name || 'document.pdf';
+    const fileSize = meta?.data?.size ? Number(meta.data.size) : null;
+    const fileMime = meta?.data?.mimeType || 'application/pdf';
+
+    // Rendre public si demandé
+    try {
+      if ((process.env.GDRIVE_PUBLIC || 'true') === 'true') {
+        await drive.permissions.create({
+          fileId,
+          supportsAllDrives: true,
+          requestBody: { role: 'reader', type: 'anyone' },
+        });
+      }
+    } catch (e) {
+      console.warn('[Drive perms] public link skipped:', e?.message || e);
+    }
+
+    const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
+    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+
+    // Enregistrer l’annonce (type=pdf) en Postgres
+    const pubAt = published_at ? new Date(String(published_at)) : new Date();
+    const { rows } = await pool.query(
+      `INSERT INTO announcements
+         (id, tenant_code, type, title, body, url, created_by,
+          published_at, drive_file_id, file_name, file_size, file_mime, web_view_link, download_url)
+       VALUES
+         (gen_random_uuid()::text, $1, 'pdf', $2, NULL, $3, $4,
+          $5, $6, $7, $8, $9, $10, $11)
+       RETURNING id, tenant_code, type, title, body, url, created_by,
+                 published_at, drive_file_id, file_name, file_size, file_mime, web_view_link, download_url,
+                 created_at, updated_at`,
+      [
+        code,
+        String(title).trim(),
+        webViewLink,
+        Number(req.user.sub) || null,
+        pubAt.toISOString(),
+        fileId, fileName, fileSize, fileMime, webViewLink, downloadUrl,
+      ]
+    );
+    const created = rows[0];
+
+    // Push à tous les devices du tenant (optionnel)
+    try {
+      const tok = await pool.query(
+        `SELECT token FROM devices WHERE tenant_code=$1`,
+        [code]
+      );
+      const tokens = tok.rows.map(r => r.token);
+      if (tokens.length) {
+        await sendExpoPush(tokens, {
+          title: 'Nouvelle annonce 📢',
+          body: String(title).slice(0, 120),
+          data: { type: 'announcement', announcementId: created.id },
+        });
+      }
+    } catch (e) {
+      console.warn('[push] announcement skipped', e?.message || e);
+    }
+
+    // Réponse (avec bloc file pour compat front)
+    res.status(201).json({
       ok: true,
-      id: meta.data.id,
-      name: meta.data.name,
-      mimeType: meta.data.mimeType,
-      driveId: meta.data.driveId,
-      inSharedDrive: !!meta.data.driveId
+      announcement: {
+        ...created,
+        file: {
+          driveFileId: created.drive_file_id,
+          name: created.file_name,
+          size: created.file_size,
+          mime: created.file_mime,
+          webViewLink: created.web_view_link,
+          downloadUrl: created.download_url,
+        },
+      },
     });
   } catch (e) {
-    res.status(500).json({ ok:false, error: e?.message || e });
+    console.error('[finalize-resumable] error:', e?.response?.status, e?.response?.data || e);
+    return res.status(500).json({ error: 'Finalize failed' });
   }
 });
-
 
 
 // 2/ Confirmer après upload complet et créer l’annonce (Drive public link)
 app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
   try {
     if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
-    if (!(await requireDrive(res))) return;
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
+    if (!(await requireDrive(res))) return;
     const { drive: driveClient } = await ensureDrive();
 
-    const { fileId, title } = req.body || {};
+    const { fileId, title, published_at } = req.body || {};
     if (!fileId || !title || !String(title).trim()) {
       return res.status(400).json({ error: 'fileId & title required' });
     }
 
-    // Rendre le fichier accessible par lien (optionnel)
+    // Rendre le fichier public (optionnel)
     try {
       if ((process.env.GDRIVE_PUBLIC || 'true') === 'true') {
         await driveClient.permissions.create({
@@ -1869,67 +2180,75 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
       console.warn('[Drive perms] set public failed:', e?.message || e);
     }
 
-    // Métadonnées + liens
+    // Récup métadonnées (nom, taille, mime, lien web)
     const meta = await driveClient.files.get({
       fileId,
-      fields: 'id,name,webViewLink,webContentLink',
+      fields: 'id,name,size,mimeType,webViewLink',
       supportsAllDrives: true,
     });
 
-    const url = meta.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
+    const fileName    = meta?.data?.name || 'document.pdf';
+    const fileSize    = meta?.data?.size ? Number(meta.data.size) : null;
+    const fileMime    = meta?.data?.mimeType || 'application/pdf';
+    const webViewLink = meta?.data?.webViewLink || `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
     const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-    const fileName = meta.data.name || 'document.pdf';
+    const pubAt       = published_at ? new Date(String(published_at)) : new Date();
 
-    let created = null;
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
+    // Enregistrer l’annonce en base (type = pdf)
+    const { rows } = await pool.query(
+      `INSERT INTO announcements
+         (id, tenant_code, type, title, body, url, created_by,
+          published_at, drive_file_id, file_name, file_size, file_mime, web_view_link, download_url)
+       VALUES
+         (gen_random_uuid()::text, $1, 'pdf', $2, NULL, $3, $4,
+          $5, $6, $7, $8, $9, $10, $11)
+       RETURNING id, tenant_code, type, title, body, url, created_by,
+                 published_at, drive_file_id, file_name, file_size, file_mime, web_view_link, download_url,
+                 created_at, updated_at`,
+      [
+        code,
+        String(title).trim(),
+        webViewLink,                          // url principale (vue web)
+        Number(req.user.sub) || null,
+        pubAt.toISOString(),
+        fileId, fileName, fileSize, fileMime, webViewLink, downloadUrl,
+      ]
+    );
+    const created = rows[0];
 
-      const now = new Date().toISOString();
-      const ann = {
-        id: crypto.randomUUID(),
-        type: 'pdf',
-        title: String(title).trim(),
-        body: null,
-        url, // lien d'affichage (web)
-        drive_file_id: fileId,
-        file: {
-          driveFileId: fileId,
-          name: fileName,
-          mime: 'application/pdf',
-          webViewLink: url,
-          downloadUrl,
-        },
-        created_at: now,
-        created_by: req.user.sub,
-      };
-
-      t.announcements.unshift(ann);
-      t.updated_at = now;
-      next.tenants[code] = t;
-      created = ann;
-      return true;
-    });
-
-    // Push (optionnel)
+    // Push à tous les devices du tenant (optionnel)
     try {
-      const reg = await loadRegistry();
-      const t = ensureTenantDefaults(reg.tenants?.[req.user.company_code] || {});
-      const tokens = (t.devices || []).map(d => d.token);
+      const tok = await pool.query(
+        `SELECT token FROM devices WHERE tenant_code=$1`,
+        [code]
+      );
+      const tokens = tok.rows.map(r => r.token);
       if (tokens.length) {
         await sendExpoPush(tokens, {
           title: 'Nouvelle annonce 📢',
           body: String(title).slice(0, 120),
-          data: { type: 'announcement' },
+          data: { type: 'announcement', announcementId: created.id },
         });
       }
     } catch (e) {
       console.warn('[push] announcement skipped', e?.message || e);
     }
 
-    return res.status(201).json({ ok: true, announcement: created });
+    // Réponse compatible avec ton front (bloc file)
+    return res.status(201).json({
+      ok: true,
+      announcement: {
+        ...created,
+        file: {
+          driveFileId: created.drive_file_id,
+          name: created.file_name,
+          size: created.file_size,
+          mime: created.file_mime,
+          webViewLink: created.web_view_link,
+          downloadUrl: created.download_url,
+        },
+      },
+    });
   } catch (e) {
     console.error('[announcements/confirm-upload] error:', e?.response?.status, e?.response?.data || e);
     return res.status(500).json({ error: 'Failed to confirm upload' });
@@ -1937,17 +2256,28 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
 });
 
 
-
 /** ===== SETTINGS (réglages d’entreprise) ===== */
 // Récupérer les réglages (mode de décompte, etc.)
 app.get('/settings', authRequired, async (req, res) => {
   try {
-    const reg = await loadRegistry();
-    const t0 = reg.tenants?.[req.user.company_code];
-    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
-    const t = ensureTenantDefaults(t0);
-    return res.json({ settings: t.settings || { leave_count_mode: 'ouvres' } });
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
+    const { rows } = await pool.query(
+      'SELECT key, value FROM settings WHERE tenant_code = $1',
+      [code]
+    );
+
+    // map rows -> objet { key: value }
+    const settings = {};
+    for (const r of rows) settings[r.key] = r.value;
+
+    // défaut minimal si absent
+    if (settings.leave_count_mode == null) settings.leave_count_mode = 'ouvres';
+
+    return res.json({ settings });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
@@ -1956,42 +2286,73 @@ app.get('/settings', authRequired, async (req, res) => {
 app.patch('/settings', authRequired, async (req, res) => {
   try {
     if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-  return res.status(403).json({ error: 'Forbidden' });
-}
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
     const { leave_count_mode, workweek, show_employee_bonuses } = req.body || {};
+
+    // validations
     if (leave_count_mode && !['ouvres', 'ouvrables'].includes(leave_count_mode)) {
       return res.status(400).json({ error: 'leave_count_mode must be "ouvres" or "ouvrables"' });
     }
-    if (workweek && !Array.isArray(workweek)) {
-      return res.status(400).json({ error: 'workweek must be an array of numbers (0..6)' });
+    if (workweek !== undefined) {
+      if (!Array.isArray(workweek)) {
+        return res.status(400).json({ error: 'workweek must be an array of numbers (0..6)' });
+      }
+      // nettoie: nombres entiers 0..6, uniques, triés
+      const ww = Array.from(new Set(workweek.map(Number)))
+        .filter(n => Number.isInteger(n) && n >= 0 && n <= 6)
+        .sort((a,b) => a - b);
+      if (ww.length !== workweek.length) {
+        return res.status(400).json({ error: 'workweek must contain only unique integers in 0..6' });
+      }
     }
     if (show_employee_bonuses !== undefined && typeof show_employee_bonuses !== 'boolean') {
       return res.status(400).json({ error: 'show_employee_bonuses must be boolean' });
     }
 
-    let out = null;
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
+    // upsert des clés présentes
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-      t.settings = t.settings || {};
-      if (leave_count_mode) t.settings.leave_count_mode = leave_count_mode;
-      if (Array.isArray(workweek)) t.settings.workweek = workweek;
-      if (typeof show_employee_bonuses === 'boolean') t.settings.show_employee_bonuses = show_employee_bonuses; // ⬅️ NEW
+      const upsert = async (k, v) => {
+        await client.query(
+          `INSERT INTO settings (tenant_code, key, value, updated_at)
+           VALUES ($1, $2, $3::jsonb, now())
+           ON CONFLICT (tenant_code, key)
+           DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+          [code, k, JSON.stringify(v)]
+        );
+      };
 
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      out = t.settings;
-      return true;
-    });
+      if (leave_count_mode !== undefined) await upsert('leave_count_mode', leave_count_mode);
+      if (workweek !== undefined)         await upsert('workweek', workweek);
+      if (show_employee_bonuses !== undefined) await upsert('show_employee_bonuses', !!show_employee_bonuses);
 
-    return res.json({ ok: true, settings: out });
+      // renvoie l’état complet après MAJ
+      const { rows } = await client.query(
+        'SELECT key, value FROM settings WHERE tenant_code = $1',
+        [code]
+      );
+      await client.query('COMMIT');
+
+      const settings = {};
+      for (const r of rows) settings[r.key] = r.value;
+      if (settings.leave_count_mode == null) settings.leave_count_mode = 'ouvres';
+
+      return res.json({ ok: true, settings });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      client.release();
+    }
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
@@ -2542,54 +2903,109 @@ app.get('/profile/me', authRequired, async (req, res) => {
 
 
 
-// PATCH /profile/me  => l’employé peut MAJ téléphone/adresse (OWNER peut aussi)
-app.patch('/profile/me', authRequired, async (req, res) => {
+// Récupérer les réglages (mode de décompte, etc.)
+app.get('/settings', authRequired, async (req, res) => {
   try {
-    const code = req.user.company_code;
-    const role = String(req.user.role || '').toUpperCase();
-    const id   = String(req.user.sub);
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
-    await withRegistryUpdate((next) => {
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t  = ensureTenantDefaults(t0);
+    const { rows } = await pool.query(
+      'SELECT key, value FROM settings WHERE tenant_code = $1',
+      [code]
+    );
 
-      const body = req.body || {};
-      const patch = {};
+    const settings = {};
+    for (const r of rows) settings[r.key] = r.value;
 
-      // Employé : peut MAJ phone/address ; Patron : peut tout (et refléter dans users)
-      if (role === 'OWNER') {
-        if ('first_name' in body) patch.first_name = String(body.first_name || '');
-        if ('last_name'  in body) patch.last_name  = String(body.last_name  || '');
-        if ('email'      in body) patch.email      = String(body.email      || '');
-        // miroir dans users si fourni
-        t.users = t.users || {};
-        if (t.users[id]) {
-          if ('first_name' in body) t.users[id].first_name = patch.first_name;
-          if ('last_name'  in body) t.users[id].last_name  = patch.last_name;
-          if ('email'      in body) t.users[id].email      = patch.email;
-        }
-      }
-      if ('phone'   in body) patch.phone   = String(body.phone   || '');
-      if ('address' in body) patch.address = String(body.address || '');
+    // défaut minimal si absent
+    if (settings.leave_count_mode == null) settings.leave_count_mode = 'ouvres';
 
-      t.employee_profiles.byId[id] = {
-        ...(t.employee_profiles.byId[id] || {}),
-        ...patch,
-        updatedAt: new Date().toISOString(),
-      };
-
-      next.tenants[code] = t;
-      return true;
-    });
-
-    return res.json({ success: true });
+    return res.json({ settings });
   } catch (e) {
-    const msg = String(e.message || e);
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
-    return res.status(500).json({ error: msg });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
+// Mettre à jour les réglages (OWNER uniquement)
+app.patch('/settings', authRequired, async (req, res) => {
+  try {
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
+    const { leave_count_mode, workweek, show_employee_bonuses } = req.body || {};
+
+    // -------- validations + normalisation --------
+    let mode = leave_count_mode;
+    if (mode !== undefined) {
+      mode = String(mode).trim().toLowerCase();
+      if (!['ouvres', 'ouvrables'].includes(mode)) {
+        return res.status(400).json({ error: 'leave_count_mode must be "ouvres" or "ouvrables"' });
+      }
+    }
+
+    let ww = workweek;
+    if (ww !== undefined) {
+      if (!Array.isArray(ww)) {
+        return res.status(400).json({ error: 'workweek must be an array of numbers (0..6)' });
+      }
+      ww = Array.from(new Set(ww.map(Number)))
+        .filter(n => Number.isInteger(n) && n >= 0 && n <= 6)
+        .sort((a, b) => a - b);
+      if (ww.length === 0) {
+        return res.status(400).json({ error: 'workweek cannot be empty; use 0..6 (0=dimanche, 1=lundi, ...)' });
+      }
+    }
+
+    if (show_employee_bonuses !== undefined && typeof show_employee_bonuses !== 'boolean') {
+      return res.status(400).json({ error: 'show_employee_bonuses must be boolean' });
+    }
+
+    // -------- upsert des clés présentes (transaction) --------
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const upsert = async (k, v) => {
+        await client.query(
+          `INSERT INTO settings (tenant_code, key, value, updated_at)
+           VALUES ($1, $2, $3::jsonb, now())
+           ON CONFLICT (tenant_code, key)
+           DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+          [code, k, JSON.stringify(v)]
+        );
+      };
+
+      if (mode !== undefined) await upsert('leave_count_mode', mode);
+      if (ww   !== undefined) await upsert('workweek', ww);
+      if (show_employee_bonuses !== undefined) await upsert('show_employee_bonuses', !!show_employee_bonuses);
+
+      const { rows } = await client.query(
+        'SELECT key, value FROM settings WHERE tenant_code = $1',
+        [code]
+      );
+      await client.query('COMMIT');
+
+      const settings = {};
+      for (const r of rows) settings[r.key] = r.value;
+      if (settings.leave_count_mode == null) settings.leave_count_mode = 'ouvres';
+
+      return res.json({ ok: true, settings });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 
 
 // OWNER: GET /profiles  => renvoie un map de tous les profils (fusion staff + profils)
@@ -2643,199 +3059,275 @@ app.get('/profiles', authRequired, async (req, res) => {
 
 
 // OWNER: PATCH /profile/:empId  => MAJ d’un profil employé (tous champs)
+// PATCH /profile/:empId — OWNER: maj identité + profil (phone/address)
 app.patch('/profile/:empId', authRequired, async (req, res) => {
   if (String(req.user.role || '').toUpperCase() !== 'OWNER') {
     return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
   }
   try {
-    const code = req.user.company_code;
-    const empId = String(req.params.empId || '').trim();
-    if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+    const code = String(req.user.company_code || '').trim();
+    const empId = Number(req.params.empId);
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(empId) || empId <= 0) return res.status(400).json({ error: 'EMP_ID_MISSING' });
 
-    await withRegistryUpdate((next) => {
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t  = ensureTenantDefaults(t0);
+    const body = req.body || {};
+    const userPatch = {};
+    for (const k of ['first_name','last_name','email']) {
+      if (k in body) userPatch[k] = body[k] == null ? null : String(body[k]);
+    }
+    const profilePhone   = ('phone'   in body) ? (body.phone   == null ? null : String(body.phone))   : undefined;
+    const profileAddress = ('address' in body) ? (body.address == null ? null : String(body.address)) : undefined;
 
-      const body = req.body || {};
-      const patch = {};
-      for (const k of ['first_name','last_name','email','phone','address']) {
-        if (k in body) patch[k] = String(body[k] || '');
+    // Validations
+    if (userPatch.email != null) {
+      const e = String(userPatch.email).trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) {
+        return res.status(400).json({ error: 'BAD_EMAIL' });
+      }
+      userPatch.email = e;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // lock user existence
+      const cur = await client.query(
+        'SELECT id FROM users WHERE tenant_code=$1 AND id=$2 FOR UPDATE',
+        [code, empId]
+      );
+      if (!cur.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'User not found' });
       }
 
-      // miroir nom/prénom/email dans users si présent
-      t.users = t.users || {};
-      if (t.users[empId]) {
-        if ('first_name' in patch) t.users[empId].first_name = patch.first_name;
-        if ('last_name'  in patch) t.users[empId].last_name  = patch.last_name;
-        if ('email'      in patch) t.users[empId].email      = patch.email;
+      // update users (first_name,last_name,email)
+      if (Object.keys(userPatch).length) {
+        const sets = [];
+        const params = [];
+        let i = 1;
+        for (const k of ['first_name','last_name','email']) {
+          if (k in userPatch) { sets.push(`${k} = $${i++}`); params.push(userPatch[k]); }
+        }
+        sets.push(`updated_at = now()`);
+        const sql = `
+          UPDATE users SET ${sets.join(', ')}
+           WHERE tenant_code = $${i++} AND id = $${i++}
+           RETURNING id, email, role, first_name, last_name, is_active, created_at, updated_at
+        `;
+        params.push(code, empId);
+        try {
+          await client.query(sql, params);
+        } catch (e) {
+          if (e && e.code === '23505') {
+            // unique(tenant_code,email)
+            throw Object.assign(new Error('EMAIL_ALREADY_EXISTS'), { status: 409 });
+          }
+          throw e;
+        }
       }
 
-      t.employee_profiles.byId[empId] = {
-        ...(t.employee_profiles.byId[empId] || {}),
-        ...patch,
-        updatedAt: new Date().toISOString(),
-      };
+      // upsert employee profile (phone/address) — si fourni
+      if (profilePhone !== undefined || profileAddress !== undefined) {
+        await client.query(
+          `INSERT INTO employee_profiles (tenant_code, user_id, phone, address, updated_at)
+           VALUES ($1,$2,$3,$4, now())
+           ON CONFLICT (tenant_code, user_id)
+           DO UPDATE SET
+             phone      = COALESCE(EXCLUDED.phone, employee_profiles.phone),
+             address    = COALESCE(EXCLUDED.address, employee_profiles.address),
+             updated_at = now()`,
+          [
+            code,
+            empId,
+            (profilePhone   !== undefined ? profilePhone   : null),
+            (profileAddress !== undefined ? profileAddress : null),
+          ]
+        );
+      }
 
-      next.tenants[code] = t;
-      return true;
-    });
-
-    return res.json({ success: true });
+      await client.query('COMMIT');
+      return res.json({ success: true });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      if (e.status === 409 || (e.message && e.message.includes('EMAIL_ALREADY_EXISTS'))) {
+        return res.status(409).json({ error: 'EMAIL_ALREADY_EXISTS' });
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
+    if (msg.includes('User not found')) return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
 
 
-// POST /auth/change-password  (EMPLOYEE/OWNER change son propre mot de passe)
+// POST /auth/change-password — l’utilisateur change son propre mot de passe
 app.post('/auth/change-password', authRequired, async (req, res) => {
   try {
-    const code = req.user.company_code;
-    const reg = await loadRegistry();
-    const t = reg.tenants?.[code];
-    if (!t) return res.status(404).json({ error: 'Tenant not found' });
-
-    const uid = String(req.user.sub);              // id numérique créé à l’invitation
-    const user = t.users?.[uid];
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    const code = String(req.user.company_code || '').trim();
+    const uid  = Number(req.user.sub);
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'BAD_USER' });
 
     const { currentPassword, newPassword } = req.body || {};
     if (!newPassword || String(newPassword).length < 8) {
       return res.status(400).json({ error: 'WEAK_PASSWORD' });
     }
 
-    // Vérifier l’ancien mdp : bcrypt d’abord, sinon legacy scrypt
-    let ok = false;
-    if (user.password_hash) {
-      ok = await bcrypt.compare(String(currentPassword || ''), String(user.password_hash));
-    }
-    if (!ok && t.auth?.byId?.[uid]?.password) {
-      ok = pwdVerify(t.auth.byId[uid].password, String(currentPassword || ''));
-    }
+    const cur = await pool.query(
+      'SELECT id, password_hash FROM users WHERE tenant_code=$1 AND id=$2',
+      [code, uid]
+    );
+    if (!cur.rows.length) return res.status(404).json({ error: 'User not found' });
+    const { password_hash } = cur.rows[0];
+
+    // vérifier l’ancien mdp
+    const ok = password_hash
+      ? await bcrypt.compare(String(currentPassword || ''), String(password_hash))
+      : false;
     if (!ok) return res.status(401).json({ error: 'INVALID_CURRENT_PASSWORD' });
 
     const newHash = await bcrypt.hash(String(newPassword), 10);
-
-    // Écrire le nouveau hash au bon endroit + nettoyer l’ancien store
-    await withRegistryUpdate((next) => {
-      const tt = next.tenants?.[code];
-      if (!tt?.users?.[uid]) throw new Error('User not found');
-      tt.users[uid].password_hash = newHash;
-      if (tt.auth?.byId?.[uid]) delete tt.auth.byId[uid]; // supprime l’ancien scrypt
-      tt.updated_at = new Date().toISOString();
-      next.tenants[code] = tt;
-      return true;
-    });
+    await pool.query(
+      'UPDATE users SET password_hash=$1, updated_at=now() WHERE tenant_code=$2 AND id=$3',
+      [newHash, code, uid]
+    );
 
     return res.json({ success: true });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// Helper: retourne l'objet user + defaults
-function getTenantAndUser(reg, companyCode, uid) {
-  const t0 = reg.tenants?.[companyCode];
-  if (!t0) throw new Error('Tenant not found');
-  const t = ensureTenantDefaults(t0);
-  const user = t.users?.[String(uid)];
-  if (!user) throw new Error('User not found');
-  return { t, user };
-}
 
-// GET /legal/status  -> indique ce que l'utilisateur doit accepter
+// GET /legal/status — indique ce que l'utilisateur doit accepter
 app.get('/legal/status', authRequired, async (req, res) => {
   try {
-    const reg = await loadRegistry();
-    const { t, user } = getTenantAndUser(reg, req.user.company_code, req.user.sub);
+    const code = String(req.user.company_code || '').trim();
+    const uid  = Number(req.user.sub);
     const role = String(req.user.role || '').toUpperCase();
-    const uid  = String(req.user.sub);
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'BAD_USER' });
 
-    // Versions + URLs avec valeurs par défaut
-    const versions = (t.legal && t.legal.versions) ? t.legal.versions : { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
-    const urls     = (t.legal && t.legal.urls)     ? t.legal.urls     : {};
+    // 1) versions & urls depuis settings
+    const { rows: srows } = await pool.query(
+      `SELECT key, value FROM settings
+        WHERE tenant_code=$1 AND key IN ('legal_versions','legal_urls')`,
+      [code]
+    );
+    let versions = { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
+    let urls = {};
+    for (const r of srows) {
+      if (r.key === 'legal_versions' && r.value) versions = { ...versions, ...r.value };
+      if (r.key === 'legal_urls' && r.value) urls = { ...urls, ...r.value };
+    }
 
-    // Lecture des acceptations :
-    // 1) Nouveau schéma: t.legal.acceptances.byUser[uid]
-    // 2) Legacy: user.legal_accepts (fallback)
-    const accTenant = t?.legal?.acceptances?.byUser?.[uid] || null;
-    const accLegacy = user?.legal_accepts || null;
-    const acc = accTenant || accLegacy || {};
+    // 2) acceptations utilisateur
+    const { rows: acc } = await pool.query(
+      `SELECT doc, version FROM legal_acceptances
+        WHERE tenant_code=$1 AND user_id=$2 AND doc IN ('cgu','cgv','privacy')`,
+      [code, uid]
+    );
+    const accMap = Object.create(null);
+    for (const a of acc) accMap[a.doc] = a;
 
-    const hasCGU     = acc.cgu     && acc.cgu.version     === versions.cgu;
-    const hasCGV     = acc.cgv     && acc.cgv.version     === versions.cgv;
-    const hasPrivacy = acc.privacy && acc.privacy.version === versions.privacy;
+    const hasCGU     = !!(accMap.cgu     && accMap.cgu.version     === versions.cgu);
+    const hasCGV     = !!(accMap.cgv     && accMap.cgv.version     === versions.cgv);
+    const hasPrivacy = !!(accMap.privacy && accMap.privacy.version === versions.privacy);
 
-    // Règles d’obligation
-    const need_cgu = !hasCGU;                             // CGU pour tout le monde
-    const need_cgv = role === 'OWNER' ? !hasCGV : false;  // CGV pour Patron uniquement (pas RH/Admin)
-    const need_privacy = false;                           // ← si tu ne veux PAS forcer la confidentialité
-    // Si tu veux la rendre obligatoire pour tous, remplace par: const need_privacy = !hasPrivacy;
+    // Règles d’obligation (comme ton code d’origine)
+    const need_cgu = !hasCGU;                       // CGU pour tout le monde
+    const need_cgv = role === 'OWNER' ? !hasCGV : false; // CGV pour Patron uniquement
+    const need_privacy = false;                     // mets true si tu veux la rendre obligatoire
 
-    return res.json({
-      role,
-      versions,
-      urls,
-      need_cgu,
-      need_cgv,
-      need_privacy,
-    });
+    return res.json({ role, versions, urls, need_cgu, need_cgv, need_privacy });
   } catch (e) {
+    console.error(e);
     const msg = String(e.message || e);
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: msg });
-    if (msg.includes('User not found'))   return res.status(404).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
 
+
 // POST /legal/accept  -> enregistre l’acceptation de l’utilisateur courant
 // body: { acceptCGU?: boolean, acceptCGV?: boolean }
+// POST /legal/accept — enregistre l'acceptation des CGU/CGV pour l'utilisateur courant
 app.post('/legal/accept', authRequired, async (req, res) => {
   try {
-    const { acceptCGU, acceptCGV } = req.body || {};
+    const code = String(req.user.company_code || '').trim();
+    const uid  = Number(req.user.sub);
     const role = String(req.user.role || '').toUpperCase();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'BAD_USER' });
 
-    await withRegistryUpdate((next) => {
-      const code = req.user.company_code;
-      const t0 = next.tenants?.[code];
-      if (!t0) throw new Error('Tenant not found');
-      const t = ensureTenantDefaults(t0);
+    const { acceptCGU, acceptCGV } = req.body || {};
 
-      const uid = String(req.user.sub);
-      if (!t.users?.[uid]) throw new Error('User not found');
+    // Vérifier que l'utilisateur existe dans ce tenant
+    const u = await pool.query(
+      'SELECT id FROM users WHERE tenant_code=$1 AND id=$2',
+      [code, uid]
+    );
+    if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
 
-      const v = t.legal?.versions || { cgv:'1.0', cgu:'1.0', privacy:'1.0' };
-      t.users[uid].legal_accepts = t.users[uid].legal_accepts || {};
+    // Récup versions légales depuis settings (fallback défauts)
+    const s = await pool.query(
+      `SELECT value FROM settings WHERE tenant_code=$1 AND key='legal_versions'`,
+      [code]
+    );
+    const defVersions = { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
+    const versions = s.rows.length && s.rows[0].value
+      ? { ...defVersions, ...s.rows[0].value }
+      : defVersions;
 
-      const now = new Date().toISOString();
+    // Règles: CGU pour tous; CGV uniquement OWNER
+    if (acceptCGV && role !== 'OWNER') {
+      return res.status(403).json({ error: 'FORBIDDEN_CGV_NON_OWNER' });
+    }
 
-      if (acceptCGU) {
-        t.users[uid].legal_accepts.cgu = { version: v.cgu, at: now };
-      }
-      if (acceptCGV) {
-        if (role !== 'OWNER') throw new Error('FORBIDDEN_CGV_NON_OWNER');
-        t.users[uid].legal_accepts.cgv = { version: v.cgv, at: now };
-      }
+    // Si rien à enregistrer, on renvoie OK (comportement compatible)
+    if (!acceptCGU && !acceptCGV) {
+      return res.json({ ok: true });
+    }
 
-      t.updated_at = now;
-      next.tenants[code] = t;
-      return true;
-    });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const upsertAcceptance = async (doc, ver) => {
+        await client.query(
+          `INSERT INTO legal_acceptances (tenant_code, user_id, doc, version, accepted_at)
+           VALUES ($1,$2,$3,$4, now())
+           ON CONFLICT (tenant_code, user_id, doc)
+           DO UPDATE SET version = EXCLUDED.version, accepted_at = now()`,
+          [code, uid, doc, String(ver)]
+        );
+      };
+
+      if (acceptCGU) await upsertAcceptance('cgu', versions.cgu);
+      if (acceptCGV) await upsertAcceptance('cgv', versions.cgv);
+
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      client.release();
+    }
 
     return res.json({ ok: true });
   } catch (e) {
     const msg = String(e.message || e);
-    if (msg.includes('Tenant not found') || msg.includes('User not found'))
-      return res.status(404).json({ error: msg });
-    if (msg.includes('FORBIDDEN_CGV_NON_OWNER'))
-      return res.status(403).json({ error: msg });
+    if (msg.includes('User not found'))   return res.status(404).json({ error: msg });
+    if (msg.includes('FORBIDDEN_CGV_NON_OWNER')) return res.status(403).json({ error: msg });
     return res.status(500).json({ error: msg });
   }
 });
-
 
 
 /** ===== START ===== */
