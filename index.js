@@ -2,26 +2,25 @@ import "dotenv/config";
 import express from "express";
 import helmet from "helmet";
 import cors from "cors";
-import fetch from "node-fetch";
+import fetch from "node-fetch"; // ok même si Node 18+ a fetch global
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import { google } from "googleapis";
 import { Readable } from "stream";
-import { computeBonusV3 } from './bonusMathV3.js';
-import { monthKey } from './utils/dates.js';
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { q } from './db.js';
-import { tenantLoad, tenantUpsert, tenantUpdate } from './tenant-store.js';
+import { computeBonusV3 } from "./bonusMathV3.js";
+import { monthKey } from "./utils/dates.js";
+import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+
+// ❗️Utilise ESM pour la DB (pas de require ici)
+import { pool /*, q*/ } from "./db.js";
+// import { q } from "./db.js"; // décommente si tu l’utilises vraiment
 
 
-const { pool } = require('./db');
 const app = express();
 
-
-function isHttpUrl(u='') { return /^https?:\/\//i.test(String(u)); }
-/** ===== CORS (whitelist) ===== */
+// ===== CORS =====
 const ALLOWED_ORIGINS = [
   "https://opti-admin.vercel.app",
   "https://www.opti-admin.vercel.app",
@@ -29,16 +28,18 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3000",
 ];
 app.use((req, res, next) => { res.header("Vary", "Origin"); next(); });
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true); // curl/health/no-origin
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(null, false); // CORS désactivé pour cet origin (pas d'erreur 500)
-  },
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: false,
-}));
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true); // curl/health/no-origin
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(null, false);
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: false,
+  })
+);
 app.options("*", cors());
 
 // Helmet (assoupli pour API)
@@ -55,68 +56,79 @@ const JWT_SECRET = process.env.JWT_SECRET;
 ["JSONBIN_API_URL","JSONBIN_MASTER_KEY","JSONBIN_OPTIRH_BIN_ID","APP_SIGNING_SECRET","JWT_SECRET"]
   .forEach(k => { if (!process.env[k]) console.warn(`[warn] Missing env ${k}`); });
 
+// Rôles OWNER-like (utilisé par beaucoup de routes)
+export const OWNER_LIKE = new Set(["OWNER", "MANAGER"]); // ajuste si besoin
 
-// --- Google Drive (compte de service) ---
+/** ===== Google Drive (compte de service) ===== */
 const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
-const GDRIVE_PUBLIC    = (process.env.GDRIVE_PUBLIC || 'true') === 'true';
+const GDRIVE_PUBLIC    = (process.env.GDRIVE_PUBLIC || "true") === "true";
 
 let drive = null;      // client google.drive
 let driveAuth = null;  // client JWT pour driveAuth.request()
 
 function getServiceAccountJSON() {
-  let raw = process.env.GDRIVE_SA_JSON || '';
-  const b64 = process.env.GDRIVE_SA_BASE64 || '';
-  if (!raw && b64) raw = Buffer.from(b64, 'base64').toString('utf8');
-  if (!raw) throw new Error('Missing GDRIVE_SA_JSON or GDRIVE_SA_BASE64');
+  let raw = process.env.GDRIVE_SA_JSON || "";
+  const b64 = process.env.GDRIVE_SA_BASE64 || "";
+  if (!raw && b64) raw = Buffer.from(b64, "base64").toString("utf8");
+  if (!raw) throw new Error("Missing GDRIVE_SA_JSON or GDRIVE_SA_BASE64");
 
   const json = JSON.parse(raw);
-  if (json.private_key && json.private_key.includes('\\n')) {
-    json.private_key = json.private_key.replace(/\\n/g, '\n');
+  if (json.private_key && json.private_key.includes("\\n")) {
+    json.private_key = json.private_key.replace(/\\n/g, "\n");
   }
   return json;
 }
 
-async function ensureDrive() {
+export async function ensureDrive() {
   if (drive && driveAuth) return { drive, driveAuth };
-
   const sa = getServiceAccountJSON();
-  console.log('[Drive] SA email=', sa.client_email, ' keyLen=', (sa.private_key || '').length, ' folderIdSet=', !!process.env.GDRIVE_FOLDER_ID);
-
-  // ⬇️ constructeur OBJET (évite "No key or keyFile set")
   const authClient = new google.auth.JWT({
     email: sa.client_email,
-    key: sa.private_key,                           // <- la clé privée
-    scopes: ['https://www.googleapis.com/auth/drive'],
+    key: sa.private_key,
+    scopes: ["https://www.googleapis.com/auth/drive"],
   });
-
   driveAuth = authClient;
-  drive = google.drive({ version: 'v3', auth: authClient });
+  drive = google.drive({ version: "v3", auth: authClient });
   return { drive, driveAuth };
 }
 
-
-async function requireDrive(res) {
+export async function requireDrive(res) {
   try {
     const ok = await ensureDrive();
     if (!ok || !process.env.GDRIVE_FOLDER_ID) {
-      res.status(500).json({ error: 'Drive not configured (service account or GDRIVE_FOLDER_ID)' });
+      res.status(500).json({ error: "Drive not configured (service account or GDRIVE_FOLDER_ID)" });
       return false;
     }
     return true;
   } catch (e) {
-    console.error('[Drive] ensure failed:', e?.message || e);
-    res.status(500).json({ error: 'Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64)' });
+    console.error("[Drive] ensure failed:", e?.message || e);
+    res.status(500).json({ error: "Drive not configured (GDRIVE_SA_JSON/GDRIVE_SA_BASE64)" });
     return false;
   }
 }
 
-function isPdf(m) { return String(m || '').toLowerCase() === 'application/pdf'; }
-function isHttpUrl(u = '') { return /^https?:\/\//i.test(String(u)); }
+// ===== Helpers communs =====
+function isPdf(m) { return String(m || "").toLowerCase() === "application/pdf"; }
+function isHttpUrl(u = "") { return /^https?:\/\//i.test(String(u)); }
 function grabIdFromDriveLink(link) {
   if (!link) return null;
   const m = String(link).match(/\/file\/d\/([^/]+)/);
   return m ? m[1] : null;
 }
+
+// manquait dans ton header : utilisé pour upload buffer -> stream
+function bufferToStream(buffer) {
+  const r = new Readable();
+  r.push(buffer);
+  r.push(null);
+  return r;
+}
+
+// Multer en mémoire pour /announcements/upload
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB (ajuste)
+});
 
 /** ===== UTILS ===== */
 const sign = (payload) =>
@@ -127,7 +139,7 @@ const genCompanyCode = (name = "CO") => {
   return base + Math.floor(100 + Math.random() * 900); // ex: OPT123
 };
 
-// JSONBin I/O
+// === (legacy JSONBin — conserve si tu en as encore besoin pour certaines routes) ===
 async function loadRegistry() {
   const r = await fetch(`${API}/b/${BIN_ID}/latest`, { headers: { "X-Master-Key": MASTER } });
   if (!r.ok) {
@@ -154,8 +166,6 @@ async function saveRegistry(record) {
   const json = await r.json();
   return json.record;
 }
-
-// Petit helper pour gérer les conflits d’écriture
 async function withRegistryUpdate(mutator, maxRetry = 3) {
   for (let i = 0; i < maxRetry; i++) {
     const reg = await loadRegistry();
@@ -172,20 +182,20 @@ async function withRegistryUpdate(mutator, maxRetry = 3) {
   }
 }
 
-if (process.env.DEBUG_BONUS === '1') {
-  
+// Debug bonus (ok)
+if (process.env.DEBUG_BONUS === "1") {
   const formula = {
     version: 3,
-    id: 'demo',
-    title: 'Démo 20% HT',
+    id: "demo",
+    title: "Démo 20% HT",
     fields: [],
     rules: [
-      { type: 'percent', rate: 0.20, base: { kind: 'field', key: 'totalTTC', mode: 'HT', vatKey: 'totalVAT' } }
+      { type: "percent", rate: 0.20, base: { kind: "field", key: "totalTTC", mode: "HT", vatKey: "totalVAT" } }
     ],
   };
   const sale = { totalTTC: 500, totalVAT: 0.20 };
-  const res = computeBonusV3(formula, sale);
-  console.log('[DEBUG_BONUS] computeBonusV3 =>', res, '(attendu ≈ 83.33)');
+  const resDemo = computeBonusV3(formula, sale);
+  console.log("[DEBUG_BONUS] computeBonusV3 =>", resDemo, "(attendu ≈ 83.33)");
 }
 
 
@@ -340,12 +350,6 @@ async function sendExpoPush(tokens = [], message = { title: '', body: '', data: 
     }
   }
 }
-
-// Upload mémoire (25 Mo max par PDF)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
-});
 
 function bufferToStream(buffer) {
   const stream = new Readable();
