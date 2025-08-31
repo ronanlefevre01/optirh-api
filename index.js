@@ -513,38 +513,73 @@ app.post("/auth/activate-licence", async (req, res) => {
 
 
 // Login Patron/Employé (hybride bcrypt + scrypt)
-app.post("/auth/login", async (req, res) => {
+function isLicenseValid(lic = {}) {
+  if (!lic) return false;
+  const status = String(lic.status || lic.state || '').toLowerCase();   // active / trial / paid…
+  const ok = ['active','trial','paid','enabled','valid'].includes(status);
+  const until = lic.valid_until || lic.validUntil || null;
+  const notExpired = !until || new Date(until).toISOString() >= new Date().toISOString();
+  return ok && notExpired;
+}
+
+
+app.post('/auth/login', async (req, res) => {
   try {
     const { company_code, email, password } = req.body || {};
-    if (!company_code || !email || !password)
-      return res.status(400).json({ error: "fields required" });
+    if (!company_code || !email || !password) {
+      return res.status(400).json({ error: 'fields required' });
+    }
 
-    const t = ensureTenantDefaults(await tenantLoad(company_code));
-    if (!t) return res.status(404).json({ error: "Unknown company" });
+    // 1) Licence & tenant depuis le JSON (JSONBin)
+    const reg = await loadRegistry();
+    const tJson = reg.tenants?.[company_code];
+    if (!tJson) return res.status(404).json({ error: 'TENANT_NOT_FOUND' });
+    const lic = (reg.licences || reg.licenses || {})[company_code] || null;
+    if (!isLicenseValid(lic)) return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
 
-    const users = t.users || {};
-    const user = Object.values(users).find(
-      (u) => String(u.email).toLowerCase() === String(email).toLowerCase()
+    // 2) Utilisateur dans Postgres (Neon)
+    const { rows } = await pool.query(
+      `SELECT id, email, role, first_name, last_name, password_hash
+         FROM users
+        WHERE tenant_code = $1 AND lower(email) = lower($2)
+        LIMIT 1`,
+      [company_code, email]
     );
-    if (!user) return res.status(401).json({ error: "Invalid credentials" });
+    if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
 
-    // vérif mdp (ton code existant, inchangé)
+    const u = rows[0];
+
+    // 3) Vérif mot de passe: bcrypt (DB) puis fallback legacy scrypt (JSON)
     let ok = false;
-    const empId = String(user.id);
-    const recById   = t?.auth?.byId?.[empId];
-    const recByMail = t?.auth?.byId?.[String(user.email || '').toLowerCase()];
-    const vault = recById || recByMail || null;
+    if (u.password_hash) {
+      ok = await bcrypt.compare(String(password), String(u.password_hash));
+    }
+    if (!ok) {
+      const vaultById   = tJson?.auth?.byId?.[String(u.id)];
+      const vaultByMail = tJson?.auth?.byId?.[String(email).toLowerCase()];
+      const vault = vaultById || vaultByMail || null;
+      if (vault?.password) ok = pwdVerify(vault.password, String(password));
+    }
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
-    if (vault?.password) ok = pwdVerify(vault.password, password);
-    if (!ok && user.password_hash) ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
-
+    // 4) JWT
     const token = jwt.sign(
-      { sub: user.id, company_code, role: user.role },
+      { sub: u.id, role: String(u.role || '').toUpperCase(), company_code },
       JWT_SECRET,
-      { expiresIn: "30d" }
+      { expiresIn: '30d' }
     );
-    return res.json({ token, role: user.role });
+
+    return res.json({
+      token,
+      user: {
+        id: u.id,
+        email: u.email,
+        role: u.role,
+        first_name: u.first_name,
+        last_name: u.last_name,
+        company_code,
+      }
+    });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
