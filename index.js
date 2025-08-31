@@ -436,6 +436,71 @@ app.post("/api/licences", async (req, res) => {
   }
 });
 
+// --- ACTIVATE (Neon) ---
+// Compat: accepte /auth/activate (ancien) et /license/activate (nouveau)
+app.post(['/auth/activate','/license/activate'], async (req, res) => {
+  try {
+    const { licence_key, email, password, first_name, last_name } = req.body || {};
+    if (!licence_key || !email || !password) {
+      return res.status(400).json({ error: 'fields required (licence_key, email, password)' });
+    }
+
+    const code = String(licence_key).trim(); // = tenant_code en DB
+    const mail = String(email).trim();
+
+    // 1) licence en DB
+    const licQ = await pool.query(
+      `SELECT tenant_code, status, valid_until FROM licences WHERE tenant_code = $1`,
+      [code]
+    );
+    if (!licQ.rowCount) return res.status(404).json({ error: 'UNKNOWN_LICENCE' });
+    if (!isDbLicenseValid(licQ.rows[0])) {
+      return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
+    }
+
+    // 2) s'assurer du tenant
+    await pool.query(
+      `INSERT INTO tenants(code, name) VALUES ($1, $2)
+       ON CONFLICT (code) DO NOTHING`,
+      [code, code]
+    );
+
+    // 3) créer / mettre à jour l'OWNER
+    const hash = await bcrypt.hash(String(password), 10);
+
+    const userUp = await pool.query(
+      `INSERT INTO users (tenant_code, email, role, first_name, last_name, password_hash)
+       VALUES ($1, lower($2), 'OWNER', $3, $4, $5)
+       ON CONFLICT (tenant_code, email)
+       DO UPDATE SET role='OWNER',
+                     first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+                     last_name  = COALESCE(EXCLUDED.last_name , users.last_name ),
+                     password_hash = EXCLUDED.password_hash,
+                     updated_at = now()
+       RETURNING id, email, role, first_name, last_name`,
+      [code, mail, first_name || null, last_name || null, hash]
+    );
+    const u = userUp.rows[0];
+
+    // 4) token direct (l’app sera connectée après activation)
+    const token = jwt.sign(
+      { sub: u.id, role: 'OWNER', company_code: code },
+      process.env.JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+
+    return res.json({
+      ok: true,
+      token,
+      tenant_code: code,
+      user: u
+    });
+  } catch (e) {
+    console.error('[activate]', e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 app.get("/api/licences/validate", async (req, res) => {
   try {
     const { key } = req.query;
