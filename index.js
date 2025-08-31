@@ -350,12 +350,7 @@ async function sendExpoPush(tokens = [], message = { title: '', body: '', data: 
   }
 }
 
-function bufferToStream(buffer) {
-  const stream = new Readable();
-  stream.push(buffer);
-  stream.push(null);
-  return stream;
-}
+
 
 
 // ✅ ping sans auth
