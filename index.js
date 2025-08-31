@@ -160,6 +160,16 @@ function bufferToStream(buffer) {
   return r;
 }
 
+function isDbLicenseValid(row) {
+  if (!row) return false;
+  const s = String(row.status || '').toLowerCase();
+  const ok = (s === 'active' || s === 'trial'); // adapte si besoin
+  const nowIso = new Date().toISOString();
+  const notExpired = !row.valid_until || new Date(row.valid_until).toISOString() >= nowIso;
+  return ok && notExpired;
+}
+
+
 // Multer en mémoire pour /announcements/upload
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -513,14 +523,41 @@ app.post("/auth/activate-licence", async (req, res) => {
 
 
 // Login Patron/Employé (hybride bcrypt + scrypt)
-function isLicenseValid(lic = {}) {
-  if (!lic) return false;
-  const status = String(lic.status || lic.state || '').toLowerCase();   // active / trial / paid…
-  const ok = ['active','trial','paid','enabled','valid'].includes(status);
-  const until = lic.valid_until || lic.validUntil || null;
-  const notExpired = !until || new Date(until).toISOString() >= new Date().toISOString();
-  return ok && notExpired;
-}
+
+// Upsert licence (appelé par OptiAdmin)
+app.post('/admin/licences', async (req, res) => {
+  try {
+    const key = req.headers['x-admin-key'] || req.query.key;
+    if (!key || key !== process.env.ADMIN_API_KEY) {
+      return res.status(401).json({ error: 'UNAUTHORIZED' });
+    }
+
+    const { tenant_code, name, status, valid_until, seats = null, meta = null } = req.body || {};
+    if (!tenant_code || !status) return res.status(400).json({ error: 'tenant_code & status required' });
+
+    // s’assurer que le tenant existe
+    await pool.query(
+      `INSERT INTO tenants(code, name) VALUES ($1,$2)
+       ON CONFLICT (code) DO UPDATE SET name = COALESCE(EXCLUDED.name, tenants.name), updated_at=now()`,
+      [tenant_code, name || tenant_code]
+    );
+
+    // upsert licence
+    await pool.query(
+      `INSERT INTO licences (tenant_code, status, valid_until, seats, meta, updated_at)
+       VALUES ($1,$2,$3,$4,$5, now())
+       ON CONFLICT (tenant_code)
+       DO UPDATE SET status=EXCLUDED.status, valid_until=EXCLUDED.valid_until,
+                     seats=EXCLUDED.seats, meta=EXCLUDED.meta, updated_at=now()`,
+      [tenant_code, status, valid_until || null, seats, meta]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
 
 
 app.post('/auth/login', async (req, res) => {
@@ -530,43 +567,35 @@ app.post('/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'fields required' });
     }
 
-    // 1) Licence & tenant depuis le JSON (JSONBin)
-    const reg = await loadRegistry();
-    const tJson = reg.tenants?.[company_code];
-    if (!tJson) return res.status(404).json({ error: 'TENANT_NOT_FOUND' });
-    const lic = (reg.licences || reg.licenses || {})[company_code] || null;
-    if (!isLicenseValid(lic)) return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
+    // 1) licence en DB
+    const licQ = await pool.query(
+      `SELECT tenant_code, status, valid_until FROM licences WHERE tenant_code = $1`,
+      [company_code]
+    );
+    if (!licQ.rowCount || !isDbLicenseValid(licQ.rows[0])) {
+      return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
+    }
 
-    // 2) Utilisateur dans Postgres (Neon)
-    const { rows } = await pool.query(
+    // 2) utilisateur en DB
+    const uQ = await pool.query(
       `SELECT id, email, role, first_name, last_name, password_hash
          FROM users
         WHERE tenant_code = $1 AND lower(email) = lower($2)
         LIMIT 1`,
       [company_code, email]
     );
-    if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!uQ.rowCount) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
 
-    const u = rows[0];
+    const u = uQ.rows[0];
+    if (!u.password_hash) return res.status(401).json({ error: 'NO_PASSWORD_SET' });
 
-    // 3) Vérif mot de passe: bcrypt (DB) puis fallback legacy scrypt (JSON)
-    let ok = false;
-    if (u.password_hash) {
-      ok = await bcrypt.compare(String(password), String(u.password_hash));
-    }
-    if (!ok) {
-      const vaultById   = tJson?.auth?.byId?.[String(u.id)];
-      const vaultByMail = tJson?.auth?.byId?.[String(email).toLowerCase()];
-      const vault = vaultById || vaultByMail || null;
-      if (vault?.password) ok = pwdVerify(vault.password, String(password));
-    }
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(String(password), String(u.password_hash));
+    if (!ok) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
 
-    // 4) JWT
     const token = jwt.sign(
       { sub: u.id, role: String(u.role || '').toUpperCase(), company_code },
-      JWT_SECRET,
-      { expiresIn: '30d' }
+      process.env.JWT_SECRET,
+      { expiresIn: '12h' }
     );
 
     return res.json({
@@ -581,10 +610,27 @@ app.post('/auth/login', async (req, res) => {
       }
     });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
+app.get('/license/status', async (req, res) => {
+  try {
+    const code = String(req.query.code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    const { rows } = await pool.query(`SELECT status, valid_until FROM licences WHERE tenant_code=$1`, [code]);
+    if (!rows.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    const row = rows[0];
+    return res.json({
+      status: row.status,
+      valid_until: row.valid_until,
+      valid: isDbLicenseValid(row)
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
 
 // Changer son email de connexion (EMPLOYEE/OWNER) — Version Neon
 app.post('/auth/change-email', authRequired, async (req, res) => {
