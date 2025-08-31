@@ -107,6 +107,42 @@ export async function requireDrive(res) {
   }
 }
 
+// === Auth JWT (à mettre AVANT les routes) ===
+function getAuthToken(req) {
+  const h = req.headers.authorization || req.headers.Authorization;
+  if (!h) return null;
+  const parts = String(h).trim().split(' ');
+  return parts.length === 2 ? parts[1] : parts[0]; // "Bearer x" ou juste "x"
+}
+
+export function authRequired(req, res, next) {
+  try {
+    const token = getAuthToken(req) || (req.query && req.query.token);
+    if (!token) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+
+    // HS256 avec JWT_SECRET (env)
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+
+    // Normalisation pour ton code existant
+    const role = String(payload.role || payload.user_role || '').toUpperCase();
+    const sub  = payload.sub ?? payload.user_id ?? payload.id ?? payload.uid;
+    const company_code =
+      payload.company_code ?? payload.companyCode ?? payload.tenant_code ?? payload.tenantCode;
+
+    req.user = {
+      ...payload,
+      role,
+      sub,
+      company_code,
+    };
+
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: 'INVALID_TOKEN' });
+  }
+}
+
+
 // ===== Helpers communs =====
 function isPdf(m) { return String(m || "").toLowerCase() === "application/pdf"; }
 function isHttpUrl(u = "") { return /^https?:\/\//i.test(String(u)); }
