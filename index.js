@@ -57,7 +57,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
   .forEach(k => { if (!process.env[k]) console.warn(`[warn] Missing env ${k}`); });
 
 // Rôles OWNER-like (utilisé par beaucoup de routes)
-export const OWNER_LIKE = new Set(["OWNER", "MANAGER"]); // ajuste si besoin
+export const OWNER_LIKE = new Set(["OWNER", "MANAGER", "HR"]); // ajuste si besoin
 
 /** ===== Google Drive (compte de service) ===== */
 const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
@@ -291,7 +291,6 @@ function saveTenant(companyCode, tenant) {
 
 
 // Rôles "patron-like"
-const OWNER_LIKE = new Set(['OWNER', 'HR']);
 
 function requireOwner(req, res, next) {
   const r = String(req?.user?.role || '').toUpperCase();
