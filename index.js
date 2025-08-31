@@ -445,30 +445,34 @@ app.post(['/auth/activate','/license/activate'], async (req, res) => {
       return res.status(400).json({ error: 'fields required (licence_key, email, password)' });
     }
 
-    const code = String(licence_key).trim(); // = tenant_code en DB
+    const codeRaw = String(licence_key).trim();
     const mail = String(email).trim();
 
-    // 1) licence en DB
+    // licence insensible à la casse
     const licQ = await pool.query(
-      `SELECT tenant_code, status, valid_until FROM licences WHERE tenant_code = $1`,
-      [code]
+      `SELECT tenant_code, status, valid_until
+         FROM licences
+        WHERE lower(tenant_code) = lower($1)`,
+      [codeRaw]
     );
     if (!licQ.rowCount) return res.status(404).json({ error: 'UNKNOWN_LICENCE' });
-    if (!isDbLicenseValid(licQ.rows[0])) {
-      return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
-    }
 
-    // 2) s'assurer du tenant
+    const lic = licQ.rows[0];
+    const tenantCode = lic.tenant_code; // 👈 on récupère la casse réelle
+    const okStatus = ['active','trial'].includes(String(lic.status).toLowerCase());
+    const notExpired = !lic.valid_until || new Date(lic.valid_until) >= new Date();
+    if (!okStatus || !notExpired) return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
+
+    // s’assurer du tenant
     await pool.query(
-      `INSERT INTO tenants(code, name) VALUES ($1, $2)
+      `INSERT INTO tenants(code, name) VALUES ($1,$2)
        ON CONFLICT (code) DO NOTHING`,
-      [code, code]
+      [tenantCode, tenantCode]
     );
 
-    // 3) créer / mettre à jour l'OWNER
+    // créer/mettre à jour l'OWNER
     const hash = await bcrypt.hash(String(password), 10);
-
-    const userUp = await pool.query(
+    const up = await pool.query(
       `INSERT INTO users (tenant_code, email, role, first_name, last_name, password_hash)
        VALUES ($1, lower($2), 'OWNER', $3, $4, $5)
        ON CONFLICT (tenant_code, email)
@@ -478,28 +482,23 @@ app.post(['/auth/activate','/license/activate'], async (req, res) => {
                      password_hash = EXCLUDED.password_hash,
                      updated_at = now()
        RETURNING id, email, role, first_name, last_name`,
-      [code, mail, first_name || null, last_name || null, hash]
+      [tenantCode, mail, first_name || null, last_name || null, hash]
     );
-    const u = userUp.rows[0];
+    const u = up.rows[0];
 
-    // 4) token direct (l’app sera connectée après activation)
     const token = jwt.sign(
-      { sub: u.id, role: 'OWNER', company_code: code },
+      { sub: u.id, role: 'OWNER', company_code: tenantCode },
       process.env.JWT_SECRET,
       { expiresIn: '12h' }
     );
 
-    return res.json({
-      ok: true,
-      token,
-      tenant_code: code,
-      user: u
-    });
+    return res.json({ ok: true, token, tenant_code: tenantCode, user: u });
   } catch (e) {
     console.error('[activate]', e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 app.get("/api/licences/validate", async (req, res) => {
   try {
@@ -628,57 +627,50 @@ app.post('/admin/licences', async (req, res) => {
 app.post('/auth/login', async (req, res) => {
   try {
     const { company_code, email, password } = req.body || {};
-    if (!company_code || !email || !password) {
+    if (!company_code || !email || !password)
       return res.status(400).json({ error: 'fields required' });
-    }
 
-    // 1) licence en DB
+    const codeRaw = String(company_code).trim();
+
+    // licence
     const licQ = await pool.query(
-      `SELECT tenant_code, status, valid_until FROM licences WHERE tenant_code = $1`,
-      [company_code]
+      `SELECT tenant_code, status, valid_until FROM licences
+        WHERE lower(tenant_code) = lower($1)`,
+      [codeRaw]
     );
-    if (!licQ.rowCount || !isDbLicenseValid(licQ.rows[0])) {
-      return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
-    }
+    if (!licQ.rowCount) return res.status(404).json({ error: 'Unknown company' });
+    const lic = licQ.rows[0];
+    const tenantCode = lic.tenant_code;
 
-    // 2) utilisateur en DB
     const uQ = await pool.query(
       `SELECT id, email, role, first_name, last_name, password_hash
          FROM users
-        WHERE tenant_code = $1 AND lower(email) = lower($2)
+        WHERE lower(tenant_code) = lower($1)
+          AND lower(email) = lower($2)
         LIMIT 1`,
-      [company_code, email]
+      [tenantCode, email]
     );
-    if (!uQ.rowCount) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+    if (!uQ.rowCount) return res.status(401).json({ error: 'Invalid credentials' });
 
     const u = uQ.rows[0];
     if (!u.password_hash) return res.status(401).json({ error: 'NO_PASSWORD_SET' });
 
     const ok = await bcrypt.compare(String(password), String(u.password_hash));
-    if (!ok) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
     const token = jwt.sign(
-      { sub: u.id, role: String(u.role || '').toUpperCase(), company_code },
+      { sub: u.id, role: String(u.role || '').toUpperCase(), company_code: tenantCode },
       process.env.JWT_SECRET,
       { expiresIn: '12h' }
     );
 
-    return res.json({
-      token,
-      user: {
-        id: u.id,
-        email: u.email,
-        role: u.role,
-        first_name: u.first_name,
-        last_name: u.last_name,
-        company_code,
-      }
-    });
+    return res.json({ token, user: { ...u, company_code: tenantCode } });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 app.get('/license/status', async (req, res) => {
   try {
