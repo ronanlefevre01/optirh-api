@@ -2309,175 +2309,179 @@ app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req,
 });
 
 // 5) Saisie vente (EMPLOYEE/OWNER)
-app.post('/bonusV3/sale', authRequired, bonusRequireEmployeeOrOwner, async (req, res) => {
+// Helpers
+const isOwnerLike = (r) => new Set(['OWNER','HR']).has(String(r||'').toUpperCase());
+const MONTH = () => monthKey(); // tu l'as déjà
+
+// 2.1 Enregistrer une vente (EMPLOYEE ou OWNER)
+app.post('/bonusV3/sale', authRequired, async (req, res) => {
   try {
-    const code = bonusCompanyCodeOf(req);
-    const m = monthKey();
+    const code = String(req.user.company_code || '').trim();
     const empId = Number(req.user.sub);
+    if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
+
+    const m = MONTH();
+    // bloqué si gelé ?
+    const frozen = await pool.query(
+      'SELECT 1 FROM bonus_ledger WHERE tenant_code=$1 AND month=$2 LIMIT 1',
+      [code, m]
+    );
+    if (frozen.rowCount) return res.status(409).json({ error: 'MONTH_FROZEN' });
 
     const { formulaId, sale } = req.body || {};
     if (!formulaId || typeof sale !== 'object') return res.status(400).json({ error: 'BAD_REQUEST' });
 
-    // calcule le bonus côté serveur si tu veux; ici on fait confiance au front ou recalcul:
-    // import computeBonusV3 ...:
-    const formulaQ = await pool.query(
-      `SELECT rules, fields FROM bonus_formulas WHERE tenant_code=$1 AND id=$2`,
+    // récupérer la formule
+    const f = await pool.query(
+      `SELECT id, version, title, fields, rules
+         FROM bonus_formulas WHERE tenant_code=$1 AND id=$2`,
       [code, formulaId]
     );
-    if (!formulaQ.rowCount) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
+    if (!f.rowCount) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
 
-    const bonus = Number(require('./bonusMathV3.js').computeBonusV3(
-      { version:3, rules: formulaQ.rows[0].rules, fields: formulaQ.rows[0].fields },
-      sale
-    ) || 0);
+    const formula = f.rows[0];
+    const bonus = Number(computeBonusV3(formula, sale) || 0);
 
-    const { rows } = await pool.query(
-      `INSERT INTO bonus_entries (tenant_code, month, employee_id, formula_id, sale, bonus)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6)
-       RETURNING id, month, employee_id, formula_id, sale, bonus, at`,
-      [code, m, empId, formulaId, JSON.stringify(sale), bonus]
+    await pool.query(
+      `INSERT INTO bonus_entries (tenant_code, employee_id, month, formula_id, sale, bonus)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [code, empId, m, formulaId, sale, bonus]
     );
 
-    res.json({ success: true, bonus: rows[0].bonus, entry: rows[0] });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+    res.json({ success: true, bonus });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
-// 6) Total employé sur un mois
-app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, async (req, res) => {
+// 2.2 Total de l’utilisateur courant (EMPLOYEE/OWNER)
+app.get('/bonusV3/my-total', authRequired, async (req, res) => {
   try {
-    const code = bonusCompanyCodeOf(req);
+    const code = String(req.user.company_code || '').trim();
     const empId = Number(req.user.sub);
-    const m = String(req.query.month || monthKey());
-
-    const { rows } = await pool.query(
-      `SELECT COALESCE(SUM(bonus),0) AS total, COUNT(*)::int AS count
+    const m = String(req.query.month || MONTH());
+    const rows = await pool.query(
+      `SELECT COALESCE(SUM(bonus),0)::float AS total, COUNT(*)::int AS count
          FROM bonus_entries
-        WHERE tenant_code=$1 AND month=$2 AND employee_id=$3`,
-      [code, m, empId]
+        WHERE tenant_code=$1 AND employee_id=$2 AND month=$3`,
+      [code, empId, m]
     );
-    res.json({ month: m, total: Number(rows[0].total), count: rows[0].count });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+    res.json({ month: m, total: rows.rows[0].total, count: rows.rows[0].count });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
-// 7) Récap patron
-app.get('/bonusV3/summary', authRequired, bonusRequireOwner, async (req, res) => {
+// 2.3 Récap Patron (OWNER) : totaux + dernier gel
+app.get('/bonusV3/summary', authRequired, async (req, res) => {
   try {
-    const code = bonusCompanyCodeOf(req);
-    const m = String(req.query.month || monthKey());
+    if (!isOwnerLike(req.user.role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+    const code = String(req.user.company_code || '').trim();
+    const m = String(req.query.month || MONTH());
 
-    const byEmpQ = await pool.query(
-      `SELECT employee_id, COALESCE(SUM(bonus),0) AS total, COUNT(*)::int AS count
+    const byEmp = await pool.query(
+      `SELECT employee_id, COALESCE(SUM(bonus),0)::float AS total, COUNT(*)::int AS count
          FROM bonus_entries
         WHERE tenant_code=$1 AND month=$2
         GROUP BY employee_id`,
       [code, m]
     );
-    const byFormulaQ = await pool.query(
-      `SELECT formula_id, COALESCE(SUM(bonus),0) AS total
+    const byFormula = await pool.query(
+      `SELECT formula_id, COALESCE(SUM(bonus),0)::float AS total
          FROM bonus_entries
         WHERE tenant_code=$1 AND month=$2
         GROUP BY formula_id`,
       [code, m]
     );
-    const lastFreezeQ = await pool.query(
-      `SELECT frozen_at FROM bonus_freezes
-        WHERE tenant_code=$1 AND month=$2
-        ORDER BY seq DESC
-        LIMIT 1`,
-      [code, m]
-    );
-
-    const byEmployee = {};
-    let totalAll = 0;
-    for (const r of byEmpQ.rows) {
-      byEmployee[r.employee_id] = { total: Number(r.total), count: r.count };
-      totalAll += Number(r.total);
-    }
-    const byFormula = {};
-    for (const r of byFormulaQ.rows) byFormula[r.formula_id] = Number(r.total);
-
-    // snapshot d’affichage de base pour les employés
-    const employeesQ = await pool.query(
-      `SELECT id, email,
-              COALESCE(NULLIF(first_name,''), NULL) AS first_name,
-              COALESCE(NULLIF(last_name,''),  NULL) AS last_name
+    const users = await pool.query(
+      `SELECT id, email, first_name, last_name
          FROM users WHERE tenant_code=$1`,
       [code]
     );
+    const last = await pool.query(
+      `SELECT frozen_at FROM bonus_ledger
+        WHERE tenant_code=$1 AND month=$2 ORDER BY seq DESC LIMIT 1`,
+      [code, m]
+    );
+
     const employees = {};
-    for (const u of employeesQ.rows) {
+    for (const u of users.rows) {
       employees[String(u.id)] = {
-        id: u.id,
-        email: u.email,
-        name: [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || u.email || String(u.id),
+        id: u.id, email: u.email,
+        name: [u.first_name||'', u.last_name||''].join(' ').trim() || u.email
       };
     }
+
+    const be = {};
+    for (const r of byEmp.rows) be[String(r.employee_id)] = { total: r.total, count: r.count };
+
+    const bf = {};
+    for (const r of byFormula.rows) bf[r.formula_id] = r.total;
+
+    const totalAll = Object.values(be).reduce((s, x) => s + (x.total||0), 0);
 
     res.json({
       month: m,
       totalAll,
-      byEmployee,
-      byFormula,
+      byEmployee: be,
+      byFormula: bf,
       employees,
-      lastFrozenAt: lastFreezeQ.rows[0]?.frozen_at || null
+      lastFrozenAt: last.rowCount ? last.rows[0].frozen_at : null
     });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
-// 8) Figé (freeze) — snapshot + purge des entrées du mois (comme avant)
-app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, async (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const m = String(req.query.month || monthKey());
-  const client = await pool.connect();
+// 2.4 Geler le mois (OWNER) : snapshot + purge des saisies du mois
+app.post('/bonusV3/freeze', authRequired, async (req, res) => {
   try {
-    await client.query('BEGIN');
+    if (!isOwnerLike(req.user.role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+    const code = String(req.user.company_code || '').trim();
+    const m = String(req.query.month || MONTH());
 
-    const byEmp = await client.query(
-      `SELECT employee_id, COALESCE(SUM(bonus),0) AS total
+    const byEmp = await pool.query(
+      `SELECT employee_id, COALESCE(SUM(bonus),0)::float AS total
          FROM bonus_entries
         WHERE tenant_code=$1 AND month=$2
         GROUP BY employee_id`,
       [code, m]
     );
-    const byFormula = await client.query(
-      `SELECT formula_id, COALESCE(SUM(bonus),0) AS total
+    const byFormula = await pool.query(
+      `SELECT formula_id, COALESCE(SUM(bonus),0)::float AS total
          FROM bonus_entries
         WHERE tenant_code=$1 AND month=$2
         GROUP BY formula_id`,
       [code, m]
     );
 
-    const be = {};
-    byEmp.rows.forEach(r => { be[r.employee_id] = Number(r.total); });
-    const bf = {};
-    byFormula.rows.forEach(r => { bf[r.formula_id] = Number(r.total); });
+    const empObj = {};
+    byEmp.rows.forEach(r => { empObj[String(r.employee_id)] = r.total; });
+    const formObj = {};
+    byFormula.rows.forEach(r => { formObj[r.formula_id] = r.total; });
 
-    const { rows: seqR } = await client.query(
-      `SELECT COALESCE(MAX(seq),0)+1 AS next_seq
-         FROM bonus_freezes WHERE tenant_code=$1 AND month=$2`,
+    const { rows: seqRow } = await pool.query(
+      `SELECT COALESCE(MAX(seq),0)+1 AS next FROM bonus_ledger WHERE tenant_code=$1 AND month=$2`,
       [code, m]
     );
-    const seq = seqR[0].next_seq;
+    const seq = seqRow[0].next;
 
-    await client.query(
-      `INSERT INTO bonus_freezes (tenant_code, month, seq, frozen_at, by_employee, by_formula)
+    await pool.query(
+      `INSERT INTO bonus_ledger(tenant_code, month, seq, frozen_at, by_employee, by_formula)
        VALUES ($1,$2,$3, now(), $4::jsonb, $5::jsonb)`,
-      [code, m, seq, JSON.stringify(be), JSON.stringify(bf)]
+      [code, m, seq, empObj, formObj]
     );
 
-    // on "redémarre" la période : purge des entrées du mois
-    await client.query(
-      `DELETE FROM bonus_entries WHERE tenant_code=$1 AND month=$2`,
-      [code, m]
-    );
+    // on vide les entrées du mois pour “redémarrer” proprement
+    await pool.query(`DELETE FROM bonus_entries WHERE tenant_code=$1 AND month=$2`, [code, m]);
 
-    await client.query('COMMIT');
-    res.json({ success: true, month: m, seq, frozenAt: new Date().toISOString() });
+    res.json({ success: true, month: m, seq });
   } catch (e) {
-    try { await client.query('ROLLBACK'); } catch {}
     res.status(500).json({ error: String(e.message || e) });
-  } finally { client.release(); }
+  }
 });
+
 
 // 9) Liste des entrées d’un employé (OWNER)
 app.get('/bonusV3/entries', authRequired, bonusRequireOwner, async (req, res) => {
