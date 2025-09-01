@@ -1033,25 +1033,39 @@ app.get("/leaves", authRequired, async (req, res) => {
     }
 
     const sql = `
-      SELECT
-        l.id,
-        l.employee_id,
-        l.employee_id AS user_id,         -- compat front ancien
-        l.type,
-        l.status,
-        l.start_date,
-        l.end_date,
-        l.comment,
-        l.created_at,
-        l.updated_at,
-        u.first_name,
-        u.last_name,
-        u.email
-      FROM leaves l
-      LEFT JOIN users u ON u.id = l.employee_id
-      WHERE ${clauses.join(" AND ")}
-      ORDER BY l.created_at DESC
-    `;
+  SELECT
+    l.id,
+    l.employee_id,
+    l.employee_id AS user_id,                            -- compat
+    l.type,
+    l.status,
+    TO_CHAR(l.start_date,'YYYY-MM-DD') AS start_date,    -- 👈 propre
+    TO_CHAR(l.end_date,'YYYY-MM-DD')   AS end_date,      -- 👈 propre
+    l.comment,
+    l.created_at,
+    l.updated_at,
+
+    u.email,
+
+    -- champs identité, avec fallback sur employee_profiles
+    COALESCE(u.first_name, p.first_name) AS first_name,
+    COALESCE(u.last_name , p.last_name ) AS last_name,
+
+    -- nom d'affichage prêt à l'emploi
+    CASE
+      WHEN LENGTH(TRIM(COALESCE(u.first_name,p.first_name,'') || ' ' || COALESCE(u.last_name,p.last_name,''))) > 0
+        THEN TRIM(COALESCE(u.first_name,p.first_name,'') || ' ' || COALESCE(u.last_name,p.last_name,''))
+      ELSE u.email
+    END AS display_name
+  FROM leaves l
+  LEFT JOIN users u
+    ON u.tenant_code = l.tenant_code AND u.id = l.employee_id
+  LEFT JOIN employee_profiles p
+    ON p.tenant_code = l.tenant_code AND p.user_id = l.employee_id
+  WHERE ${clauses.join(' AND ')}
+  ORDER BY l.created_at DESC
+`;
+
 
     const { rows } = await pool.query(sql, params);
     return res.json({ leaves: rows });
