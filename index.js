@@ -163,10 +163,35 @@ function bufferToStream(buffer) {
 function isDbLicenseValid(row) {
   if (!row) return false;
   const s = String(row.status || '').toLowerCase();
-  const ok = (s === 'active' || s === 'trial'); // adapte si besoin
-  const nowIso = new Date().toISOString();
-  const notExpired = !row.valid_until || new Date(row.valid_until).toISOString() >= nowIso;
+  const ok = (s === 'active' || s === 'trial');
+  const notExpired = !row.valid_until || new Date(row.valid_until) >= new Date();
   return ok && notExpired;
+}
+
+async function provisionLegacyTenantFromDB(code, dbUser) {
+  try {
+    await withRegistryUpdate((next) => {
+      const t0 = next.tenants?.[code] || null;
+      const t  = ensureTenantDefaults(t0 || { code, name: code, users: {} });
+
+      const uid = String(dbUser.id);
+      t.users = t.users || {};
+      t.users[uid] = {
+        id: dbUser.id,
+        email: dbUser.email,
+        first_name: dbUser.first_name || '',
+        last_name:  dbUser.last_name  || '',
+        role: String(dbUser.role || 'EMPLOYEE').toUpperCase(),
+        updated_at: new Date().toISOString(),
+      };
+
+      t.updated_at = new Date().toISOString();
+      next.tenants[code] = t;
+      return true;
+    });
+  } catch (e) {
+    console.warn('[legacy-bridge] skip', e?.message || e);
+  }
 }
 
 
