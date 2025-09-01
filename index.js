@@ -431,6 +431,84 @@ app.get('/ping', (_req, res) => res.type('text').send('pong'));
 /** ===== HEALTH ===== */
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
+// --- Activation OWNER 100% Neon (utilise aussi meta.contact_email si email absent)
+async function activateOwnerNeon(req, res) {
+  try {
+    const { licence_key, email, password, first_name, last_name } = req.body || {};
+    if (!licence_key || !password) {
+      return res.status(400).json({ error: 'fields required (licence_key, password)' });
+    }
+
+    const codeRaw = String(licence_key).trim();
+
+    // licence depuis Neon (⚠️ on récupère aussi meta)
+    const licQ = await pool.query(
+      `SELECT tenant_code, status, valid_until, meta
+         FROM licences
+        WHERE lower(tenant_code) = lower($1)`,
+      [codeRaw]
+    );
+    if (!licQ.rowCount) return res.status(404).json({ error: 'UNKNOWN_LICENCE' });
+
+    const lic = licQ.rows[0];
+    const tenantCode = lic.tenant_code;
+
+    const s = String(lic.status || '').toLowerCase();
+    const okStatus   = (s === 'active' || s === 'trial');
+    const notExpired = !lic.valid_until || new Date(lic.valid_until) >= new Date();
+    if (!okStatus || !notExpired) {
+      return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
+    }
+
+    // email OWNER : body.email sinon meta.contact_email
+    const contactEmail = lic?.meta?.contact_email ? String(lic.meta.contact_email) : null;
+    const ownerEmail = String((email || contactEmail || '')).trim().toLowerCase();
+    if (!ownerEmail) return res.status(400).json({ error: 'email required' });
+
+    // s’assurer du tenant
+    await pool.query(
+      `INSERT INTO tenants(code, name) VALUES ($1,$2)
+       ON CONFLICT (code) DO NOTHING`,
+      [tenantCode, tenantCode]
+    );
+
+    // créer / upsert OWNER
+    const hash = await bcrypt.hash(String(password), 10);
+    const up = await pool.query(
+      `INSERT INTO users (tenant_code, email, role, first_name, last_name, password_hash)
+       VALUES ($1, $2, 'OWNER', $3, $4, $5)
+       ON CONFLICT (tenant_code, email)
+       DO UPDATE SET role='OWNER',
+                     first_name   = COALESCE(EXCLUDED.first_name, users.first_name),
+                     last_name    = COALESCE(EXCLUDED.last_name , users.last_name ),
+                     password_hash= EXCLUDED.password_hash,
+                     updated_at   = now()
+       RETURNING id, email, role, first_name, last_name`,
+      [tenantCode, ownerEmail, first_name || null, last_name || null, hash]
+    );
+    const u = up.rows[0];
+
+    // Pont JSONBin pour les écrans legacy
+    try { await provisionLegacyTenantFromDB(tenantCode, u); } catch {}
+
+    const token = jwt.sign(
+      { sub: u.id, role: 'OWNER', company_code: tenantCode },
+      process.env.JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+
+    return res.json({ ok: true, token, tenant_code: tenantCode, user: u });
+  } catch (e) {
+    console.error('[activateOwnerNeon]', e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+app.post(
+  ['/auth/activate', '/license/activate', '/auth/activate-licence'],
+  activateOwnerNeon
+);
+
 /** ===== LICENCES ===== */
 app.post("/api/licences", async (req, res) => {
   try {
@@ -461,84 +539,33 @@ app.post("/api/licences", async (req, res) => {
   }
 });
 
-// --- ACTIVATE (Neon) ---
-// Compat: accepte /auth/activate (ancien) et /license/activate (nouveau)
-app.post(['/auth/activate','/license/activate'], async (req, res) => {
-  try {
-    const { licence_key, email, password, first_name, last_name } = req.body || {};
-    if (!licence_key || !email || !password) {
-      return res.status(400).json({ error: 'fields required (licence_key, email, password)' });
-    }
-
-    const codeRaw = String(licence_key).trim();
-    const mail = String(email).trim();
-
-    // licence insensible à la casse
-    const licQ = await pool.query(
-      `SELECT tenant_code, status, valid_until
-         FROM licences
-        WHERE lower(tenant_code) = lower($1)`,
-      [codeRaw]
-    );
-    if (!licQ.rowCount) return res.status(404).json({ error: 'UNKNOWN_LICENCE' });
-
-    const lic = licQ.rows[0];
-    const tenantCode = lic.tenant_code; // 👈 on récupère la casse réelle
-    const okStatus = ['active','trial'].includes(String(lic.status).toLowerCase());
-    const notExpired = !lic.valid_until || new Date(lic.valid_until) >= new Date();
-    if (!okStatus || !notExpired) return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
-
-    // s’assurer du tenant
-    await pool.query(
-      `INSERT INTO tenants(code, name) VALUES ($1,$2)
-       ON CONFLICT (code) DO NOTHING`,
-      [tenantCode, tenantCode]
-    );
-
-    // créer/mettre à jour l'OWNER
-    const hash = await bcrypt.hash(String(password), 10);
-    const up = await pool.query(
-      `INSERT INTO users (tenant_code, email, role, first_name, last_name, password_hash)
-       VALUES ($1, lower($2), 'OWNER', $3, $4, $5)
-       ON CONFLICT (tenant_code, email)
-       DO UPDATE SET role='OWNER',
-                     first_name = COALESCE(EXCLUDED.first_name, users.first_name),
-                     last_name  = COALESCE(EXCLUDED.last_name , users.last_name ),
-                     password_hash = EXCLUDED.password_hash,
-                     updated_at = now()
-       RETURNING id, email, role, first_name, last_name`,
-      [tenantCode, mail, first_name || null, last_name || null, hash]
-    );
-    const u = up.rows[0];
-
-    const token = jwt.sign(
-      { sub: u.id, role: 'OWNER', company_code: tenantCode },
-      process.env.JWT_SECRET,
-      { expiresIn: '12h' }
-    );
-
-    return res.json({ ok: true, token, tenant_code: tenantCode, user: u });
-  } catch (e) {
-    console.error('[activate]', e);
-    return res.status(500).json({ error: String(e.message || e) });
-  }
-});
 
 
 app.get("/api/licences/validate", async (req, res) => {
   try {
-    const { key } = req.query;
+    const key = String(req.query.key || '').trim();
     if (!key) return res.status(400).json({ error: "key required" });
-    const reg = await loadRegistry();
-    const lic = reg.licences?.[key];
-    if (!lic) return res.status(404).json({ error: "Unknown licence" });
-    if (lic.status !== "active") return res.status(403).json({ error: "Licence inactive" });
+
+    const { rows } = await pool.query(
+      `SELECT tenant_code, status, valid_until, meta
+         FROM licences
+        WHERE lower(tenant_code) = lower($1)`,
+      [key]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Unknown licence" });
+
+    const lic = rows[0];
+    const s = String(lic.status || '').toLowerCase();
+    if (!(s === 'active' || s === 'trial')) return res.status(403).json({ error: "Licence inactive" });
 
     const safe = {
-      company: lic.company,
-      company_code: lic.company_code,
-      modules: lic.modules,
-      expires_at: lic.expires_at,
+      company: {
+        name: lic?.meta?.company_name || null,
+        contact_email: lic?.meta?.contact_email || null,
+      },
+      company_code: lic.tenant_code,
+      modules: lic?.meta?.modules || null,
+      expires_at: lic.valid_until || null,
     };
     return res.json({ licence: safe, sig: sign(safe) });
   } catch (e) {
@@ -546,70 +573,8 @@ app.get("/api/licences/validate", async (req, res) => {
   }
 });
 
+
 /** ===== AUTH / TENANT ===== */
-
-// Patron active la licence → création du tenant + compte OWNER
-app.post("/auth/activate-licence", async (req, res) => {
-  try {
-    const { licence_key, admin_email, admin_password } = req.body || {};
-    if (!licence_key || !admin_email || !admin_password)
-      return res.status(400).json({ error: "fields required" });
-
-    // 1) Lire la licence sur JSONBin (inchangé)
-    const reg = await loadRegistry();
-    const lic = reg.licences?.[licence_key];
-    if (!lic || lic.status !== "active") return res.status(403).json({ error: "Invalid licence" });
-
-    const code = lic.company_code;
-
-    // 2) Vérifier si le tenant existe déjà dans Neon
-    if (await tenantLoad(code)) return res.status(409).json({ error: "Licence already activated" });
-
-    // 3) Créer le tenant dans Neon
-    const now = new Date().toISOString();
-    const hash = await bcrypt.hash(admin_password, 10);
-
-    const tenantDoc = ensureTenantDefaults({
-      company: {
-        name: lic.company.name,
-        siret: lic.company.siret || null,
-        contact_email: lic.company.contact_email || null,
-        contact_firstname: lic.company.contact_firstname || null,
-        contact_lastname: lic.company.contact_lastname || null,
-        created_at: now,
-      },
-      licence_key,
-      users: {
-        "1": {
-          id: 1,
-          role: "OWNER",
-          email: admin_email,
-          password_hash: hash,
-          first_name: lic.company.contact_firstname || null,
-          last_name: lic.company.contact_lastname || null,
-          created_at: now,
-        },
-      },
-      next_user_id: 2,
-      // le reste sera complété par ensureTenantDefaults
-    });
-
-    await tenantUpsert(code, tenantDoc);
-
-    // 4) (optionnel) marquer la licence comme activée côté JSONBin
-    await withRegistryUpdate((next) => {
-      if (!next.licences?.[licence_key]) throw new Error("Licence disappeared");
-      next.licences[licence_key].activated_at = now;
-      next.updated_at = now;
-      return true;
-    });
-
-    return res.status(201).json({ ok: true, company_code: code });
-  } catch (e) {
-    return res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
 
 // Login Patron/Employé (hybride bcrypt + scrypt)
 
@@ -657,9 +622,10 @@ app.post('/auth/login', async (req, res) => {
 
     const codeRaw = String(company_code).trim();
 
-    // licence
+    // Licence + contrôle statut/expiration + meta (optionnel)
     const licQ = await pool.query(
-      `SELECT tenant_code, status, valid_until FROM licences
+      `SELECT tenant_code, status, valid_until, meta
+         FROM licences
         WHERE lower(tenant_code) = lower($1)`,
       [codeRaw]
     );
@@ -667,6 +633,14 @@ app.post('/auth/login', async (req, res) => {
     const lic = licQ.rows[0];
     const tenantCode = lic.tenant_code;
 
+    const s = String(lic.status || '').toLowerCase();
+    const okStatus   = (s === 'active' || s === 'trial');
+    const notExpired = !lic.valid_until || new Date(lic.valid_until) >= new Date();
+    if (!okStatus || !notExpired) {
+      return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
+    }
+
+    // User
     const uQ = await pool.query(
       `SELECT id, email, role, first_name, last_name, password_hash
          FROM users
@@ -683,6 +657,9 @@ app.post('/auth/login', async (req, res) => {
     const ok = await bcrypt.compare(String(password), String(u.password_hash));
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
+    // ⚠️ Pont legacy JSONBin (évite “tenant not found” tant que tout n’est pas migré)
+    try { await provisionLegacyTenantFromDB(tenantCode, u); } catch {}
+
     const token = jwt.sign(
       { sub: u.id, role: String(u.role || '').toUpperCase(), company_code: tenantCode },
       process.env.JWT_SECRET,
@@ -695,6 +672,7 @@ app.post('/auth/login', async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 app.get('/license/status', async (req, res) => {
@@ -717,159 +695,111 @@ app.get('/license/status', async (req, res) => {
 // Changer son email de connexion (EMPLOYEE/OWNER) — Version Neon
 app.post('/auth/change-email', authRequired, async (req, res) => {
   try {
+    const code = String(req.user.company_code || '').trim();
+    const uid  = Number(req.user.sub);
     const { currentPassword, newEmail } = req.body || {};
-    const code = req.user.company_code;
+
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'BAD_USER' });
 
     const email = String(newEmail || '').trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: 'BAD_EMAIL' });
     }
 
-    // 1) Charger le tenant depuis Neon
-    const t0 = await tenantLoad(code);
-    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
-    const t  = ensureTenantDefaults(t0);
+    // 1) Charger l'utilisateur dans CE tenant
+    const cur = await pool.query(
+      'SELECT id, email, password_hash FROM users WHERE tenant_code = $1 AND id = $2',
+      [code, uid]
+    );
+    if (!cur.rowCount) return res.status(404).json({ error: 'User not found' });
+    const u = cur.rows[0];
 
-    const uid  = String(req.user.sub);
-    const user = t.users?.[uid];
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    // 2) Vérifier le mot de passe (scrypt d’abord, puis bcrypt)
-    const vault = t?.auth?.byId?.[uid] || t?.auth?.byId?.[String(user.email || '').toLowerCase()];
-    let ok = false;
-    if (vault?.password) ok = pwdVerify(vault.password, String(currentPassword || ''));
-    if (!ok && user.password_hash) ok = await bcrypt.compare(String(currentPassword || ''), user.password_hash);
+    // 2) Vérifier le mot de passe (bcrypt)
+    const ok = u.password_hash
+      ? await bcrypt.compare(String(currentPassword || ''), String(u.password_hash))
+      : false;
     if (!ok) return res.status(400).json({ error: 'BAD_CURRENT_PASSWORD' });
 
-    // 3) Unicité de l'email
-    const already = Object.values(t.users || {}).some(
-      (u) => String(u.email || '').toLowerCase() === email && String(u.id) !== uid
+    // 3) Unicité de l'email dans le tenant
+    const exists = await pool.query(
+      'SELECT 1 FROM users WHERE tenant_code=$1 AND lower(email)=lower($2) AND id<>$3 LIMIT 1',
+      [code, email, uid]
     );
-    if (already) return res.status(409).json({ error: 'EMAIL_TAKEN' });
+    if (exists.rowCount) return res.status(409).json({ error: 'EMAIL_TAKEN' });
 
-    const oldEmail = String(user.email || '').toLowerCase();
+    // 4) MAJ en base
+    const up = await pool.query(
+      `UPDATE users
+          SET email=$1, updated_at=now()
+        WHERE tenant_code=$2 AND id=$3
+        RETURNING id, email, role, first_name, last_name, updated_at`,
+      [email, code, uid]
+    );
 
-    // 4) Écrire la nouvelle valeur dans Neon (mutation atomique)
-    await tenantUpdate(code, (tt) => {
-      const now = new Date().toISOString();
-      ensureTenantDefaults(tt);
-
-      if (!tt.users?.[uid]) throw new Error('User not found');
-
-      // MAJ user
-      tt.users[uid].email = email;
-      tt.updated_at = now;
-
-      // MAJ profils (si présents)
-      tt.employee_profiles = tt.employee_profiles || { byId: {} };
-      const pById = tt.employee_profiles.byId;
-
-      // synchroniser profil sous uid et ancienne clé email si elle existe
-      for (const key of [uid, oldEmail]) {
-        if (key && pById[key]) {
-          pById[key] = { ...pById[key], email, updatedAt: now };
-        }
-      }
-      // créer si absent
-      if (!pById[uid]) pById[uid] = { email, updatedAt: now };
-      // nettoyer l’ancienne entrée email si différente
-      if (oldEmail && oldEmail !== email && pById[oldEmail]) delete pById[oldEmail];
-
-      return tt; // ← tenantUpdate upserte tt vers Neon
-    });
-
-    return res.json({ success: true, email });
+    return res.json({ success: true, email: up.rows[0].email, user: up.rows[0] });
   } catch (e) {
-    const msg = String(e?.message || e);
-    if (msg.includes('User not found'))   return res.status(404).json({ error: 'User not found' });
-    if (msg.includes('Tenant not found')) return res.status(404).json({ error: 'Tenant not found' });
-    return res.status(500).json({ error: msg });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
-
 
 /** ===== USERS ===== */
 
 app.post("/users/invite", authRequired, async (req, res) => {
   try {
     // Seuls OWNER ou HR peuvent inviter
-    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-      return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || "").toUpperCase())) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    const temp_password = String(req.body?.temp_password || "").trim();
-    const first_name = req.body?.first_name ?? null;
-    const last_name  = req.body?.last_name  ?? null;
+    const code         = String(req.user.company_code || "").trim();
+    const email        = String(req.body?.email || "").trim().toLowerCase();
+    const tempPassword = String(req.body?.temp_password || "").trim();
+    const first_name   = req.body?.first_name ?? null;
+    const last_name    = req.body?.last_name  ?? null;
 
     // Normalisation & validation du rôle
     const rawRole = String(req.body?.role || "EMPLOYEE").toUpperCase();
+    // Compat : MANAGER => HR
+    let role = rawRole === "MANAGER" ? "HR" : rawRole;
 
-    // Support legacy : si "MANAGER" arrive encore du front, on le traite comme HR (admin).
-    let role = rawRole === 'MANAGER' ? 'HR' : rawRole;
-
-    // Rôles autorisés pour création (tu peux retirer 'OWNER' si tu ne veux pas inviter un autre patron)
-    const allowedRoles = new Set(['EMPLOYEE', 'HR', 'OWNER']);
+    // Rôles autorisés (retire 'OWNER' si tu ne veux pas inviter d'autres owners)
+    const allowedRoles = new Set(["EMPLOYEE", "HR", "OWNER"]);
     if (!allowedRoles.has(role)) {
-      return res.status(400).json({ error: 'BAD_ROLE' });
+      return res.status(400).json({ error: "BAD_ROLE" });
     }
 
+    // Validations
     if (!email) return res.status(400).json({ error: "email requis" });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: "email invalide" });
     }
-    if (!temp_password) return res.status(400).json({ error: "temp_password requis" });
+    if (!tempPassword) return res.status(400).json({ error: "temp_password requis" });
 
-    let created = null;
+    // Hash du mot de passe temporaire
+    const hash = await bcrypt.hash(String(tempPassword), 10);
 
-    await withRegistryUpdate(async (next) => {
-      const code = req.user.company_code;
-      const t = next.tenants?.[code];
-      if (!t) throw new Error("Tenant not found");
+    // Insert en base — contrainte unique: (tenant_code, email)
+    // On ne met PAS de ON CONFLICT ici pour détecter proprement le 23505.
+    const { rows } = await pool.query(
+      `INSERT INTO users (tenant_code, email, role, first_name, last_name, password_hash)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, email, role, first_name, last_name, is_active, created_at, updated_at`,
+      [code, email, role, first_name || null, last_name || null, hash]
+    );
 
-      const exists = Object.values(t.users || {}).some(
-        u => String(u.email || '').toLowerCase() === email
-      );
-      if (exists) throw new Error("User already exists");
-
-      const id = t.next_user_id || 1;
-      const hash = await bcrypt.hash(temp_password, 10);
-      const now = new Date().toISOString();
-
-      t.users = t.users || {};
-      t.users[String(id)] = {
-        id,
-        role,              // 'EMPLOYEE' | 'HR' | 'OWNER'
-        email,
-        password_hash: hash,
-        first_name: first_name || null,
-        last_name: last_name || null,
-        created_at: now,
-      };
-      t.next_user_id = id + 1;
-      t.updated_at = now;
-
-      created = {
-        id,
-        email,
-        role,
-        first_name: first_name || null,
-        last_name: last_name || null,
-        created_at: now
-      };
-
-      next.tenants[code] = t;
-      return true;
-    });
-
-    return res.status(201).json({ ok: true, user: created });
+    return res.status(201).json({ ok: true, user: rows[0] });
   } catch (e) {
-    const msg = String(e.message || e);
-    if (msg.includes("User already exists")) return res.status(409).json({ error: msg });
-    if (msg.includes("Tenant not found"))   return res.status(404).json({ error: msg });
+    // 23505 = violation contrainte unique -> email déjà pris pour ce tenant
+    if (e && e.code === "23505") {
+      return res.status(409).json({ error: "EMAIL_ALREADY_EXISTS" });
+    }
+    const msg = String(e?.message || e);
     return res.status(500).json({ error: msg });
   }
 });
+
 
 
 app.get("/users", authRequired, async (req, res) => {
@@ -1165,25 +1095,72 @@ app.post('/leaves', authRequired, async (req, res) => {
 // Lister les congés
 app.get("/leaves", authRequired, async (req, res) => {
   try {
-    const { status, all } = req.query;
-    const reg = await loadRegistry();
-    const t = reg.tenants?.[req.user.company_code];
-    if (!t) return res.status(404).json({ error: "Tenant not found" });
+    const code = String(req.user.company_code || "").trim();
+    if (!code) return res.status(400).json({ error: "TENANT_CODE_MISSING" });
 
-    let list = t.leaves || [];
-    if (req.user.role === "OWNER") {
-      // Compat: status=all ou all=true => renvoyer tout
-   const wantAll = String(all || '').toLowerCase() === 'true' || String(status || '').toLowerCase() === 'all';
-   if (!wantAll && status) list = list.filter(l => l.status === status);
-    } else {
-      list = list.filter(l => Number(l.user_id) === Number(req.user.sub));
+    const isOwner = String(req.user.role || "").toUpperCase() === "OWNER";
+    const { status, all } = req.query;
+
+    // Compat: status=all ou all=true => ne pas filtrer par statut
+    const wantAll =
+      isOwner &&
+      (String(all || "").toLowerCase() === "true" ||
+       String(status || "").toLowerCase() === "all");
+
+    // WHERE dynamique
+    const clauses = ["l.tenant_code = $1"];
+    const params = [code];
+    let i = 2;
+
+    // Employé : ne voir que ses propres demandes
+    if (!isOwner) {
+      clauses.push(`l.employee_id = $${i++}`);
+      params.push(Number(req.user.sub));
     }
-    list = [...list].sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
-    return res.json({ leaves: list });
+
+    // Filtre par statut si demandé (et pas "all")
+    if (!wantAll && status) {
+      const m = {
+        pending:   "PENDING",
+        approved:  "APPROVED",
+        rejected:  "REJECTED",
+        cancelled: "CANCELLED",
+        canceled:  "CANCELLED",
+      };
+      const norm = m[String(status).toLowerCase()] || String(status).toUpperCase();
+      clauses.push(`l.status = $${i++}`);
+      params.push(norm);
+    }
+
+    const sql = `
+      SELECT
+        l.id,
+        l.employee_id,
+        l.employee_id AS user_id,         -- compat front ancien
+        l.type,
+        l.status,
+        l.start_date,
+        l.end_date,
+        l.comment,
+        l.created_at,
+        l.updated_at,
+        u.first_name,
+        u.last_name,
+        u.email
+      FROM leaves l
+      LEFT JOIN users u ON u.id = l.employee_id
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY l.created_at DESC
+    `;
+
+    const { rows } = await pool.query(sql, params);
+    return res.json({ leaves: rows });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 /** ===== DEVICES (Expo push tokens) ===== */
 app.post('/devices/register', authRequired, async (req, res) => {
@@ -2342,106 +2319,6 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
 
 
 /** ===== SETTINGS (réglages d’entreprise) ===== */
-// Récupérer les réglages (mode de décompte, etc.)
-app.get('/settings', authRequired, async (req, res) => {
-  try {
-    const code = String(req.user.company_code || '').trim();
-    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
-
-    const { rows } = await pool.query(
-      'SELECT key, value FROM settings WHERE tenant_code = $1',
-      [code]
-    );
-
-    // map rows -> objet { key: value }
-    const settings = {};
-    for (const r of rows) settings[r.key] = r.value;
-
-    // défaut minimal si absent
-    if (settings.leave_count_mode == null) settings.leave_count_mode = 'ouvres';
-
-    return res.json({ settings });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
-// Mettre à jour les réglages (OWNER uniquement)
-app.patch('/settings', authRequired, async (req, res) => {
-  try {
-    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    const code = String(req.user.company_code || '').trim();
-    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
-
-    const { leave_count_mode, workweek, show_employee_bonuses } = req.body || {};
-
-    // validations
-    if (leave_count_mode && !['ouvres', 'ouvrables'].includes(leave_count_mode)) {
-      return res.status(400).json({ error: 'leave_count_mode must be "ouvres" or "ouvrables"' });
-    }
-    if (workweek !== undefined) {
-      if (!Array.isArray(workweek)) {
-        return res.status(400).json({ error: 'workweek must be an array of numbers (0..6)' });
-      }
-      // nettoie: nombres entiers 0..6, uniques, triés
-      const ww = Array.from(new Set(workweek.map(Number)))
-        .filter(n => Number.isInteger(n) && n >= 0 && n <= 6)
-        .sort((a,b) => a - b);
-      if (ww.length !== workweek.length) {
-        return res.status(400).json({ error: 'workweek must contain only unique integers in 0..6' });
-      }
-    }
-    if (show_employee_bonuses !== undefined && typeof show_employee_bonuses !== 'boolean') {
-      return res.status(400).json({ error: 'show_employee_bonuses must be boolean' });
-    }
-
-    // upsert des clés présentes
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const upsert = async (k, v) => {
-        await client.query(
-          `INSERT INTO settings (tenant_code, key, value, updated_at)
-           VALUES ($1, $2, $3::jsonb, now())
-           ON CONFLICT (tenant_code, key)
-           DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-          [code, k, JSON.stringify(v)]
-        );
-      };
-
-      if (leave_count_mode !== undefined) await upsert('leave_count_mode', leave_count_mode);
-      if (workweek !== undefined)         await upsert('workweek', workweek);
-      if (show_employee_bonuses !== undefined) await upsert('show_employee_bonuses', !!show_employee_bonuses);
-
-      // renvoie l’état complet après MAJ
-      const { rows } = await client.query(
-        'SELECT key, value FROM settings WHERE tenant_code = $1',
-        [code]
-      );
-      await client.query('COMMIT');
-
-      const settings = {};
-      for (const r of rows) settings[r.key] = r.value;
-      if (settings.leave_count_mode == null) settings.leave_count_mode = 'ouvres';
-
-      return res.json({ ok: true, settings });
-    } catch (e) {
-      try { await client.query('ROLLBACK'); } catch {}
-      throw e;
-    } finally {
-      client.release();
-    }
-  } catch (e) {
-    console.error(e);
-    const msg = String(e.message || e);
-    return res.status(500).json({ error: msg });
-  }
-});
-
 
 // =========================== BONUS V3 — HELPERS ===========================
 
@@ -3414,9 +3291,6 @@ app.post('/legal/accept', authRequired, async (req, res) => {
   }
 });
 
-
-// health simple (pas d'auth)
-app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
 // '0.0.0.0' = écoute toutes interfaces (utile en local et sur Render)
