@@ -1001,7 +1001,7 @@ app.get("/leaves", authRequired, async (req, res) => {
     const isOwner = String(req.user.role || "").toUpperCase() === "OWNER";
     const { status, all } = req.query;
 
-    // Compat: status=all ou all=true => ne pas filtrer par statut
+    // Compat: status=all ou all=true => ne pas filtrer par statut (Owner uniquement)
     const wantAll =
       isOwner &&
       (String(all || "").toLowerCase() === "true" ||
@@ -1033,39 +1033,32 @@ app.get("/leaves", authRequired, async (req, res) => {
     }
 
     const sql = `
-  SELECT
-    l.id,
-    l.employee_id,
-    l.employee_id AS user_id,                            -- compat
-    l.type,
-    l.status,
-    TO_CHAR(l.start_date,'YYYY-MM-DD') AS start_date,    -- 👈 propre
-    TO_CHAR(l.end_date,'YYYY-MM-DD')   AS end_date,      -- 👈 propre
-    l.comment,
-    l.created_at,
-    l.updated_at,
+      SELECT
+        l.id,
+        l.employee_id,
+        l.employee_id AS user_id,                    -- compat ancien front
+        l.type,
+        l.status,
+        TO_CHAR(l.start_date,'YYYY-MM-DD') AS start_date,  -- propre (string)
+        TO_CHAR(l.end_date,'YYYY-MM-DD')   AS end_date,    -- propre (string)
+        l.comment,
+        l.created_at,
+        l.updated_at,
 
-    u.email,
-
-    -- champs identité, avec fallback sur employee_profiles
-    COALESCE(u.first_name, p.first_name) AS first_name,
-    COALESCE(u.last_name , p.last_name ) AS last_name,
-
-    -- nom d'affichage prêt à l'emploi
-    CASE
-      WHEN LENGTH(TRIM(COALESCE(u.first_name,p.first_name,'') || ' ' || COALESCE(u.last_name,p.last_name,''))) > 0
-        THEN TRIM(COALESCE(u.first_name,p.first_name,'') || ' ' || COALESCE(u.last_name,p.last_name,''))
-      ELSE u.email
-    END AS display_name
-  FROM leaves l
-  LEFT JOIN users u
-    ON u.tenant_code = l.tenant_code AND u.id = l.employee_id
-  LEFT JOIN employee_profiles p
-    ON p.tenant_code = l.tenant_code AND p.user_id = l.employee_id
-  WHERE ${clauses.join(' AND ')}
-  ORDER BY l.created_at DESC
-`;
-
+        u.email,
+        u.first_name,
+        u.last_name,
+        CASE
+          WHEN LENGTH(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''))) > 0
+            THEN TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''))
+          ELSE u.email
+        END AS display_name
+      FROM leaves l
+      LEFT JOIN users u
+        ON u.tenant_code = l.tenant_code AND u.id = l.employee_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY l.created_at DESC
+    `;
 
     const { rows } = await pool.query(sql, params);
     return res.json({ leaves: rows });
@@ -1105,22 +1098,50 @@ app.post('/devices/register', authRequired, async (req, res) => {
 app.get('/leaves/pending', authRequired, async (req, res) => {
   try {
     const role = String(req.user.role || '').toUpperCase();
-    if (!['OWNER', 'HR'].includes(role)) return res.status(403).json({ error: 'Forbidden' });
+    if (!['OWNER', 'HR'].includes(role)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
 
     const code = String(req.user.company_code || '').trim();
-    const { rows } = await pool.query(
-      `SELECT l.*, u.first_name, u.last_name, u.email
-         FROM leaves l
-         LEFT JOIN users u ON u.id = l.employee_id
-        WHERE l.tenant_code = $1 AND l.status = 'PENDING'
-        ORDER BY l.created_at DESC`,
-      [code]
-    );
-    res.json({ leaves: rows });
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
+    const sql = `
+      SELECT
+        l.id,
+        l.employee_id,
+        l.type,
+        l.status,
+        TO_CHAR(l.start_date,'YYYY-MM-DD') AS start_date,
+        TO_CHAR(l.end_date,'YYYY-MM-DD')   AS end_date,
+        l.comment,
+        l.created_at,
+        l.updated_at,
+
+        u.email,
+        u.first_name,
+        u.last_name,
+        CASE
+          WHEN LENGTH(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''))) > 0
+            THEN TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''))
+          ELSE u.email
+        END AS display_name
+      FROM leaves l
+      LEFT JOIN users u
+        ON u.tenant_code = l.tenant_code
+       AND u.id          = l.employee_id
+      WHERE l.tenant_code = $1
+        AND l.status = 'PENDING'
+      ORDER BY l.created_at DESC
+    `;
+
+    const { rows } = await pool.query(sql, [code]);
+    return res.json({ leaves: rows });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 // ————————————————————————————————
