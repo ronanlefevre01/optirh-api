@@ -3177,18 +3177,38 @@ app.get('/legal/status', authRequired, async (req, res) => {
     if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
     if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'BAD_USER' });
 
+    // helper: force https:// si l'URL ne commence pas par http
+    const normUrl = (u) => {
+      const s = String(u || '').trim();
+      if (!s) return null;
+      return /^https?:\/\//i.test(s) ? s : `https://${s}`;
+    };
+
     // 1) versions & urls depuis settings
     const { rows: srows } = await pool.query(
       `SELECT key, value FROM settings
         WHERE tenant_code=$1 AND key IN ('legal_versions','legal_urls')`,
       [code]
     );
+
     let versions = { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
     let urls = {};
     for (const r of srows) {
       if (r.key === 'legal_versions' && r.value) versions = { ...versions, ...r.value };
-      if (r.key === 'legal_urls' && r.value) urls = { ...urls, ...r.value };
+      if (r.key === 'legal_urls' && r.value)     urls     = { ...urls,     ...r.value };
     }
+
+    // ✅ Fallback vers les ENV si manquants en base
+    if (!urls.cgu     && process.env.LEGAL_CGU_URL)         urls.cgu     = process.env.LEGAL_CGU_URL;
+    if (!urls.cgv     && process.env.LEGAL_CGV_URL)         urls.cgv     = process.env.LEGAL_CGV_URL;
+    if (!urls.privacy && process.env.LEGAL_PRIVACY_URL)     urls.privacy = process.env.LEGAL_PRIVACY_URL;
+
+    // sanitiser pour garantir des liens cliquables
+    urls = {
+      cgu:     normUrl(urls.cgu),
+      cgv:     normUrl(urls.cgv),
+      privacy: normUrl(urls.privacy),
+    };
 
     // 2) acceptations utilisateur
     const { rows: acc } = await pool.query(
@@ -3203,10 +3223,10 @@ app.get('/legal/status', authRequired, async (req, res) => {
     const hasCGV     = !!(accMap.cgv     && accMap.cgv.version     === versions.cgv);
     const hasPrivacy = !!(accMap.privacy && accMap.privacy.version === versions.privacy);
 
-    // Règles d’obligation (comme ton code d’origine)
-    const need_cgu = !hasCGU;                       // CGU pour tout le monde
-    const need_cgv = role === 'OWNER' ? !hasCGV : false; // CGV pour Patron uniquement
-    const need_privacy = false;                     // mets true si tu veux la rendre obligatoire
+    // Règles d’obligation
+    const need_cgu     = !hasCGU;                         // CGU pour tout le monde
+    const need_cgv     = role === 'OWNER' ? !hasCGV : false; // CGV pour le Patron uniquement
+    const need_privacy = false;                           // mets true si tu veux la rendre obligatoire
 
     return res.json({ role, versions, urls, need_cgu, need_cgv, need_privacy });
   } catch (e) {
@@ -3215,6 +3235,7 @@ app.get('/legal/status', authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
 
 
 // POST /legal/accept  -> enregistre l’acceptation de l’utilisateur courant
