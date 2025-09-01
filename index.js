@@ -168,31 +168,11 @@ function isDbLicenseValid(row) {
   return ok && notExpired;
 }
 
-async function provisionLegacyTenantFromDB(code, dbUser) {
-  try {
-    await withRegistryUpdate((next) => {
-      const t0 = next.tenants?.[code] || null;
-      const t  = ensureTenantDefaults(t0 || { code, name: code, users: {} });
-
-      const uid = String(dbUser.id);
-      t.users = t.users || {};
-      t.users[uid] = {
-        id: dbUser.id,
-        email: dbUser.email,
-        first_name: dbUser.first_name || '',
-        last_name:  dbUser.last_name  || '',
-        role: String(dbUser.role || 'EMPLOYEE').toUpperCase(),
-        updated_at: new Date().toISOString(),
-      };
-
-      t.updated_at = new Date().toISOString();
-      next.tenants[code] = t;
-      return true;
-    });
-  } catch (e) {
-    console.warn('[legacy-bridge] skip', e?.message || e);
-  }
+// Désactivation du pont JSONBin : ne fait plus rien
+async function provisionLegacyTenantFromDB(/* code, dbUser */) {
+  return; // no-op
 }
+
 
 
 // Multer en mémoire pour /announcements/upload
@@ -209,65 +189,6 @@ const genCompanyCode = (name = "CO") => {
   const base = String(name).replace(/[^A-Z0-9]/gi, "").slice(0, 3).toUpperCase() || "CO";
   return base + Math.floor(100 + Math.random() * 900); // ex: OPT123
 };
-
-// === (legacy JSONBin — conserve si tu en as encore besoin pour certaines routes) ===
-async function loadRegistry() {
-  const r = await fetch(`${API}/b/${BIN_ID}/latest`, { headers: { "X-Master-Key": MASTER } });
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`JSONBin read error (${r.status}) ${txt}`);
-  }
-  const json = await r.json(); // {record, metadata}
-  const rec = json.record || {};
-  rec.licences = rec.licences || {};
-  rec.tenants  = rec.tenants  || {};
-  rec.rev = rec.rev || 0;
-  return rec;
-}
-async function saveRegistry(record) {
-  const r = await fetch(`${API}/b/${BIN_ID}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json", "X-Master-Key": MASTER },
-    body: JSON.stringify(record),
-  });
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`JSONBin write error (${r.status}) ${txt}`);
-  }
-  const json = await r.json();
-  return json.record;
-}
-async function withRegistryUpdate(mutator, maxRetry = 3) {
-  for (let i = 0; i < maxRetry; i++) {
-    const reg = await loadRegistry();
-    const now = new Date().toISOString();
-    const next = { ...reg, rev: (reg.rev || 0) + 1, updated_at: now };
-    const changed = await mutator(next, reg);
-    if (!changed) return reg;
-    try {
-      await saveRegistry(next);
-      return next;
-    } catch (e) {
-      if (i === maxRetry - 1) throw e;
-    }
-  }
-}
-
-// Debug bonus (ok)
-if (process.env.DEBUG_BONUS === "1") {
-  const formula = {
-    version: 3,
-    id: "demo",
-    title: "Démo 20% HT",
-    fields: [],
-    rules: [
-      { type: "percent", rate: 0.20, base: { kind: "field", key: "totalTTC", mode: "HT", vatKey: "totalVAT" } }
-    ],
-  };
-  const sale = { totalTTC: 500, totalVAT: 0.20 };
-  const resDemo = computeBonusV3(formula, sale);
-  console.log("[DEBUG_BONUS] computeBonusV3 =>", resDemo, "(attendu ≈ 83.33)");
-}
 
 
 /** ===== HELPERS AGENDA & PUSH ===== */
@@ -510,36 +431,6 @@ app.post(
 );
 
 /** ===== LICENCES ===== */
-app.post("/api/licences", async (req, res) => {
-  try {
-    const { licence_key, company, modules, expires_at, status = "active" } = req.body || {};
-    if (!licence_key || !company?.name)
-      return res.status(400).json({ error: "licence_key & company.name required" });
-
-    await withRegistryUpdate((next) => {
-      const now = new Date().toISOString();
-      const prev = next.licences[licence_key];
-      next.licences[licence_key] = {
-        ...(prev || {}),
-        licence_key,
-        company,
-        company_code: prev?.company_code || genCompanyCode(company.name),
-        modules,
-        status,
-        expires_at,
-        created_at: prev?.created_at || now,
-        updated_at: now,
-      };
-      return true;
-    });
-
-    return res.status(201).json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
-
 
 app.get("/api/licences/validate", async (req, res) => {
   try {
@@ -804,16 +695,25 @@ app.post("/users/invite", authRequired, async (req, res) => {
 
 app.get("/users", authRequired, async (req, res) => {
   try {
-    if (req.user.role !== "OWNER") return res.status(403).json({ error: "Forbidden" });
-    const reg = await loadRegistry();
-    const t = reg.tenants?.[req.user.company_code];
-    if (!t) return res.status(404).json({ error: "Tenant not found" });
-    const list = Object.values(t.users || {}).sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
-    return res.json({ users: list });
+    if (String(req.user.role || "").toUpperCase() !== "OWNER") {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    const code = String(req.user.company_code || "").trim();
+    if (!code) return res.status(400).json({ error: "TENANT_CODE_MISSING" });
+
+    const { rows } = await pool.query(
+      `SELECT id, email, role, first_name, last_name, is_active, created_at, updated_at
+         FROM users
+        WHERE tenant_code = $1
+        ORDER BY created_at DESC`,
+      [code]
+    );
+    return res.json({ users: rows });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 // PATCH /users/:id — mise à jour d’un utilisateur du tenant courant
 app.patch('/users/:id', authRequired, async (req, res) => {
@@ -2318,453 +2218,324 @@ app.post('/announcements/confirm-upload', authRequired, async (req, res) => {
 });
 
 
-/** ===== SETTINGS (réglages d’entreprise) ===== */
 
-// =========================== BONUS V3 — HELPERS ===========================
 
-// Rôles / infos de base
+// Helpers bonus
 const bonusRoleOf = (req) => String(req.user?.role || '').toUpperCase();
-const bonusCompanyCodeOf = (req) => req.user?.company_code || req.user?.companyCode;
-
-// OWNER-like = OWNER ou HR
+const bonusCompanyCodeOf = (req) => String(req.user?.company_code || '').trim();
 const BONUS_OWNER_LIKE = new Set(['OWNER', 'HR']);
 
-// Middlewares
 function bonusRequireOwner(req, res, next) {
-  const r = bonusRoleOf(req);
-  if (BONUS_OWNER_LIKE.has(r)) return next();
+  if (BONUS_OWNER_LIKE.has(bonusRoleOf(req))) return next();
   return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
 }
-
 function bonusRequireEmployeeOrOwner(req, res, next) {
   const r = bonusRoleOf(req);
   if (r === 'EMPLOYEE' || BONUS_OWNER_LIKE.has(r)) return next();
   return res.status(403).json({ error: 'FORBIDDEN_EMPLOYEE' });
 }
 
-
-// Squelette Bonus V3 sur le tenant
-function bonusEnsureStruct(t) {
-  t.bonusV3 = t.bonusV3 || {};
-  t.bonusV3.formulas = t.bonusV3.formulas || { byId: {}, order: [] };
-  t.bonusV3.entries  = t.bonusV3.entries  || {}; // { [YYYY-MM]: { [empId]: [ {formulaId, sale, bonus, at} ] } }
-  t.bonusV3.ledger   = t.bonusV3.ledger   || {}; // { [YYYY-MM]: { frozenAt, byEmployee, byFormula } }
-  return t;
-}
-
-// Index du personnel (id/email/affichage)
-function bonusGetStaffIndex(t) {
-  const list = Array.isArray(t.employees) ? t.employees
-            : Array.isArray(t.staff)      ? t.staff
-            : [];
-
-  const byId = Object.create(null);
-  const emailToId = Object.create(null);
-  const displayById = Object.create(null);
-  const roleById = Object.create(null);
-
-  for (const p of list) {
-    const id = String(p.user_id ?? p.id ?? p._id ?? p.code ?? p.email ?? '').trim();
-    if (!id) continue;
-
-    byId[id] = p;
-
-    const email = p.email ? String(p.email).trim().toLowerCase() : null;
-    if (email) emailToId[email] = id;
-
-    const first = p.first_name ?? p.firstName ?? p.given_name ?? p.givenName;
-    const last  = p.last_name  ?? p.lastName  ?? p.family_name ?? p.familyName;
-    const name  =
-      [first, last].filter(Boolean).join(' ').trim() ||
-      p.name || p.full_name || p.displayName || p.email || id;
-
-    displayById[id] = { id, name, email: p.email ?? null };
-    roleById[id] = (p.role || p.user_role || p.type || '').toUpperCase() || null;
-  }
-  return { byId, emailToId, displayById, roleById };
-}
-
-// Normalise un identifiant employé (email -> id connu)
-function bonusCanonicalEmpId(t, raw) {
-  if (raw == null) return null;
-  const s = String(raw).trim();
-  if (!s || s === 'undefined' || s === 'null') return null;
-  const { emailToId } = bonusGetStaffIndex(t);
-  const isEmail = s.includes('@') && !s.includes(' ');
-  return isEmail ? (emailToId[s.toLowerCase()] || s) : s;
-}
-
-// Récupère l'id employé depuis req + normalisation
-function bonusEmpIdFromReq(req, t) {
-  const u = req.user || {};
-  const hdr = req.headers || {};
-  const raw =
-    u.user_id ?? u.id ?? u._id ?? u.uid ?? u.sub ??
-    hdr['x-user-id'] ?? hdr['x-user'] ??
-    u.email ?? u.username ?? u.code;
-  return bonusCanonicalEmpId(t, raw);
-}
-
-// (optionnel) Petite migration pour fusionner emails -> ids dans entries
-function bonusMigrateEntriesKeys(t) {
-  const months = Object.keys(t?.bonusV3?.entries || {});
-  for (const m of months) {
-    const src = t.bonusV3.entries[m] || {};
-    const dst = {};
-    for (const k of Object.keys(src)) {
-      const canon = bonusCanonicalEmpId(t, k);
-      if (!canon) continue;
-      (dst[canon] = dst[canon] || []).push(...(src[k] || []));
-    }
-    t.bonusV3.entries[m] = dst;
-  }
-}
-
-// ---- Ledger helpers (multi-gels dans le même mois) ----
-function bonusEnsureLedgerArray(t, m) {
-  t.bonusV3 = t.bonusV3 || {};
-  t.bonusV3.ledger = t.bonusV3.ledger || {};
-  const cur = t.bonusV3.ledger[m];
-
-  // création
-  if (!cur) {
-    t.bonusV3.ledger[m] = { freezes: [] };
-    return t.bonusV3.ledger[m].freezes;
-  }
-
-  // migration ancien schéma {frozenAt, byEmployee, byFormula} -> {freezes:[...]}
-  if (!Array.isArray(cur.freezes)) {
-    const migrated = [];
-    if (cur.frozenAt) {
-      migrated.push({
-        frozenAt: cur.frozenAt,
-        byEmployee: cur.byEmployee || {},
-        byFormula: cur.byFormula || {},
-      });
-    }
-    t.bonusV3.ledger[m] = { freezes: migrated };
-  }
-  return t.bonusV3.ledger[m].freezes;
-}
-
-function bonusGetLastFreeze(t, m) {
-  const arr = t?.bonusV3?.ledger?.[m]?.freezes;
-  if (Array.isArray(arr) && arr.length > 0) return arr[arr.length - 1];
-  return null;
-}
-
-
-// =========================== BONUS V3 — ROUTES ===========================
-
-// 1) LISTER les formules (OWNER)
-app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, (req, res) => {
+// 1) Lister formules (OWNER)
+app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) => {
   const code = bonusCompanyCodeOf(req);
-  const t = bonusEnsureStruct(getTenant(code));
-  const list = (t.bonusV3.formulas.order || [])
-    .map(id => t.bonusV3.formulas.byId[id])
-    .filter(Boolean);
-  res.json(list);
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, version, title, fields, rules, position, created_at, updated_at
+         FROM bonus_formulas
+        WHERE tenant_code=$1
+        ORDER BY position ASC, created_at ASC`,
+      [code]
+    );
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// 2) CRÉER une formule (OWNER)
-app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, (req, res) => {
+// 2) Créer formule (OWNER)
+app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) => {
   const code = bonusCompanyCodeOf(req);
-  const t = bonusEnsureStruct(getTenant(code));
+  try {
+    const f = req.body || {};
+    const id = f.id || `f_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    const title = String(f.title || '').trim();
+    if (!title) return res.status(400).json({ error: 'TITLE_REQUIRED' });
 
-  const f = req.body || {};
-  if (f.version !== 3) f.version = 3;
-  if (!f.id) f.id = `f_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    const { rows: pos } = await pool.query(
+      `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+         FROM bonus_formulas WHERE tenant_code=$1`,
+      [code]
+    );
 
-  t.bonusV3.formulas.byId[f.id] = f;
-  if (!t.bonusV3.formulas.order.includes(f.id)) t.bonusV3.formulas.order.push(f.id);
-
-  saveTenant(code, t);
-  res.json({ success: true, id: f.id });
+    await pool.query(
+      `INSERT INTO bonus_formulas (tenant_code, id, version, title, fields, rules, position)
+       VALUES ($1,$2,3,$3,$4::jsonb,$5::jsonb,$6)`,
+      [code, id, title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[]), pos[0].next_pos]
+    );
+    res.json({ success: true, id });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// 3) METTRE À JOUR une formule (OWNER)
-app.put('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, (req, res) => {
+// 3) Update formule (OWNER)
+app.put('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req, res) => {
   const code = bonusCompanyCodeOf(req);
   const id = String(req.params.id || '');
-  const t = bonusEnsureStruct(getTenant(code));
-  if (!id || !t.bonusV3.formulas.byId[id]) return res.status(404).json({ error: 'NOT_FOUND' });
+  try {
+    const f = req.body || {};
+    const title = String(f.title || '').trim();
+    if (!title) return res.status(400).json({ error: 'TITLE_REQUIRED' });
 
-  const f = req.body || {};
-  f.version = 3;
-  f.id = id;
-  t.bonusV3.formulas.byId[id] = f;
-
-  if (!t.bonusV3.formulas.order.includes(id)) t.bonusV3.formulas.order.push(id);
-  saveTenant(code, t);
-  res.json({ success: true });
+    const { rowCount } = await pool.query(
+      `UPDATE bonus_formulas
+          SET title=$1, fields=$2::jsonb, rules=$3::jsonb, version=3, updated_at=now()
+        WHERE tenant_code=$4 AND id=$5`,
+      [title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[]), code, id]
+    );
+    if (!rowCount) return res.status(404).json({ error: 'NOT_FOUND' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// 4) SUPPRIMER une formule (OWNER)
-app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, (req, res) => {
+// 4) Delete formule (OWNER)
+app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req, res) => {
   const code = bonusCompanyCodeOf(req);
   const id = String(req.params.id || '');
-  const t = bonusEnsureStruct(getTenant(code));
-  if (!id || !t.bonusV3.formulas.byId[id]) return res.status(404).json({ error: 'NOT_FOUND' });
-
-  delete t.bonusV3.formulas.byId[id];
-  t.bonusV3.formulas.order = (t.bonusV3.formulas.order || []).filter(x => x !== id);
-
-  saveTenant(code, t);
-  res.json({ success: true });
+  try {
+    const { rowCount } = await pool.query(
+      `DELETE FROM bonus_formulas WHERE tenant_code=$1 AND id=$2`,
+      [code, id]
+    );
+    if (!rowCount) return res.status(404).json({ error: 'NOT_FOUND' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// 5) SAISIE d'une vente (EMPLOYEE ou OWNER)
-app.post('/bonusV3/sale', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+// 5) Saisie vente (EMPLOYEE/OWNER)
+app.post('/bonusV3/sale', authRequired, bonusRequireEmployeeOrOwner, async (req, res) => {
   try {
     const code = bonusCompanyCodeOf(req);
-    const t = bonusEnsureStruct(getTenant(code));
     const m = monthKey();
-
-    // période figée ?
-    if (t.bonusV3.ledger?.[m]?.frozenAt) {
-      return res.status(409).json({ error: 'MONTH_FROZEN' });
-    }
-
-    // id employé normalisé
-    const empId = bonusEmpIdFromReq(req, t);
-    if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
+    const empId = Number(req.user.sub);
 
     const { formulaId, sale } = req.body || {};
-    if (!formulaId || typeof sale !== 'object') {
-      return res.status(400).json({ error: 'BAD_REQUEST' });
-    }
+    if (!formulaId || typeof sale !== 'object') return res.status(400).json({ error: 'BAD_REQUEST' });
 
-    const formula = t.bonusV3.formulas?.byId?.[formulaId];
-    if (!formula) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
+    // calcule le bonus côté serveur si tu veux; ici on fait confiance au front ou recalcul:
+    // import computeBonusV3 ...:
+    const formulaQ = await pool.query(
+      `SELECT rules, fields FROM bonus_formulas WHERE tenant_code=$1 AND id=$2`,
+      [code, formulaId]
+    );
+    if (!formulaQ.rowCount) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
 
-    const bonus = Number(computeBonusV3(formula, sale) || 0);
+    const bonus = Number(require('./bonusMathV3.js').computeBonusV3(
+      { version:3, rules: formulaQ.rows[0].rules, fields: formulaQ.rows[0].fields },
+      sale
+    ) || 0);
 
-    if (!t.bonusV3.entries[m]) t.bonusV3.entries[m] = {};
-    if (!t.bonusV3.entries[m][empId]) t.bonusV3.entries[m][empId] = [];
-    t.bonusV3.entries[m][empId].push({ formulaId, sale, bonus, at: new Date().toISOString() });
+    const { rows } = await pool.query(
+      `INSERT INTO bonus_entries (tenant_code, month, employee_id, formula_id, sale, bonus)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6)
+       RETURNING id, month, employee_id, formula_id, sale, bonus, at`,
+      [code, m, empId, formulaId, JSON.stringify(sale), bonus]
+    );
 
-    saveTenant(code, t);
-    res.json({ success: true, bonus });
-  } catch (e) {
-    console.error('POST /bonusV3/sale failed', e);
-    res.status(500).json({ error: 'INTERNAL' });
-  }
+    res.json({ success: true, bonus: rows[0].bonus, entry: rows[0] });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// 6) COMPTEUR employé (EMPLOYEE ou OWNER)
-app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
+// 6) Total employé sur un mois
+app.get('/bonusV3/my-total', authRequired, bonusRequireEmployeeOrOwner, async (req, res) => {
   try {
     const code = bonusCompanyCodeOf(req);
-    const t = bonusEnsureStruct(getTenant(code));
-    const empId = bonusEmpIdFromReq(req, t);
-    if (!empId) return res.status(400).json({ error: 'EMP_ID_MISSING' });
-
+    const empId = Number(req.user.sub);
     const m = String(req.query.month || monthKey());
-    const list = t.bonusV3.entries?.[m]?.[empId] || [];
-    const total = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
-    res.json({ month: m, total, count: list.length });
+
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(bonus),0) AS total, COUNT(*)::int AS count
+         FROM bonus_entries
+        WHERE tenant_code=$1 AND month=$2 AND employee_id=$3`,
+      [code, m, empId]
+    );
+    res.json({ month: m, total: Number(rows[0].total), count: rows[0].count });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// 7) Récap patron
+app.get('/bonusV3/summary', authRequired, bonusRequireOwner, async (req, res) => {
+  try {
+    const code = bonusCompanyCodeOf(req);
+    const m = String(req.query.month || monthKey());
+
+    const byEmpQ = await pool.query(
+      `SELECT employee_id, COALESCE(SUM(bonus),0) AS total, COUNT(*)::int AS count
+         FROM bonus_entries
+        WHERE tenant_code=$1 AND month=$2
+        GROUP BY employee_id`,
+      [code, m]
+    );
+    const byFormulaQ = await pool.query(
+      `SELECT formula_id, COALESCE(SUM(bonus),0) AS total
+         FROM bonus_entries
+        WHERE tenant_code=$1 AND month=$2
+        GROUP BY formula_id`,
+      [code, m]
+    );
+    const lastFreezeQ = await pool.query(
+      `SELECT frozen_at FROM bonus_freezes
+        WHERE tenant_code=$1 AND month=$2
+        ORDER BY seq DESC
+        LIMIT 1`,
+      [code, m]
+    );
+
+    const byEmployee = {};
+    let totalAll = 0;
+    for (const r of byEmpQ.rows) {
+      byEmployee[r.employee_id] = { total: Number(r.total), count: r.count };
+      totalAll += Number(r.total);
+    }
+    const byFormula = {};
+    for (const r of byFormulaQ.rows) byFormula[r.formula_id] = Number(r.total);
+
+    // snapshot d’affichage de base pour les employés
+    const employeesQ = await pool.query(
+      `SELECT id, email,
+              COALESCE(NULLIF(first_name,''), NULL) AS first_name,
+              COALESCE(NULLIF(last_name,''),  NULL) AS last_name
+         FROM users WHERE tenant_code=$1`,
+      [code]
+    );
+    const employees = {};
+    for (const u of employeesQ.rows) {
+      employees[String(u.id)] = {
+        id: u.id,
+        email: u.email,
+        name: [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || u.email || String(u.id),
+      };
+    }
+
+    res.json({
+      month: m,
+      totalAll,
+      byEmployee,
+      byFormula,
+      employees,
+      lastFrozenAt: lastFreezeQ.rows[0]?.frozen_at || null
+    });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// 8) Figé (freeze) — snapshot + purge des entrées du mois (comme avant)
+app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, async (req, res) => {
+  const code = bonusCompanyCodeOf(req);
+  const m = String(req.query.month || monthKey());
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const byEmp = await client.query(
+      `SELECT employee_id, COALESCE(SUM(bonus),0) AS total
+         FROM bonus_entries
+        WHERE tenant_code=$1 AND month=$2
+        GROUP BY employee_id`,
+      [code, m]
+    );
+    const byFormula = await client.query(
+      `SELECT formula_id, COALESCE(SUM(bonus),0) AS total
+         FROM bonus_entries
+        WHERE tenant_code=$1 AND month=$2
+        GROUP BY formula_id`,
+      [code, m]
+    );
+
+    const be = {};
+    byEmp.rows.forEach(r => { be[r.employee_id] = Number(r.total); });
+    const bf = {};
+    byFormula.rows.forEach(r => { bf[r.formula_id] = Number(r.total); });
+
+    const { rows: seqR } = await client.query(
+      `SELECT COALESCE(MAX(seq),0)+1 AS next_seq
+         FROM bonus_freezes WHERE tenant_code=$1 AND month=$2`,
+      [code, m]
+    );
+    const seq = seqR[0].next_seq;
+
+    await client.query(
+      `INSERT INTO bonus_freezes (tenant_code, month, seq, frozen_at, by_employee, by_formula)
+       VALUES ($1,$2,$3, now(), $4::jsonb, $5::jsonb)`,
+      [code, m, seq, JSON.stringify(be), JSON.stringify(bf)]
+    );
+
+    // on "redémarre" la période : purge des entrées du mois
+    await client.query(
+      `DELETE FROM bonus_entries WHERE tenant_code=$1 AND month=$2`,
+      [code, m]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, month: m, seq, frozenAt: new Date().toISOString() });
   } catch (e) {
-    console.error('GET /bonusV3/my-total failed', e);
-    res.status(500).json({ error: 'INTERNAL' });
-  }
+    try { await client.query('ROLLBACK'); } catch {}
+    res.status(500).json({ error: String(e.message || e) });
+  } finally { client.release(); }
 });
 
-// 7) RÉCAP Patron (OWNER) — toujours "gelable" ; expose le dernier gel
-app.get('/bonusV3/summary', authRequired, bonusRequireOwner, (req, res) => {
+// 9) Liste des entrées d’un employé (OWNER)
+app.get('/bonusV3/entries', authRequired, bonusRequireOwner, async (req, res) => {
+  try {
+    const code = bonusCompanyCodeOf(req);
+    const empId = Number(req.query.empId);
+    const m = String(req.query.month || monthKey());
+    if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
+
+    const { rows } = await pool.query(
+      `SELECT id, month, employee_id, formula_id, sale, bonus, at
+         FROM bonus_entries
+        WHERE tenant_code=$1 AND month=$2 AND employee_id=$3
+        ORDER BY at DESC`,
+      [code, m, empId]
+    );
+    res.json({ month: m, empId, entries: rows });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// 10) Historique gel d’un employé (OWNER)
+app.get('/bonusV3/history', authRequired, bonusRequireOwner, async (req, res) => {
+  try {
+    const code = bonusCompanyCodeOf(req);
+    const empId = Number(req.query.empId);
+    if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
+
+    const { rows } = await pool.query(
+      `SELECT month, seq, frozen_at, (by_employee ->> $3)::numeric AS total
+         FROM bonus_freezes
+        WHERE tenant_code=$1
+        ORDER BY (COALESCE(frozen_at::text, month)) DESC, seq DESC`,
+      [code, String(empId), String(empId)]
+    );
+
+    const out = rows.map(r => ({
+      month: r.month,
+      total: Number(r.total || 0),
+      frozenAt: r.frozen_at,
+      seq: r.seq
+    }));
+    res.json({ empId, history: out });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// 11) Formules côté Employé
+app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, async (req, res) => {
   const code = bonusCompanyCodeOf(req);
-  const m = String(req.query.month || monthKey());
-  const t = bonusEnsureStruct(getTenant(code));
-
-  const rawByEmp = t.bonusV3.entries?.[m] || {};
-
-  // fusion e-mail -> id canonique
-  const mergedByEmp = {};
-  for (const rawId of Object.keys(rawByEmp)) {
-    const id = bonusCanonicalEmpId(t, rawId);
-    if (!mergedByEmp[id]) mergedByEmp[id] = [];
-    mergedByEmp[id].push(...(rawByEmp[rawId] || []));
-  }
-
-  const byEmployee = {};
-  const byFormula = {};
-  for (const empId of Object.keys(mergedByEmp)) {
-    const list = mergedByEmp[empId] || [];
-    const tot = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
-    byEmployee[empId] = { total: tot, count: list.length };
-    for (const it of list) {
-      byFormula[it.formulaId] = (byFormula[it.formulaId] || 0) + Number(it.bonus || 0);
-    }
-  }
-
-  const { displayById } = bonusGetStaffIndex(t);
-  const employees = {};
-  for (const id of Object.keys(displayById || {})) {
-    employees[id] = displayById[id]; // {id, name, email}
-  }
-
-  // dernier gel du mois (s'il y en a eu)
-  const last = bonusGetLastFreeze(t, m);
-  const lastFrozenAt = last?.frozenAt || null;
-
-  const totalAll = Object.values(byEmployee).reduce((s, x) => s + (x.total || 0), 0);
-  res.json({ month: m, totalAll, byEmployee, byFormula, employees, lastFrozenAt });
-});
-
-
-// 8) FIGER la période (OWNER) — pousse un "gel" et redémarre une nouvelle période
-app.post('/bonusV3/freeze', authRequired, bonusRequireOwner, (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const m = String(req.query.month || monthKey());
-  const t = bonusEnsureStruct(getTenant(code));
-
-  const byEmp = t.bonusV3.entries?.[m] || {};
-  const ledgerEmp = {};
-  const ledgerFormula = {};
-
-  for (const empId of Object.keys(byEmp)) {
-    const list = byEmp[empId] || [];
-    ledgerEmp[empId] = list.reduce((s, it) => s + Number(it.bonus || 0), 0);
-    for (const it of list) {
-      ledgerFormula[it.formulaId] = (ledgerFormula[it.formulaId] || 0) + Number(it.bonus || 0);
-    }
-  }
-
-  const freezes = bonusEnsureLedgerArray(t, m);
-  const snapshot = {
-    frozenAt: new Date().toISOString(),
-    byEmployee: ledgerEmp,
-    byFormula: ledgerFormula,
-  };
-  freezes.push(snapshot);
-
-  // redémarre une nouvelle période immédiatement pour le même mois
-  t.bonusV3.entries[m] = {};
-
-  saveTenant(code, t);
-  res.json({ success: true, month: m, seq: freezes.length, frozenAt: snapshot.frozenAt });
-});
-
-
-// 9) LISTE des ventes d’un employé pour un mois (OWNER) — route principale
-app.get('/bonusV3/entries', authRequired, bonusRequireOwner, (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const t = bonusEnsureStruct(getTenant(code));
-
-  const rawEmp = String(req.query.empId || '').trim();
-  if (!rawEmp) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
-
-  const empId = bonusCanonicalEmpId(t, rawEmp);
-  const m = String(req.query.month || monthKey());
-
-  const list = t.bonusV3.entries?.[m]?.[empId] || [];
-  const sorted = [...list].sort((a, b) =>
-    String(b.at || '').localeCompare(String(a.at || ''))
-  );
-  res.json({ month: m, empId, entries: sorted });
-});
-
-// 10) HISTORIQUE figé d’un employé (OWNER) — liste tous les gels, y compris multiples dans un mois
-app.get('/bonusV3/employee-history', authRequired, bonusRequireOwner, (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const empId = String(req.query.empId || '').trim();
-  const t = bonusEnsureStruct(getTenant(code));
-  if (!empId) return res.status(400).json({ error: 'MISSING_EMP_ID' });
-
-  const out = [];
-  for (const [month, led] of Object.entries(t.bonusV3.ledger || {})) {
-    // nouveau schéma
-    if (Array.isArray(led.freezes)) {
-      led.freezes.forEach((snap, i) => {
-        const total = Number((snap.byEmployee || {})[empId] || 0);
-        out.push({ month, total, frozenAt: snap.frozenAt, seq: i + 1 });
-      });
-    } else {
-      // ancien schéma (compat)
-      const total = Number((led.byEmployee || {})[empId] || 0);
-      if (led.frozenAt) out.push({ month, total, frozenAt: led.frozenAt, seq: 1 });
-    }
-  }
-  // on affiche tout, même total=0 (à toi de filtrer si tu préfères)
-  out.sort((a, b) => {
-    // tri par date de gel décroissante puis par mois
-    const ad = (a.frozenAt || a.month);
-    const bd = (b.frozenAt || b.month);
-    return String(bd).localeCompare(String(ad));
-  });
-
-  res.json({ empId, history: out });
-});
-
-// 10bis) HISTORIQUE figé d’un employé (OWNER) — compatible multi-gels
-app.get('/bonusV3/history', authRequired, bonusRequireOwner, (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const rawEmpId = String(req.query.empId || '').trim();
-  if (!rawEmpId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
-
-  const t = bonusEnsureStruct(getTenant(code));
-
-  // normalise l’identifiant (email -> id canonique si possible)
-  const empId = bonusCanonicalEmpId(t, rawEmpId);
-
-  const out = [];
-  const ledger = t.bonusV3.ledger || {};
-
-  for (const [month, led] of Object.entries(ledger)) {
-    // Nouveau schéma: { freezes: [ { frozenAt, byEmployee, byFormula } , ... ] }
-    if (Array.isArray(led?.freezes)) {
-      led.freezes.forEach((snap, i) => {
-        const total = Number((snap.byEmployee || {})[empId] || 0);
-        out.push({
-          month,
-          total,
-          frozenAt: snap.frozenAt || null,
-          seq: i + 1, // rang du gel dans le mois
-        });
-      });
-    } else {
-      // Ancien schéma: { frozenAt, byEmployee, byFormula }
-      const total = Number((led.byEmployee || {})[empId] || 0);
-      out.push({
-        month,
-        total,
-        frozenAt: led.frozenAt || null,
-        seq: 1,
-      });
-    }
-  }
-
-  // Tri décroissant par date (frozenAt si présent sinon le mois), puis par seq
-  out.sort((a, b) => {
-    const ad = a.frozenAt || a.month;
-    const bd = b.frozenAt || b.month;
-    const cmp = String(bd).localeCompare(String(ad));
-    return cmp !== 0 ? cmp : (b.seq || 0) - (a.seq || 0);
-  });
-
-  res.json({ empId, history: out });
-});
-
-
-// 11) Liste des formules visibles côté Employé (lecture seule)
-app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, (req, res) => {
-  const code = bonusCompanyCodeOf(req);
-  const t = bonusEnsureStruct(getTenant(code));
-  const list = (t.bonusV3.formulas.order || [])
-    .map(id => t.bonusV3.formulas.byId[id])
-    .filter(Boolean)
-    .map(f => ({ id: f.id, title: f.title, fields: f.fields || [] }));
-  res.json(list);
-});
-
-// (optionnel) debug
-app.get('/whoami', authRequired, (req, res) => {
-  res.json({ role: req.user?.role, user: req.user?.user_id, company: req.user?.company_code });
-});
-
-// ----- Alias de compatibilité (si ton front appelle encore ces chemins) -----
-app.get('/bonusV3/employee-entries', authRequired, bonusRequireOwner, (req, res) => {
-  req.url = req.url.replace('/employee-entries', '/entries');
-  return app._router.handle(req, res, () => {});
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, title, fields
+         FROM bonus_formulas
+        WHERE tenant_code=$1
+        ORDER BY position ASC, created_at ASC`,
+      [code]
+    );
+    res.json(rows.map(f => ({ id: f.id, title: f.title, fields: f.fields || [] })));
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 // ========== PROFILS EMPLOYÉS (durable côté serveur) ==========
@@ -2838,30 +2609,38 @@ function pwdVerify(stored, password) {
 // GET /profile/me  => profil de l'utilisateur connecté (EMPLOYEE/OWNER)
 app.get('/profile/me', authRequired, async (req, res) => {
   try {
-    const code = req.user.company_code;
-    const reg = await loadRegistry();
-    const t0  = reg.tenants?.[code];
-    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
-    const t   = ensureTenantDefaults(t0);
+    const code = String(req.user.company_code || '').trim();
+    const uid  = Number(req.user.sub);
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'BAD_USER' });
 
-    const id = String(req.user.sub);                    // id JWT
-    const idx = profGetStaffIndex(t);
-    const base = idx.displayById[id] || {};             // ⬅️ prénom/nom/email de l’invitation
-    const profile = (t.employee_profiles?.byId?.[id]) || {};
+    const { rows } = await pool.query(
+      `SELECT u.id, u.email, u.first_name, u.last_name, u.updated_at,
+              p.phone, p.address, p.updated_at AS profile_updated_at
+         FROM users u
+         LEFT JOIN employee_profiles p
+           ON p.tenant_code = u.tenant_code AND p.user_id = u.id
+        WHERE u.tenant_code = $1 AND u.id = $2
+        LIMIT 1`,
+      [code, uid]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
 
+    const r = rows[0];
     return res.json({
-      id,
-      email:      profile.email      ?? base.email ?? null,
-      first_name: profile.first_name ?? base.first_name ?? null,
-      last_name:  profile.last_name  ?? base.last_name  ?? null,
-      phone:      profile.phone      ?? null,
-      address:    profile.address    ?? null,
-      updatedAt:  profile.updatedAt  ?? null,
+      id: r.id,
+      email:      r.email,
+      first_name: r.first_name ?? null,
+      last_name:  r.last_name  ?? null,
+      phone:      r.phone ?? null,
+      address:    r.address ?? null,
+      updatedAt:  r.profile_updated_at || r.updated_at || null,
     });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 
@@ -2971,57 +2750,64 @@ app.patch('/settings', authRequired, async (req, res) => {
 
 
 // OWNER: GET /profiles  => renvoie un map de tous les profils (fusion staff + profils)
+// ==============================
+// GET /profiles  (OWNER only) — lit depuis Neon (users + employee_profiles)
+// ==============================
 app.get('/profiles', authRequired, async (req, res) => {
-  if (String(req.user.role || '').toUpperCase() !== 'OWNER') {
-    return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
-  }
   try {
-    const code = req.user.company_code;
-    const reg  = await loadRegistry();
-    const t0   = reg.tenants?.[code];
-    if (!t0) return res.status(404).json({ error: 'Tenant not found' });
-    const t    = ensureTenantDefaults(t0);
-    const idx  = profGetStaffIndex(t);
+    if (String(req.user.role || '').toUpperCase() !== 'OWNER') {
+      return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+    }
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
+    const { rows } = await pool.query(
+      `SELECT u.id,
+              u.email,
+              u.role,
+              u.first_name,
+              u.last_name,
+              u.is_active,
+              u.created_at,
+              u.updated_at,
+              p.phone,
+              p.address,
+              p.updated_at AS profile_updated_at
+         FROM users u
+         LEFT JOIN employee_profiles p
+           ON p.tenant_code = u.tenant_code AND p.user_id = u.id
+        WHERE u.tenant_code = $1
+        ORDER BY u.created_at DESC`,
+      [code]
+    );
 
     const out = {};
-    for (const id of Object.keys(idx.displayById)) {
-      const base = idx.displayById[id];
-      const p = t.employee_profiles.byId[id] || {};
-      out[id] = {
-        id,
-        email:      p.email      ?? base.email ?? null,
-        first_name: p.first_name ?? base.first_name ?? null,
-        last_name:  p.last_name  ?? base.last_name  ?? null,
-        phone:      p.phone ?? null,
-        address:    p.address ?? null,
-        updatedAt:  p.updatedAt ?? null,
+    for (const r of rows) {
+      out[String(r.id)] = {
+        id: r.id,
+        email: r.email,
+        first_name: r.first_name ?? null,
+        last_name: r.last_name ?? null,
+        phone: r.phone ?? null,
+        address: r.address ?? null,
+        updatedAt: r.profile_updated_at || r.updated_at || null,
+        // champs utiles en plus si ton front en a besoin :
+        role: r.role || null,
+        is_active: r.is_active,
+        created_at: r.created_at,
       };
     }
-    // profils orphelins
-    for (const id of Object.keys(t.employee_profiles.byId || {})) {
-      if (out[id]) continue;
-      const p = t.employee_profiles.byId[id];
-      out[id] = {
-        id,
-        email: p.email ?? null,
-        first_name: p.first_name ?? null,
-        last_name:  p.last_name ?? null,
-        phone: p.phone ?? null,
-        address: p.address ?? null,
-        updatedAt: p.updatedAt ?? null,
-      };
-    }
-
     return res.json({ profiles: out });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 
-
-// OWNER: PATCH /profile/:empId  => MAJ d’un profil employé (tous champs)
-// PATCH /profile/:empId — OWNER: maj identité + profil (phone/address)
+// ===================================================================
+// PATCH /profile/:empId (OWNER) — maj identité (users) + profil (phone/address)
+// ===================================================================
 app.patch('/profile/:empId', authRequired, async (req, res) => {
   if (String(req.user.role || '').toUpperCase() !== 'OWNER') {
     return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
@@ -3053,7 +2839,7 @@ app.patch('/profile/:empId', authRequired, async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // lock user existence
+      // Lock + existence
       const cur = await client.query(
         'SELECT id FROM users WHERE tenant_code=$1 AND id=$2 FOR UPDATE',
         [code, empId]
@@ -3063,7 +2849,7 @@ app.patch('/profile/:empId', authRequired, async (req, res) => {
         return res.status(404).json({ error: 'User not found' });
       }
 
-      // update users (first_name,last_name,email)
+      // UPDATE users (first_name, last_name, email)
       if (Object.keys(userPatch).length) {
         const sets = [];
         const params = [];
@@ -3082,34 +2868,79 @@ app.patch('/profile/:empId', authRequired, async (req, res) => {
           await client.query(sql, params);
         } catch (e) {
           if (e && e.code === '23505') {
-            // unique(tenant_code,email)
+            // contrainte unique (tenant_code, email)
             throw Object.assign(new Error('EMAIL_ALREADY_EXISTS'), { status: 409 });
           }
           throw e;
         }
       }
 
-      // upsert employee profile (phone/address) — si fourni
+      // PROFILE (phone/address)
       if (profilePhone !== undefined || profileAddress !== undefined) {
+        // S'assurer que la ligne existe
         await client.query(
           `INSERT INTO employee_profiles (tenant_code, user_id, phone, address, updated_at)
-           VALUES ($1,$2,$3,$4, now())
-           ON CONFLICT (tenant_code, user_id)
-           DO UPDATE SET
-             phone      = COALESCE(EXCLUDED.phone, employee_profiles.phone),
-             address    = COALESCE(EXCLUDED.address, employee_profiles.address),
-             updated_at = now()`,
-          [
-            code,
-            empId,
-            (profilePhone   !== undefined ? profilePhone   : null),
-            (profileAddress !== undefined ? profileAddress : null),
-          ]
+           VALUES ($1,$2,NULL,NULL, now())
+           ON CONFLICT (tenant_code, user_id) DO NOTHING`,
+          [code, empId]
         );
+
+        // UPDATE dynamique uniquement sur les champs fournis (permet de mettre à NULL)
+        const psets = [];
+        const pparams = [];
+        let j = 1;
+        if (profilePhone !== undefined)   { psets.push(`phone = $${j++}`);   pparams.push(profilePhone); }
+        if (profileAddress !== undefined) { psets.push(`address = $${j++}`); pparams.push(profileAddress); }
+        if (psets.length) {
+          psets.push(`updated_at = now()`);
+          pparams.push(code, empId);
+          await client.query(
+            `UPDATE employee_profiles SET ${psets.join(', ')}
+              WHERE tenant_code = $${j++} AND user_id = $${j++}`,
+            pparams
+          );
+        }
       }
 
+      // Retourner le profil fusionné (users + employee_profiles)
+      const { rows: outRows } = await client.query(
+        `SELECT u.id,
+                u.email,
+                u.role,
+                u.first_name,
+                u.last_name,
+                u.is_active,
+                u.created_at,
+                u.updated_at,
+                p.phone,
+                p.address,
+                p.updated_at AS profile_updated_at
+           FROM users u
+           LEFT JOIN employee_profiles p
+             ON p.tenant_code = u.tenant_code AND p.user_id = u.id
+          WHERE u.tenant_code = $1 AND u.id = $2
+          LIMIT 1`,
+        [code, empId]
+      );
+
       await client.query('COMMIT');
-      return res.json({ success: true });
+
+      const r = outRows[0];
+      return res.json({
+        success: true,
+        profile: {
+          id: r.id,
+          email: r.email,
+          first_name: r.first_name ?? null,
+          last_name: r.last_name ?? null,
+          phone: r.phone ?? null,
+          address: r.address ?? null,
+          updatedAt: r.profile_updated_at || r.updated_at || null,
+          role: r.role || null,
+          is_active: r.is_active,
+          created_at: r.created_at,
+        }
+      });
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch {}
       if (e.status === 409 || (e.message && e.message.includes('EMAIL_ALREADY_EXISTS'))) {
@@ -3128,7 +2959,9 @@ app.patch('/profile/:empId', authRequired, async (req, res) => {
 });
 
 
+// ================================================================
 // POST /auth/change-password — l’utilisateur change son propre mot de passe
+// ================================================================
 app.post('/auth/change-password', authRequired, async (req, res) => {
   try {
     const code = String(req.user.company_code || '').trim();
@@ -3137,6 +2970,9 @@ app.post('/auth/change-password', authRequired, async (req, res) => {
     if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'BAD_USER' });
 
     const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || String(currentPassword).length === 0) {
+      return res.status(400).json({ error: 'CURRENT_PASSWORD_REQUIRED' });
+    }
     if (!newPassword || String(newPassword).length < 8) {
       return res.status(400).json({ error: 'WEAK_PASSWORD' });
     }
@@ -3166,6 +3002,7 @@ app.post('/auth/change-password', authRequired, async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 // GET /legal/status — indique ce que l'utilisateur doit accepter
