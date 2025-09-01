@@ -1095,6 +1095,7 @@ app.post('/devices/register', authRequired, async (req, res) => {
 // GET /leaves/pending
 // Liste des demandes en attente (OWNER/MANAGER uniquement)
 // ————————————————————————————————
+// Demandes en attente (OWNER/HR) — avec nom/prénom et dates JJ/MM/AAAA
 app.get('/leaves/pending', authRequired, async (req, res) => {
   try {
     const role = String(req.user.role || '').toUpperCase();
@@ -1111,24 +1112,34 @@ app.get('/leaves/pending', authRequired, async (req, res) => {
         l.employee_id,
         l.type,
         l.status,
-        TO_CHAR(l.start_date,'YYYY-MM-DD') AS start_date,
-        TO_CHAR(l.end_date,'YYYY-MM-DD')   AS end_date,
+        TO_CHAR(l.start_date,'DD/MM/YYYY') AS start_date,
+        TO_CHAR(l.end_date  ,'DD/MM/YYYY') AS end_date,
         l.comment,
         l.created_at,
         l.updated_at,
 
         u.email,
-        u.first_name,
-        u.last_name,
+        COALESCE(NULLIF(u.first_name,''), p.first_name) AS first_name,
+        COALESCE(NULLIF(u.last_name ,''), p.last_name ) AS last_name,
+
         CASE
-          WHEN LENGTH(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''))) > 0
-            THEN TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''))
+          WHEN LENGTH(
+            TRIM(
+              COALESCE(NULLIF(u.first_name,''), p.first_name, '') || ' ' ||
+              COALESCE(NULLIF(u.last_name ,''), p.last_name , '')
+            )
+          ) > 0
+          THEN TRIM(
+            COALESCE(NULLIF(u.first_name,''), p.first_name, '') || ' ' ||
+            COALESCE(NULLIF(u.last_name ,''), p.last_name , '')
+          )
           ELSE u.email
         END AS display_name
       FROM leaves l
       LEFT JOIN users u
-        ON u.tenant_code = l.tenant_code
-       AND u.id          = l.employee_id
+        ON u.tenant_code = l.tenant_code AND u.id = l.employee_id
+      LEFT JOIN employee_profiles p
+        ON p.tenant_code = l.tenant_code AND p.user_id = l.employee_id
       WHERE l.tenant_code = $1
         AND l.status = 'PENDING'
       ORDER BY l.created_at DESC
@@ -1137,11 +1148,9 @@ app.get('/leaves/pending', authRequired, async (req, res) => {
     const { rows } = await pool.query(sql, [code]);
     return res.json({ leaves: rows });
   } catch (e) {
-    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
-
 
 
 // ————————————————————————————————
@@ -1191,196 +1200,98 @@ app.get('/calendar/events', authRequired, async (req, res) => {
 // - edit (seulement si APPROVED) => met à jour l’event
 // Noter: le statut en base est UPPERCASE ('PENDING','APPROVED','REJECTED','CANCELLED')
 // ————————————————————————————————
+// PATCH /leaves/:id
 app.patch('/leaves/:id', authRequired, async (req, res) => {
+  const id   = Number(req.params.id);
+  const code = String(req.user.company_code || '').trim();
+  const role = String(req.user.role || '').toUpperCase();
+
+  if (!['OWNER','HR'].includes(role)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  const { action, start_date, end_date } = req.body;
+  const client = await pool.connect();
+
   try {
-    const role = String(req.user.role || '').toUpperCase();
-    if (!['OWNER','HR'].includes(role)) return res.status(403).json({ error: 'Forbidden' });
+    await client.query('BEGIN');
 
-    const code = String(req.user.company_code || '').trim();
-    const id = Number(req.params.id);
-    let { action, status: statusRaw, manager_note, edit } = req.body || {};
-
-    if (action === 'reschedule' && !edit && (req.body.start_date || req.body.end_date || req.body.type)) {
-      edit = { start_date: req.body.start_date, end_date: req.body.end_date, type: req.body.type };
+    // 1) Lock UNIQUEMENT la ligne leaves (pas de JOIN ici)
+    const { rows: [cur] } = await client.query(
+      `SELECT * FROM leaves WHERE id=$1 AND tenant_code=$2 FOR UPDATE`,
+      [id, code]
+    );
+    if (!cur) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'NOT_FOUND' });
     }
 
-    const normalized =
-      action === 'approve' ? 'APPROVED' :
-      action === 'deny'    ? 'REJECTED' :
-      action === 'cancel'  ? 'CANCELLED' :
-      (statusRaw ? String(statusRaw).toUpperCase() : null);
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const cur = await client.query(
-        `SELECT l.*, u.first_name, u.last_name, u.email
-           FROM leaves l
-           LEFT JOIN users u ON u.id = l.employee_id
-          WHERE l.id = $1 AND l.tenant_code = $2
-          FOR UPDATE`,
-        [id, code]
-      );
-      if (!cur.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Leave not found' }); }
-      let l = cur.rows[0];
-
-      // CANCEL
-      if (action === 'cancel') {
-        if (!['APPROVED','PENDING'].includes(l.status)) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: 'Only approved or pending leave can be cancelled' });
-        }
-        const upd = await client.query(
-          `UPDATE leaves
-              SET status='CANCELLED', manager_note = COALESCE($3, manager_note),
-                  decided_by=$1, decided_at=now(), updated_at=now()
-            WHERE id=$2
-          RETURNING *`,
-          [Number(req.user.sub), id, manager_note || null]
-        );
-        l = upd.rows[0];
-        await client.query(
-          `DELETE FROM calendar_events WHERE tenant_code=$1 AND leave_id=$2`,
-          [code, id]
-        );
-        await client.query('COMMIT');
-
-        // push
-        try {
-          const tokens = (await pool.query(
-            `SELECT token FROM devices WHERE tenant_code=$1 AND user_id=$2`,
-            [code, l.employee_id]
-          )).rows.map(r => r.token);
-          if (tokens.length) await sendExpoPush(tokens, {
-            title: 'Congé annulé ❌',
-            body: `Période supprimée : ${l.start_date} → ${l.end_date}`,
-            data: { type: 'leave', status: 'cancelled', leaveId: l.id },
-          });
-        } catch {}
-
-        return res.json({ ok: true, leave: l, event: null });
+    // 2) Mise à jour
+    let updated;
+    if (action === 'reschedule') {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date) || !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
+        throw new Error('BAD_DATES_FORMAT');
       }
-
-      // EDIT
-      if (edit && typeof edit === 'object') {
-        if (l.status !== 'APPROVED') {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: 'Only approved leave can be edited' });
-        }
-        const { start_date, end_date, type } = edit;
-        const re = /^\d{4}-\d{2}-\d{2}$/;
-        if (start_date && !re.test(String(start_date))) return res.status(400).json({ error: 'bad start_date' });
-        if (end_date   && !re.test(String(end_date)))   return res.status(400).json({ error: 'bad end_date' });
-        if (start_date && end_date && String(start_date) > String(end_date))
-          return res.status(400).json({ error: 'start_date must be <= end_date' });
-
-        const upd = await client.query(
-          `UPDATE leaves
-              SET start_date = COALESCE($1, start_date),
-                  end_date   = COALESCE($2, end_date),
-                  type       = COALESCE($3, type),
-                  manager_note = COALESCE($4, manager_note),
-                  decided_by = $5,
-                  decided_at = now(),
-                  updated_at = now()
-            WHERE id=$6
-          RETURNING *`,
-          [ start_date||null, end_date||null, type||null, manager_note||null, Number(req.user.sub), id ]
-        );
-        l = upd.rows[0];
-
-        const label = `Congé ${(cur.rows[0].first_name || '')} ${(cur.rows[0].last_name || '')}`.trim() || 'Congé';
-        const ev = await client.query(
-          `INSERT INTO calendar_events (tenant_code, leave_id, title, start, "end", employee_id)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (tenant_code, leave_id)
-           DO UPDATE SET title=EXCLUDED.title, start=EXCLUDED.start, "end"=EXCLUDED."end",
-                         employee_id=EXCLUDED.employee_id, updated_at=now()
-           RETURNING *`,
-          [code, id, label, l.start_date, l.end_date, l.employee_id]
-        );
-
-        await client.query('COMMIT');
-
-        try {
-          const tokens = (await pool.query(
-            `SELECT token FROM devices WHERE tenant_code=$1 AND user_id=$2`,
-            [code, l.employee_id]
-          )).rows.map(r => r.token);
-          if (tokens.length) await sendExpoPush(tokens, {
-            title: 'Congé modifié ✏️',
-            body: `Nouvelles dates : ${l.start_date} → ${l.end_date}`,
-            data: { type: 'leave', status: 'approved', leaveId: l.id },
-          });
-        } catch {}
-
-        return res.json({ ok: true, leave: l, event: ev.rows[0] });
-      }
-
-      // APPROVE / REJECT
-      if (!['APPROVED','REJECTED'].includes(normalized || '')) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'invalid action/status' });
-      }
-
-      const upd = await client.query(
+      ({ rows: [updated] } = await client.query(
         `UPDATE leaves
-            SET status=$1, manager_note=COALESCE($4, manager_note),
-                decided_by=$2, decided_at=now(), updated_at=now()
-          WHERE id=$3
-        RETURNING *`,
-        [normalized, Number(req.user.sub), id, manager_note || null]
-      );
-      l = upd.rows[0];
-
-      let createdEvent = null;
-      if (normalized === 'APPROVED') {
-        const label = `Congé ${(cur.rows[0].first_name || '')} ${(cur.rows[0].last_name || '')}`.trim() || 'Congé';
-        const ev = await client.query(
-          `INSERT INTO calendar_events (tenant_code, leave_id, title, start, "end", employee_id)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (tenant_code, leave_id)
-           DO UPDATE SET title=EXCLUDED.title, start=EXCLUDED.start, "end"=EXCLUDED."end",
-                         employee_id=EXCLUDED.employee_id, updated_at=now()
-           RETURNING *`,
-          [code, id, label, l.start_date, l.end_date, l.employee_id]
-        );
-        createdEvent = ev.rows[0];
-      } else {
-        // REJECTED -> pas d'event
-        await client.query(`DELETE FROM calendar_events WHERE tenant_code=$1 AND leave_id=$2`, [code, id]);
-      }
-
-      await client.query('COMMIT');
-
-      // Push
-      try {
-        const tokens = (await pool.query(
-          `SELECT token FROM devices WHERE tenant_code=$1 AND user_id=$2`,
-          [code, l.employee_id]
-        )).rows.map(r => r.token);
-        if (tokens.length) {
-          if (normalized === 'APPROVED') {
-            await sendExpoPush(tokens, { title: 'Congé approuvé ✅', body: `Du ${l.start_date} au ${l.end_date}`, data: { type:'leave', status:'approved', leaveId: l.id } });
-          } else {
-            await sendExpoPush(tokens, { title: 'Congé refusé ❌', body: manager_note ? `Note: ${manager_note}` : 'Votre demande a été refusée', data: { type:'leave', status:'denied', leaveId: l.id } });
-          }
-        }
-      } catch {}
-
-      return res.json({ ok: true, leave: l, event: createdEvent });
-    } catch (e) {
-      try { await client.query('ROLLBACK'); } catch {}
-      throw e;
-    } finally {
-      client.release();
+           SET start_date=$3, end_date=$4, updated_at=NOW()
+         WHERE id=$1 AND tenant_code=$2
+         RETURNING *`,
+        [id, code, start_date, end_date]
+      ));
+    } else if (['approve','deny','cancel'].includes(action)) {
+      const newStatus =
+        action === 'approve' ? 'APPROVED' :
+        action === 'deny'    ? 'REJECTED' :
+                               'CANCELLED';
+      ({ rows: [updated] } = await client.query(
+        `UPDATE leaves
+           SET status=$3, updated_at=NOW()
+         WHERE id=$1 AND tenant_code=$2
+         RETURNING *`,
+        [id, code, newStatus]
+      ));
+    } else {
+      throw new Error('UNKNOWN_ACTION');
     }
+
+    // 3) Enrichissement (JOIN sans FOR UPDATE)
+    const { rows: [enriched] } = await client.query(
+      `
+      SELECT
+        l.id, l.employee_id, l.type, l.status,
+        TO_CHAR(l.start_date,'YYYY-MM-DD') AS start_date,
+        TO_CHAR(l.end_date  ,'YYYY-MM-DD') AS end_date,
+        l.comment, l.created_at, l.updated_at,
+        u.email,
+        COALESCE(u.first_name, p.first_name) AS first_name,
+        COALESCE(u.last_name , p.last_name ) AS last_name,
+        CASE
+          WHEN LENGTH(TRIM(COALESCE(u.first_name,p.first_name,'') || ' ' || COALESCE(u.last_name,p.last_name,''))) > 0
+            THEN TRIM(COALESCE(u.first_name,p.first_name,'') || ' ' || COALESCE(u.last_name,p.last_name,''))
+          ELSE u.email
+        END AS display_name
+      FROM leaves l
+      LEFT JOIN users u
+        ON u.tenant_code = l.tenant_code AND u.id = l.employee_id
+      LEFT JOIN employee_profiles p
+        ON p.tenant_code = l.tenant_code AND p.user_id = l.employee_id
+      WHERE l.id=$1 AND l.tenant_code=$2
+      `,
+      [updated.id, code]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ leave: enriched });
   } catch (e) {
-    const msg = String(e.message || e);
-    return res.status(500).json({ error: msg });
+    await client.query('ROLLBACK');
+    console.error(e);
+    return res.status(500).json({ error: e.message || String(e) });
+  } finally {
+    client.release();
   }
 });
+
 
 // === OWNER crée un congé pour n'importe quel salarié (ou pour lui-même) ===
 // OWNER crée un congé pour n'importe quel salarié (avec possibilité de forcer)
