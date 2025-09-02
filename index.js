@@ -2412,12 +2412,16 @@ app.get('/bonusV3/summary', authRequired, async (req, res) => {
 });
 
 // 2.4 Geler le mois (OWNER) : snapshot + purge des saisies du mois
+// 2.4 Geler le mois (OWNER) : snapshot → NE SUPPRIME PAS les entrées
 app.post('/bonusV3/freeze', authRequired, async (req, res) => {
   try {
-    if (!isOwnerLike(req.user.role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+    const role = String(req.user.role || '').toUpperCase();
+    if (!['OWNER','HR'].includes(role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+
     const code = String(req.user.company_code || '').trim();
     const m = String(req.query.month || MONTH());
 
+    // snapshot par employé & par formule
     const byEmp = await pool.query(
       `SELECT employee_id, COALESCE(SUM(bonus),0)::float AS total
          FROM bonus_entries
@@ -2438,6 +2442,7 @@ app.post('/bonusV3/freeze', authRequired, async (req, res) => {
     const formObj = {};
     byFormula.rows.forEach(r => { formObj[r.formula_id] = r.total; });
 
+    // séquence locale (si ta table a un seq NOT NULL)
     const { rows: seqRow } = await pool.query(
       `SELECT COALESCE(MAX(seq),0)+1 AS next FROM bonus_ledger WHERE tenant_code=$1 AND month=$2`,
       [code, m]
@@ -2446,12 +2451,16 @@ app.post('/bonusV3/freeze', authRequired, async (req, res) => {
 
     await pool.query(
       `INSERT INTO bonus_ledger(tenant_code, month, seq, frozen_at, by_employee, by_formula)
-       VALUES ($1,$2,$3, now(), $4::jsonb, $5::jsonb)`,
+       VALUES ($1,$2,$3, now(), $4::jsonb, $5::jsonb)
+       ON CONFLICT (tenant_code, month) DO UPDATE
+       SET frozen_at = EXCLUDED.frozen_at,
+           by_employee = EXCLUDED.by_employee,
+           by_formula  = EXCLUDED.by_formula`,
       [code, m, seq, empObj, formObj]
     );
 
-    // on vide les entrées du mois pour “redémarrer” proprement
-    await pool.query(`DELETE FROM bonus_entries WHERE tenant_code=$1 AND month=$2`, [code, m]);
+    // ⚠️ on NE SUPPRIME PLUS les entrées du mois (pour l'historique)
+    // les nouvelles saisies iront de toute façon au mois suivant via getActiveMonth()
 
     res.json({ success: true, month: m, seq });
   } catch (e) {
@@ -2479,29 +2488,33 @@ app.get('/bonusV3/entries', authRequired, bonusRequireOwner, async (req, res) =>
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// 10) Historique gel d’un employé (OWNER)
+
+// 10) Historique gel d’un employé (OWNER) — lit bonus_ledger
 app.get('/bonusV3/history', authRequired, bonusRequireOwner, async (req, res) => {
   try {
     const code = bonusCompanyCodeOf(req);
-    const empId = Number(req.query.empId);
+    const empId = String(req.query.empId || '').trim();
     if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
 
     const { rows } = await pool.query(
-      `SELECT month, seq, frozen_at, (by_employee ->> $3)::numeric AS total
-         FROM bonus_freezes
+      `SELECT month, seq, frozen_at, by_employee
+         FROM bonus_ledger
         WHERE tenant_code=$1
         ORDER BY (COALESCE(frozen_at::text, month)) DESC, seq DESC`,
-      [code, String(empId), String(empId)]
+      [code]
     );
 
     const out = rows.map(r => ({
       month: r.month,
-      total: Number(r.total || 0),
+      seq: r.seq,
       frozenAt: r.frozen_at,
-      seq: r.seq
-    }));
-    res.json({ empId, history: out });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+      total: Number((r.by_employee && r.by_employee[empId]) || 0)
+    })).filter(x => x.total > 0);
+
+    res.json({ empId: Number(empId), history: out });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // 11) Formules côté Employé
@@ -2805,77 +2818,46 @@ app.delete('/bonusV3/my-entries/:id', authRequired, async (req, res) => {
   }
 });
 
-app.post('/bonusV3/summary/freeze', authRequiredOwnerOrManager, async (req, res) => {
-  const client = await db.connect();
+
+
+// GET /bonusV3/my-frozen-history
+app.get('/bonusV3/my-frozen-history', authRequired, async (req, res) => {
   try {
-    await client.query('BEGIN');
+    const code  = String(req.user.company_code || '').trim();
+    const empId = Number(req.user.sub);
+    if (!code || !empId) return res.status(400).json({ ok:false, error:'BAD_CONTEXT' });
 
-    const code = req.user.company_code;
-    const targetMonth = (req.body && req.body.month_key) || monthKeyParis(new Date());
+    const q = `
+      SELECT
+        e.month                                        AS month,      -- 'YYYY-MM'
+        COUNT(*)                                       AS nb_sales,
+        SUM(e.bonus)::numeric                          AS total_bonus,
+        SUM(COALESCE((e.sale->>'amount_ttc')::numeric,0))::numeric AS total_ttc,
+        MAX(l.frozen_at)                               AS frozen_at
+      FROM bonus_entries e
+      JOIN bonus_ledger l
+        ON l.tenant_code = e.tenant_code
+       AND l.month       = e.month
+      WHERE e.tenant_code = $1
+        AND e.employee_id = $2
+      GROUP BY e.month
+      ORDER BY e.month DESC
+    `;
+    const { rows } = await pool.query(q, [code, empId]);
 
-    // Verrouille la dernière période du mois cible
-    const { rows: curRows } = await client.query(
-      `SELECT * FROM bonus_periods
-       WHERE tenant_code = $1 AND month_key = $2
-       ORDER BY cycle DESC, start_at DESC
-       LIMIT 1
-       FOR UPDATE`,
-      [code, targetMonth]
-    );
-
-    if (curRows.length === 0) {
-      // S'il n'y avait pas encore de période pour ce mois, on en crée une et on la fige
-      await client.query(
-        `INSERT INTO bonus_periods (tenant_code, month_key, cycle, frozen, start_at, end_at)
-         VALUES ($1, $2, 1, true, now(), now())`,
-        [code, targetMonth]
-      );
-    } else {
-      const cur = curRows[0];
-      if (!cur.frozen) {
-        await client.query(
-          `UPDATE bonus_periods
-           SET frozen = true, end_at = now()
-           WHERE id = $1`,
-          [cur.id]
-        );
-      }
-    }
-
-    // Ouvrir la période du MOIS SUIVANT (cycle=1)
-    const nextMK = nextMonthKey(targetMonth);
-
-    // Idempotence : n’ouvre pas deux fois
-    const { rows: already } = await client.query(
-      `SELECT * FROM bonus_periods
-       WHERE tenant_code = $1 AND month_key = $2 AND frozen = false
-       LIMIT 1`,
-      [code, nextMK]
-    );
-
-    let opened = already[0];
-    if (!opened) {
-      const ins = await client.query(
-        `INSERT INTO bonus_periods (tenant_code, month_key, cycle, frozen, start_at)
-         VALUES ($1, $2, 1, false, now())
-         RETURNING *`,
-        [code, nextMK]
-      );
-      opened = ins.rows[0];
-    }
-
-    await client.query('COMMIT');
     return res.json({
       ok: true,
-      message: `Période ${targetMonth} figée. Nouvelle période ouverte: ${opened.month_key} (cycle ${opened.cycle}).`,
-      new_period: { month_key: opened.month_key, cycle: opened.cycle }
+      periods: rows.map(r => ({
+        month: String(r.month),                       // 'YYYY-MM'
+        nb_sales: Number(r.nb_sales || 0),
+        total_bonus: Number(r.total_bonus || 0),
+        total_ttc: Number(r.total_ttc || 0),
+        frozen_at: r.frozen_at ? String(r.frozen_at) : undefined,
+      })),
     });
   } catch (e) {
-    await client.query('ROLLBACK');
     console.error(e);
-    return res.status(500).json({ ok: false, error: 'FREEZE_FAILED' });
-  } finally {
-    client.release();
+    return res.status(500).json({ ok:false, error:'HISTORY_FAILED' });
   }
 });
 
