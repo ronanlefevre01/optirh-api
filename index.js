@@ -487,6 +487,37 @@ async function upsertCalendarForLeave(pool, tenant, leaveId) {
   `, [tenant, title, L.start_date, L.end_date, L.id]);
 }
 
+// ---- Helpers période (Europe/Paris) ----
+function monthKeyParis(date = new Date()) {
+  const p = new Intl.DateTimeFormat('fr-FR', {
+    timeZone: 'Europe/Paris',
+    year: 'numeric',
+    month: '2-digit',
+  }).formatToParts(date).reduce((a, x) => (a[x.type] = x.value, a), {});
+  return `${p.year}-${p.month}`; // ex: "2025-09"
+}
+
+function nextMonthKey(monthKey /* "YYYY-MM" */) {
+  const [Y, M] = monthKey.split('-').map(n => parseInt(n, 10));
+  const ny = M === 12 ? Y + 1 : Y;
+  const nm = M === 12 ? 1 : (M + 1);
+  return `${ny}-${String(nm).padStart(2, '0')}`;
+}
+
+/**
+ * Retourne le mois "actif" (non gelé).
+ * - Si le mois courant (Paris) est gelé dans bonus_ledger => retourne le mois suivant.
+ * - Sinon => retourne le mois courant.
+ */
+async function getActiveMonth(pool, tenantCode, now = new Date()) {
+  const mk = monthKeyParis(now);
+  const frozen = await pool.query(
+    'SELECT 1 FROM bonus_ledger WHERE tenant_code=$1 AND month=$2 LIMIT 1',
+    [tenantCode, mk]
+  );
+  return frozen.rowCount ? nextMonthKey(mk) : mk;
+}
+
 /** ===== LICENCES ===== */
 
 app.get("/api/licences/validate", async (req, res) => {
@@ -2259,38 +2290,45 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
     const empId = Number(req.user.sub);
     if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
 
-    const m = MONTH();
-    // bloqué si gelé ?
-    const frozen = await pool.query(
-      'SELECT 1 FROM bonus_ledger WHERE tenant_code=$1 AND month=$2 LIMIT 1',
-      [code, m]
-    );
-    if (frozen.rowCount) return res.status(409).json({ error: 'MONTH_FROZEN' });
-
     const { formulaId, sale } = req.body || {};
-    if (!formulaId || typeof sale !== 'object') return res.status(400).json({ error: 'BAD_REQUEST' });
+    if (!formulaId || typeof sale !== 'object') {
+      return res.status(400).json({ error: 'BAD_REQUEST' });
+    }
 
-    // récupérer la formule
+    // Récupérer la formule (scopée au tenant)
     const f = await pool.query(
       `SELECT id, version, title, fields, rules
-         FROM bonus_formulas WHERE tenant_code=$1 AND id=$2`,
+         FROM bonus_formulas
+        WHERE tenant_code=$1 AND id=$2`,
       [code, formulaId]
     );
     if (!f.rowCount) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
 
     const formula = f.rows[0];
+
+    // Calcul du bonus (selon ta logique existante)
     const bonus = Number(computeBonusV3(formula, sale) || 0);
 
+    // 🚦 Choisir la période active : si le mois courant est gelé -> mois suivant
+    const activeMonth = await getActiveMonth(pool, code);
+
+    // 💾 Insertion
     await pool.query(
-      `INSERT INTO bonus_entries (tenant_code, employee_id, month, formula_id, sale, bonus)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [code, empId, m, formulaId, sale, bonus]
+      `INSERT INTO bonus_entries
+         (tenant_code, employee_id, month, formula_id, sale, bonus)
+       VALUES
+         ($1,         $2,          $3,    $4,         $5::jsonb, $6)`,
+      [code, empId, activeMonth, formulaId, JSON.stringify(sale), bonus]
     );
 
-    res.json({ success: true, bonus });
+    return res.json({
+      success: true,
+      bonus,
+      period: { month: activeMonth }, // utile côté app pour afficher "Période active : Octobre 2025"
+    });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
@@ -2689,6 +2727,158 @@ app.patch('/settings', authRequired, async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
+// ========================
+// EMPLOYEE: lister ses ventes du mois
+// GET /bonusV3/my-entries?month=YYYY-MM&limit=20
+// ========================
+app.get('/bonusV3/my-entries', authRequired, async (req, res) => {
+  try {
+    const code = String(req.user.company_code || '').trim();
+    const empId = Number(req.user.sub);
+    if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
+
+    const m = String(req.query.month || monthKey());
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || 20), 10) || 20, 1), 200);
+
+    const { rows } = await pool.query(
+      `SELECT e.id,
+              e.month,
+              e.formula_id,
+              COALESCE(f.title, e.formula_id) AS formula_title,
+              e.sale,
+              e.bonus,
+              e.at
+         FROM bonus_entries e
+         LEFT JOIN bonus_formulas f
+           ON f.tenant_code = e.tenant_code AND f.id = e.formula_id
+        WHERE e.tenant_code = $1
+          AND e.employee_id = $2
+          AND e.month = $3
+        ORDER BY e.at DESC
+        LIMIT $4`,
+      [code, empId, m, limit]
+    );
+
+    res.json({ month: m, entries: rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// ========================
+// EMPLOYEE: supprimer UNE de ses ventes (si le mois n'est pas gelé)
+// DELETE /bonusV3/my-entries/:id
+// ========================
+app.delete('/bonusV3/my-entries/:id', authRequired, async (req, res) => {
+  try {
+    const code = String(req.user.company_code || '').trim();
+    const empId = Number(req.user.sub);
+    const id = String(req.params.id || '').trim();
+    if (!code || !empId || !id) return res.status(400).json({ error: 'BAD_CONTEXT' });
+
+    // 1) vérifier que l’entrée existe et appartient au user
+    const cur = await pool.query(
+      `SELECT id, month FROM bonus_entries
+        WHERE tenant_code=$1 AND id=$2 AND employee_id=$3
+        LIMIT 1`,
+      [code, id, empId]
+    );
+    if (!cur.rowCount) return res.status(404).json({ error: 'ENTRY_NOT_FOUND' });
+    const { month } = cur.rows[0];
+
+    // 2) bloquer si le mois est gelé
+    const frozen = await pool.query(
+      'SELECT 1 FROM bonus_ledger WHERE tenant_code=$1 AND month=$2 LIMIT 1',
+      [code, month]
+    );
+    if (frozen.rowCount) return res.status(409).json({ error: 'MONTH_FROZEN' });
+
+    // 3) suppression
+    await pool.query(
+      'DELETE FROM bonus_entries WHERE tenant_code=$1 AND id=$2 AND employee_id=$3',
+      [code, id, empId]
+    );
+    return res.json({ ok: true, id });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+app.post('/bonusV3/summary/freeze', authRequiredOwnerOrManager, async (req, res) => {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    const code = req.user.company_code;
+    const targetMonth = (req.body && req.body.month_key) || monthKeyParis(new Date());
+
+    // Verrouille la dernière période du mois cible
+    const { rows: curRows } = await client.query(
+      `SELECT * FROM bonus_periods
+       WHERE tenant_code = $1 AND month_key = $2
+       ORDER BY cycle DESC, start_at DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [code, targetMonth]
+    );
+
+    if (curRows.length === 0) {
+      // S'il n'y avait pas encore de période pour ce mois, on en crée une et on la fige
+      await client.query(
+        `INSERT INTO bonus_periods (tenant_code, month_key, cycle, frozen, start_at, end_at)
+         VALUES ($1, $2, 1, true, now(), now())`,
+        [code, targetMonth]
+      );
+    } else {
+      const cur = curRows[0];
+      if (!cur.frozen) {
+        await client.query(
+          `UPDATE bonus_periods
+           SET frozen = true, end_at = now()
+           WHERE id = $1`,
+          [cur.id]
+        );
+      }
+    }
+
+    // Ouvrir la période du MOIS SUIVANT (cycle=1)
+    const nextMK = nextMonthKey(targetMonth);
+
+    // Idempotence : n’ouvre pas deux fois
+    const { rows: already } = await client.query(
+      `SELECT * FROM bonus_periods
+       WHERE tenant_code = $1 AND month_key = $2 AND frozen = false
+       LIMIT 1`,
+      [code, nextMK]
+    );
+
+    let opened = already[0];
+    if (!opened) {
+      const ins = await client.query(
+        `INSERT INTO bonus_periods (tenant_code, month_key, cycle, frozen, start_at)
+         VALUES ($1, $2, 1, false, now())
+         RETURNING *`,
+        [code, nextMK]
+      );
+      opened = ins.rows[0];
+    }
+
+    await client.query('COMMIT');
+    return res.json({
+      ok: true,
+      message: `Période ${targetMonth} figée. Nouvelle période ouverte: ${opened.month_key} (cycle ${opened.cycle}).`,
+      new_period: { month_key: opened.month_key, cycle: opened.cycle }
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    return res.status(500).json({ ok: false, error: 'FREEZE_FAILED' });
+  } finally {
+    client.release();
+  }
+});
+
 
 
 
