@@ -495,31 +495,44 @@ app.get("/api/licences/validate", async (req, res) => {
     if (!key) return res.status(400).json({ error: "key required" });
 
     const { rows } = await pool.query(
-      `SELECT tenant_code, status, valid_until, meta
-         FROM licences
-        WHERE lower(tenant_code) = lower($1)`,
+      `SELECT
+         l.tenant_code,
+         l.status,
+         l.valid_until,
+         l.meta,
+         t.name AS tenant_name
+       FROM licences l
+       LEFT JOIN tenants t
+         ON lower(t.code) = lower(l.tenant_code)
+       WHERE lower(l.tenant_code) = lower($1)`,
       [key]
     );
     if (!rows.length) return res.status(404).json({ error: "Unknown licence" });
 
     const lic = rows[0];
     const s = String(lic.status || '').toLowerCase();
-    if (!(s === 'active' || s === 'trial')) return res.status(403).json({ error: "Licence inactive" });
+    if (!(s === 'active' || s === 'trial')) {
+      return res.status(403).json({ error: "Licence inactive" });
+    }
 
     const safe = {
       company: {
-        name: lic?.meta?.company_name || null,
-        contact_email: lic?.meta?.contact_email || null,
+        // ✅ priorité à tenants.name, sinon meta.company_name
+        name: lic?.tenant_name || lic?.meta?.company_name || null,
+        // petit fallback tolérant si meta.email était utilisé :
+        contact_email: lic?.meta?.contact_email || lic?.meta?.email || null,
       },
       company_code: lic.tenant_code,
       modules: lic?.meta?.modules || null,
       expires_at: lic.valid_until || null,
     };
+
     return res.json({ licence: safe, sig: sign(safe) });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 /** ===== AUTH / TENANT ===== */
