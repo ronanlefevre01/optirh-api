@@ -1167,34 +1167,45 @@ app.get('/leaves/pending', authRequired, async (req, res) => {
 // GET /calendar/events?from=YYYY-MM-DD&to=YYYY-MM-DD
 // Récupère les événements qui chevauchent l’intervalle
 // ————————————————————————————————
-app.get('/calendar/events', authRequired, async (req, res) => {
+// GET /calendar  et /calendar/events
+app.get(['/calendar', '/calendar/events'], authRequired, async (req, res) => {
   try {
-    const code  = String(req.user.company_code || '').trim();
-    const from  = req.query.from || null; // optionnel YYYY-MM-DD
-    const to    = req.query.to   || null;
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+
+    const from = String(req.query.from || '').trim(); // YYYY-MM-DD (optionnel)
+    const to   = String(req.query.to   || '').trim();
 
     const clauses = ['tenant_code = $1'];
-    const params  = [code];
+    const params = [code];
     let i = 2;
-    if (from) { clauses.push(`end_date >= $${i++}::date`); params.push(from); }
+
+    if (from) { clauses.push(`end_date   >= $${i++}::date`); params.push(from); }
     if (to)   { clauses.push(`start_date <= $${i++}::date`); params.push(to);   }
 
-    const { rows } = await pool.query(`
+    const sql = `
       SELECT
-        id, title, description,
-        TO_CHAR(start_date,'DD/MM/YYYY') AS start_date,
-        TO_CHAR(end_date,'DD/MM/YYYY')   AS end_date,
-        all_day, kind, source, source_id, created_at, updated_at
+        id,
+        title,
+        COALESCE(description,'') AS description,
+        -- ⚠️ format machine pour l'app
+        TO_CHAR(start_date,'YYYY-MM-DD') AS start_date,
+        TO_CHAR(end_date,'YYYY-MM-DD')   AS end_date,
+        all_day, kind, source, source_id,
+        created_at, updated_at
       FROM calendar_events
       WHERE ${clauses.join(' AND ')}
-      ORDER BY start_date, title
-    `, params);
+      ORDER BY start_date, title;
+    `;
 
+    const { rows } = await pool.query(sql, params);
     res.json({ events: rows });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 // ————————————————————————————————
