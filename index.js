@@ -1438,6 +1438,7 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
 
 // === OWNER crée un congé pour n'importe quel salarié (ou pour lui-même) ===
 // OWNER crée un congé pour n'importe quel salarié (avec possibilité de forcer)
+// === OWNER crée un congé pour n'importe quel salarié (avec possibilité de forcer)
 app.post('/leaves/admin', authRequired, async (req, res) => {
   try {
     const role = String(req.user.role || '').toUpperCase();
@@ -1450,7 +1451,6 @@ app.post('/leaves/admin', authRequired, async (req, res) => {
     if (!re.test(start_date) || !re.test(end_date)) return res.status(400).json({ error: 'bad date format' });
     if (String(start_date) > String(end_date)) return res.status(400).json({ error: 'start <= end' });
 
-    // user doit exister dans CE tenant
     const u = await pool.query(
       `SELECT id, first_name, last_name, email FROM users WHERE id = $1 AND tenant_code = $2`,
       [Number(user_id), code]
@@ -1470,28 +1470,33 @@ app.post('/leaves/admin', authRequired, async (req, res) => {
       );
       const leave = ins.rows[0];
 
-      let event = null;
+      // ⬇️ Nouveau schéma : crée/maj l’événement avec upsertCalendarForLeave
       if (normalized === 'APPROVED') {
-        const label = `Congé ${(u.rows[0].first_name || '')} ${(u.rows[0].last_name || '')}`.trim() || 'Congé';
-        const ev = await client.query(
-          `INSERT INTO calendar_events (tenant_code, leave_id, title, start, "end", employee_id)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (tenant_code, leave_id)
-           DO UPDATE SET title=EXCLUDED.title, start=EXCLUDED.start, "end"=EXCLUDED."end", employee_id=EXCLUDED.employee_id, updated_at=now()
-           RETURNING *`,
-          [code, leave.id, label, leave.start_date, leave.end_date, leave.employee_id]
-        );
-        event = ev.rows[0];
+        await upsertCalendarForLeave(client, code, leave.id);
       }
 
       await client.query('COMMIT');
 
-      // Push (facultatif)
+      // Optionnel : récupérer l’event créé (nouveau schéma)
+      let event = null;
+      if (normalized === 'APPROVED') {
+        const ev = await pool.query(
+          `SELECT id, title,
+                  TO_CHAR(start_date,'YYYY-MM-DD') AS start_date,
+                  TO_CHAR(end_date,'YYYY-MM-DD')   AS end_date
+             FROM calendar_events
+            WHERE tenant_code=$1 AND source='leaves' AND source_id=$2`,
+          [code, leave.id]
+        );
+        event = ev.rows[0] || null;
+      }
+
+      // Push
       try {
         const tokens = (await pool.query(
           `SELECT token FROM devices WHERE tenant_code=$1 AND user_id=$2`,
           [code, Number(user_id)]
-        )).rows.map(r => r.token);
+        )).rows.map(r => r.token).filter(Boolean);
         if (tokens.length) {
           await sendExpoPush(tokens, {
             title: normalized==='APPROVED' ? 'Congé ajouté ✅' : 'Demande ajoutée 🕒',
@@ -1512,7 +1517,6 @@ app.post('/leaves/admin', authRequired, async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
-
 
 
 // Modifier un événement d'agenda (OWNER)
@@ -1543,43 +1547,84 @@ app.patch('/calendar/events/:id', authRequired, async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // Lock l'event
-      const cur = await client.query(
-        `SELECT id, tenant_code, leave_id, title, start, "end", employee_id
-           FROM calendar_events
-          WHERE tenant_code=$1 AND id=$2
-          FOR UPDATE`,
-        [code, eventId]
-      );
-      if (!cur.rows.length) {
-        throw Object.assign(new Error('Event not found'), { status: 404 });
+      // Essai nouveau schéma
+      let legacyMode = false;
+      let cur;
+      try {
+        cur = await client.query(
+          `SELECT id, tenant_code, source, source_id, title, start_date, end_date
+             FROM calendar_events
+            WHERE tenant_code=$1 AND id=$2
+            FOR UPDATE`,
+          [code, eventId]
+        );
+      } catch (e) {
+        if (e && e.code === '42703') legacyMode = true; else throw e;
       }
+
+      if (!cur || !cur.rowCount) {
+        if (!legacyMode) throw Object.assign(new Error('Event not found'), { status: 404 });
+        // Legacy
+        cur = await client.query(
+          `SELECT id, tenant_code, leave_id, title, start, "end"
+             FROM calendar_events
+            WHERE tenant_code=$1 AND id=$2
+            FOR UPDATE`,
+          [code, eventId]
+        );
+        if (!cur.rowCount) throw Object.assign(new Error('Event not found'), { status: 404 });
+      }
+
       const ev = cur.rows[0];
 
-      const newStart = start ?? ev.start;
-      const newEnd   = end   ?? ev["end"];
-      const newTitle = (title !== undefined) ? title : ev.title;
+      if (!legacyMode) {
+        const newStart = start ?? ev.start_date;
+        const newEnd   = end   ?? ev.end_date;
+        const newTitle = (title !== undefined) ? title : ev.title;
 
-      // Update event
-      const up = await client.query(
-        `UPDATE calendar_events
-            SET title=$1, start=$2, "end"=$3, updated_at=now()
-          WHERE tenant_code=$4 AND id=$5
-          RETURNING id, tenant_code, leave_id, title, start, "end", employee_id, created_at, updated_at`,
-        [newTitle, newStart, newEnd, code, eventId]
-      );
-      updatedEvent = up.rows[0];
-
-      // Si lié à un congé, on garde les dates en phase
-      if (ev.leave_id) {
-        const upLeave = await client.query(
-          `UPDATE leaves
-              SET start_date=$1, end_date=$2, updated_at=now()
-            WHERE tenant_code=$3 AND id=$4
-            RETURNING id, tenant_code, employee_id, type, status, start_date, end_date, updated_at`,
-          [newStart, newEnd, code, ev.leave_id]
+        const up = await client.query(
+          `UPDATE calendar_events
+              SET title=$1, start_date=$2, end_date=$3, updated_at=now()
+            WHERE tenant_code=$4 AND id=$5
+            RETURNING id, tenant_code, source, source_id, title, start_date, end_date, created_at, updated_at`,
+          [newTitle, newStart, newEnd, code, eventId]
         );
-        if (upLeave.rows.length) updatedLeave = upLeave.rows[0];
+        updatedEvent = up.rows[0];
+
+        if (ev.source === 'leaves' && ev.source_id) {
+          const upLeave = await client.query(
+            `UPDATE leaves
+                SET start_date=$1, end_date=$2, updated_at=now()
+              WHERE tenant_code=$3 AND id=$4
+              RETURNING id, tenant_code, employee_id, type, status, start_date, end_date, updated_at`,
+            [newStart, newEnd, code, ev.source_id]
+          );
+          if (upLeave.rows.length) updatedLeave = upLeave.rows[0];
+        }
+      } else {
+        const newStart = start ?? ev.start;
+        const newEnd   = end   ?? ev.end;
+        const newTitle = (title !== undefined) ? title : ev.title;
+
+        const up = await client.query(
+          `UPDATE calendar_events
+              SET title=$1, start=$2, "end"=$3, updated_at=now()
+            WHERE tenant_code=$4 AND id=$5
+            RETURNING id, tenant_code, leave_id, title, start, "end", created_at, updated_at`,
+          [newTitle, newStart, newEnd, code, eventId]
+        );
+        updatedEvent = up.rows[0];
+
+        if (ev.leave_id) {
+          const upLeave = await client.query(
+            `UPDATE leaves
+                SET start_date=$1, end_date=$2, updated_at=now()
+              WHERE tenant_code=$3 AND id=$4
+              RETURNING id, tenant_code, employee_id, type, status, start_date, end_date, updated_at`,
+            [newStart, newEnd, code, ev.leave_id]
+          );
+          if (upLeave.rows.length) updatedLeave = upLeave.rows[0];
+        }
       }
 
       await client.query('COMMIT');
@@ -1601,63 +1646,113 @@ app.patch('/calendar/events/:id', authRequired, async (req, res) => {
 });
 
 
+
 // DELETE /calendar/events/:id — delete event (+ cancel linked leave if any)
-app.delete('/calendar/events/:id', authRequired, async (req, res) => {
+app.delete("/calendar/events/:id", authRequired, async (req, res) => {
   try {
-    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
-      return res.status(403).json({ error: 'Forbidden' });
+    if (!OWNER_LIKE.has(String(req.user.role || "").toUpperCase())) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
-    const code = String(req.user.company_code || '').trim();
-    const eventId = String(req.params.id || '').trim();
-    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
-    if (!eventId) return res.status(400).json({ error: 'BAD_EVENT_ID' });
+    const code    = String(req.user.company_code || "").trim();
+    const eventId = String(req.params.id || "").trim();
+    if (!code)    return res.status(400).json({ error: "TENANT_CODE_MISSING" });
+    if (!eventId) return res.status(400).json({ error: "BAD_EVENT_ID" });
 
     let removedEvent = null;
     let cancelledLeave = null;
 
     const client = await pool.connect();
     try {
-      await client.query('BEGIN');
+      await client.query("BEGIN");
 
-      // Lock + read event
-      const cur = await client.query(
-        `SELECT id, tenant_code, leave_id, title, start, "end", employee_id
-           FROM calendar_events
-          WHERE tenant_code=$1 AND id=$2
-          FOR UPDATE`,
-        [code, eventId]
-      );
-      if (!cur.rows.length) {
-        throw Object.assign(new Error('Event not found'), { status: 404 });
+      // --- Lecture + lock de l'event
+      let legacyMode = false;
+      let cur;
+      try {
+        // Nouveau schéma
+        cur = await client.query(
+          `SELECT id, tenant_code, title, description,
+                  TO_CHAR(start_date,'YYYY-MM-DD') AS start_date,
+                  TO_CHAR(end_date  ,'YYYY-MM-DD') AS end_date,
+                  all_day, kind, source, source_id, created_at, updated_at
+             FROM calendar_events
+            WHERE tenant_code=$1 AND id=$2
+            FOR UPDATE`,
+          [code, eventId]
+        );
+      } catch (e) {
+        // Colonne inconnue -> probablement schéma legacy
+        if (e && e.code === "42703") legacyMode = true;
+        else throw e;
       }
+
+      if (!cur || !cur.rowCount) {
+        if (!legacyMode) {
+          throw Object.assign(new Error("Event not found"), { status: 404 });
+        }
+        // Fallback legacy
+        cur = await client.query(
+          `SELECT id, tenant_code, leave_id, title, start, "end", employee_id
+             FROM calendar_events
+            WHERE tenant_code=$1 AND id=$2
+            FOR UPDATE`,
+          [code, eventId]
+        );
+        if (!cur.rowCount) {
+          throw Object.assign(new Error("Event not found"), { status: 404 });
+        }
+      }
+
       removedEvent = cur.rows[0];
 
-      // Delete event
+      // --- Suppression de l'event
       await client.query(
         `DELETE FROM calendar_events WHERE tenant_code=$1 AND id=$2`,
         [code, eventId]
       );
 
-      // Si lié à un congé -> annule le congé
-      if (removedEvent.leave_id) {
-        const up = await client.query(
-          `UPDATE leaves
-              SET status='CANCELLED',
-                  decided_by=$1,
-                  decided_at=now(),
-                  updated_at=now()
-            WHERE tenant_code=$2 AND id=$3
-            RETURNING id, tenant_code, employee_id, type, status, start_date, end_date, decided_by, decided_at, updated_at`,
-          [Number(req.user.sub), code, removedEvent.leave_id]
-        );
-        if (up.rows.length) cancelledLeave = up.rows[0];
+      // --- Si lié à un congé : on annule le congé
+      if (!legacyMode) {
+        if (removedEvent.source === "leaves" && removedEvent.source_id) {
+          const up = await client.query(
+            `UPDATE leaves
+                SET status='CANCELLED',
+                    decided_by=$1,
+                    decided_at=now(),
+                    updated_at=now()
+              WHERE tenant_code=$2 AND id=$3
+              RETURNING id, tenant_code, employee_id, type, status,
+                        TO_CHAR(start_date,'YYYY-MM-DD') AS start_date,
+                        TO_CHAR(end_date  ,'YYYY-MM-DD') AS end_date,
+                        decided_by, decided_at, updated_at`,
+            [Number(req.user.sub), code, Number(removedEvent.source_id)]
+          );
+          cancelledLeave = up.rows[0] || null;
+        }
+      } else {
+        if (removedEvent.leave_id) {
+          const up = await client.query(
+            `UPDATE leaves
+                SET status='CANCELLED',
+                    decided_by=$1,
+                    decided_at=now(),
+                    updated_at=now()
+              WHERE tenant_code=$2 AND id=$3
+              RETURNING id, tenant_code, employee_id, type, status,
+                        TO_CHAR(start_date,'YYYY-MM-DD') AS start_date,
+                        TO_CHAR(end_date  ,'YYYY-MM-DD') AS end_date,
+                        decided_by, decided_at, updated_at`,
+            [Number(req.user.sub), code, Number(removedEvent.leave_id)]
+          );
+          cancelledLeave = up.rows[0] || null;
+        }
       }
 
-      await client.query('COMMIT');
+      await client.query("COMMIT");
     } catch (e) {
-      try { await client.query('ROLLBACK'); } catch {}
-      if (e.status === 404) return res.status(404).json({ error: 'Event not found' });
+      try { await client.query("ROLLBACK"); } catch {}
+      if (e.status === 404) return res.status(404).json({ error: "Event not found" });
       throw e;
     } finally {
       client.release();
@@ -1666,10 +1761,11 @@ app.delete('/calendar/events/:id', authRequired, async (req, res) => {
     return res.json({ ok: true, removed: removedEvent, leave_cancelled: cancelledLeave });
   } catch (e) {
     console.error(e);
-    const msg = String(e.message || e);
-    return res.status(500).json({ error: msg });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
+
 
 /** ===== ANNOUNCEMENTS (panneau d’affichage) ===== */
 
@@ -3312,6 +3408,7 @@ app.get('/legal/status', authRequired, async (req, res) => {
 // POST /legal/accept  -> enregistre l’acceptation de l’utilisateur courant
 // body: { acceptCGU?: boolean, acceptCGV?: boolean }
 // POST /legal/accept — enregistre l'acceptation des CGU/CGV pour l'utilisateur courant
+// POST /legal/accept — enregistre l'acceptation des CGU/CGV pour l'utilisateur courant
 app.post('/legal/accept', authRequired, async (req, res) => {
   try {
     const code = String(req.user.company_code || '').trim();
@@ -3322,71 +3419,44 @@ app.post('/legal/accept', authRequired, async (req, res) => {
 
     const { acceptCGU, acceptCGV } = req.body || {};
 
-    // Vérifier que l'utilisateur existe dans ce tenant
-    const u = await pool.query(
-      'SELECT id FROM users WHERE tenant_code=$1 AND id=$2',
-      [code, uid]
-    );
-    if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
-
-    // Récup versions légales depuis settings (fallback défauts)
-    const s = await pool.query(
-      `SELECT value FROM settings WHERE tenant_code=$1 AND key='legal_versions'`,
+    // Récup versions depuis settings (fallbacks par défaut)
+    const { rows: srows } = await pool.query(
+      `SELECT key, value FROM settings
+        WHERE tenant_code=$1 AND key IN ('legal_versions')`,
       [code]
     );
-    const defVersions = { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
-    const versions = s.rows.length && s.rows[0].value
-      ? { ...defVersions, ...s.rows[0].value }
-      : defVersions;
-
-    // Règles: CGU pour tous; CGV uniquement OWNER
-    if (acceptCGV && role !== 'OWNER') {
-      return res.status(403).json({ error: 'FORBIDDEN_CGV_NON_OWNER' });
+    let versions = { cgu: '1.0', cgv: '1.0', privacy: '1.0' };
+    for (const r of srows) {
+      if (r.key === 'legal_versions' && r.value) versions = { ...versions, ...r.value };
     }
 
-    // Si rien à enregistrer, on renvoie OK (comportement compatible)
-    if (!acceptCGU && !acceptCGV) {
-      return res.json({ ok: true });
-    }
+    const upsert = async (doc, version) => {
+      await pool.query(
+        `INSERT INTO legal_acceptances (tenant_code, user_id, doc, version, accepted_at)
+         VALUES ($1,$2,$3,$4, now())
+         ON CONFLICT (tenant_code, user_id, doc)
+         DO UPDATE SET version=EXCLUDED.version, accepted_at=now()`,
+        [code, uid, doc, version]
+      );
+    };
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    let did = false;
+    if (acceptCGU === true) { await upsert('cgu', versions.cgu); did = true; }
+    if (acceptCGV === true && role === 'OWNER') { await upsert('cgv', versions.cgv); did = true; }
 
-      const upsertAcceptance = async (doc, ver) => {
-        await client.query(
-          `INSERT INTO legal_acceptances (tenant_code, user_id, doc, version, accepted_at)
-           VALUES ($1,$2,$3,$4, now())
-           ON CONFLICT (tenant_code, user_id, doc)
-           DO UPDATE SET version = EXCLUDED.version, accepted_at = now()`,
-          [code, uid, doc, String(ver)]
-        );
-      };
+    if (!did) return res.status(400).json({ error: 'NOTHING_ACCEPTED' });
 
-      if (acceptCGU) await upsertAcceptance('cgu', versions.cgu);
-      if (acceptCGV) await upsertAcceptance('cgv', versions.cgv);
-
-      await client.query('COMMIT');
-    } catch (e) {
-      try { await client.query('ROLLBACK'); } catch {}
-      throw e;
-    } finally {
-      client.release();
-    }
-
-    return res.json({ ok: true });
+    return res.json({ ok: true, accepted: { cgu: !!acceptCGU, cgv: role === 'OWNER' ? !!acceptCGV : false } });
   } catch (e) {
-    const msg = String(e.message || e);
-    if (msg.includes('User not found'))   return res.status(404).json({ error: msg });
-    if (msg.includes('FORBIDDEN_CGV_NON_OWNER')) return res.status(403).json({ error: msg });
-    return res.status(500).json({ error: msg });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 
-const PORT = process.env.PORT || 3000;
-// '0.0.0.0' = écoute toutes interfaces (utile en local et sur Render)
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`API up on http://localhost:${PORT}`);
-});
 
+const PORT = process.env.PORT || 3001;
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => console.log(`[api] listening on :${PORT}`));
+}
+export default app;
