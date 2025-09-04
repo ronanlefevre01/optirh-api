@@ -529,9 +529,9 @@ function nextMonthKey(monthKey /* "YYYY-MM" */) {
 }
 
 /**
- * Retourne le mois "actif" (non gelé).
- * - Si le mois courant (Paris) est gelé dans bonus_ledger => retourne le mois suivant.
- * - Sinon => retourne le mois courant.
+ * Mois "actif" pour l'INSERT (écritures) :
+ * - Si le mois courant (Paris) est gelé dans bonus_ledger => on écrit dans le mois suivant.
+ * - Sinon => on écrit dans le mois courant.
  */
 async function getActiveMonth(pool, tenantCode, now = new Date()) {
   const mk = monthKeyParis(now);
@@ -542,14 +542,40 @@ async function getActiveMonth(pool, tenantCode, now = new Date()) {
   return frozen.rowCount ? nextMonthKey(mk) : mk;
 }
 
-// ---- helpers période (utilitaire pour accepter 'active' / 'current') ----
-async function parseOrActiveMonth(raw, code) {
-  if (!raw || raw === 'active' || raw === 'current') {
-    return await getActiveMonth(pool, code); // renvoie 'YYYY-MM' actif
-  }
-  return String(raw).trim();
+// ====== Périodes actives pour la LECTURE (agrégation multi-clés) ======
+async function lastFrozenMonth(pool, tenant) {
+  const r = await pool.query(
+    `SELECT month
+       FROM bonus_ledger
+      WHERE tenant_code=$1
+      ORDER BY (COALESCE(frozen_at::text, month)) DESC, seq DESC
+      LIMIT 1`,
+    [tenant]
+  );
+  return r.rowCount ? String(r.rows[0].month) : null;
+}
+const uniq = (a) => [...new Set(a.filter(Boolean))];
+
+/**
+ * Clé(s) de période active pour AFFICHER les totaux :
+ * - après un freeze, la période “vivante” = nextMonthKey(dernier_freeze)
+ * - on inclut aussi le mois courant en filet de sécu
+ * - s'il n'y a jamais eu de freeze : mois courant uniquement
+ */
+async function getActivePeriodKeys(pool, tenant, now = new Date()) {
+  const nowM = monthKeyParis(now);
+  const last = await lastFrozenMonth(pool, tenant);
+  if (!last) return [nowM];
+  const next = nextMonthKey(last);
+  return uniq([next, nowM]);
 }
 
+/** Accepte ?month=active|current|YYYY-MM et renvoie toujours un tableau de clés */
+async function parseMonthOrActiveKeys(raw, tenant) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s || s === 'active' || s === 'current') return await getActivePeriodKeys(pool, tenant);
+  return [String(raw).trim()];
+}
 
 /** ===== LICENCES ===== */
 
@@ -2564,20 +2590,20 @@ app.get('/bonusV3/my-total', authRequired, async (req, res) => {
     const empId = Number(req.user.sub);
     if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
 
-    const m = await parseOrActiveMonth(req.query.month, code);
+    const months = await parseMonthOrActiveKeys(req.query.month, code);
 
     const { rows } = await pool.query(
-      `SELECT COALESCE(SUM(bonus),0)::float AS total,
-              COUNT(*)::int                 AS count
+      `SELECT COALESCE(SUM(bonus),0)::float AS total, COUNT(*)::int AS count
          FROM bonus_entries
-        WHERE tenant_code = $1
-          AND employee_id = $2
-          AND to_date(month || '-01','YYYY-MM-DD')
-              = to_date($3    || '-01','YYYY-MM-DD')`,
-      [code, empId, m]
+        WHERE tenant_code=$1 AND employee_id=$2 AND month = ANY($3::text[])`,
+      [code, empId, months]
     );
 
-    return res.json({ month: m, total: rows[0].total, count: rows[0].count });
+    return res.json({
+      period: { keys: months },  // ex: ['2025-10'] ou ['2025-10','2025-09'] (filet)
+      total: rows[0].total,
+      count: rows[0].count,
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
@@ -2589,45 +2615,30 @@ app.get('/bonusV3/my-total', authRequired, async (req, res) => {
 app.get('/bonusV3/summary', authRequired, async (req, res) => {
   try {
     if (!isOwnerLike(req.user.role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
-    const code = String(req.user.company_code || '').trim();
-    const m = await parseOrActiveMonth(req.query.month, code);
+
+    const code   = String(req.user.company_code || '').trim();
+    const months = await parseMonthOrActiveKeys(req.query.month, code);
 
     const byEmp = await pool.query(
-      `SELECT employee_id,
-              COALESCE(SUM(bonus),0)::float AS total,
-              COUNT(*)::int                 AS count
+      `SELECT employee_id, COALESCE(SUM(bonus),0)::float AS total, COUNT(*)::int AS count
          FROM bonus_entries
-        WHERE tenant_code = $1
-          AND to_date(month || '-01','YYYY-MM-DD')
-              = to_date($2    || '-01','YYYY-MM-DD')
+        WHERE tenant_code=$1 AND month = ANY($2::text[])
         GROUP BY employee_id`,
-      [code, m]
+      [code, months]
     );
 
     const byFormula = await pool.query(
       `SELECT formula_id, COALESCE(SUM(bonus),0)::float AS total
          FROM bonus_entries
-        WHERE tenant_code = $1
-          AND to_date(month || '-01','YYYY-MM-DD')
-              = to_date($2    || '-01','YYYY-MM-DD')
+        WHERE tenant_code=$1 AND month = ANY($2::text[])
         GROUP BY formula_id`,
-      [code, m]
+      [code, months]
     );
 
     const users = await pool.query(
       `SELECT id, email, first_name, last_name
-         FROM users
-        WHERE tenant_code = $1`,
+         FROM users WHERE tenant_code=$1`,
       [code]
-    );
-
-    const last = await pool.query(
-      `SELECT frozen_at
-         FROM bonus_ledger
-        WHERE tenant_code = $1 AND month = $2
-        ORDER BY seq DESC
-        LIMIT 1`,
-      [code, m]
     );
 
     const employees = {};
@@ -2635,31 +2646,31 @@ app.get('/bonusV3/summary', authRequired, async (req, res) => {
       employees[String(u.id)] = {
         id: u.id,
         email: u.email,
-        name: [u.first_name || '', u.last_name || ''].join(' ').trim() || u.email
+        name: [u.first_name||'', u.last_name||''].join(' ').trim() || u.email
       };
     }
 
     const be = {};
-    byEmp.rows.forEach(r => { be[String(r.employee_id)] = { total: r.total, count: r.count }; });
+    for (const r of byEmp.rows) be[String(r.employee_id)] = { total: r.total, count: r.count };
 
     const bf = {};
-    byFormula.rows.forEach(r => { bf[r.formula_id] = r.total; });
+    for (const r of byFormula.rows) bf[r.formula_id] = r.total;
 
     const totalAll = Object.values(be).reduce((s, x) => s + (x.total || 0), 0);
 
     return res.json({
-      month: m,
+      period: { keys: months },     // <- à afficher "Période en cours"
       totalAll,
       byEmployee: be,
       byFormula: bf,
-      employees,
-      lastFrozenAt: last.rowCount ? last.rows[0].frozen_at : null
+      employees
     });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: String(e.message || e) });
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 // 2.4 Geler le mois (OWNER) : snapshot + purge des saisies du mois
 // 2.4 Geler le mois (OWNER) : snapshot → NE SUPPRIME PAS les entrées
@@ -2722,39 +2733,23 @@ app.post('/bonusV3/freeze', authRequired, async (req, res) => {
 // 9) Liste des entrées d’un employé (OWNER)
 app.get('/bonusV3/entries', authRequired, bonusRequireOwner, async (req, res) => {
   try {
-    const code = bonusCompanyCodeOf(req);
-    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
-
+    const code  = bonusCompanyCodeOf(req);
     const empId = Number(req.query.empId);
-    if (!Number.isInteger(empId) || empId <= 0) {
-      return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
-    }
+    if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
 
-    const m = await parseOrActiveMonth(req.query.month, code);
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || 100), 10) || 100, 1), 1000);
+    const months = await parseMonthOrActiveKeys(req.query.month, code);
 
     const { rows } = await pool.query(
-      `SELECT e.id,
-              e.month,
-              e.employee_id,
-              e.formula_id,
-              COALESCE(f.title, e.formula_id) AS formula_title,
-              e.sale,
-              e.bonus,
-              e.at
-         FROM bonus_entries e
-         LEFT JOIN bonus_formulas f
-           ON f.tenant_code = e.tenant_code AND f.id = e.formula_id
-        WHERE e.tenant_code = $1
-          AND e.employee_id = $2
-          AND to_date(e.month || '-01','YYYY-MM-DD')
-              = to_date($3     || '-01','YYYY-MM-DD')
-        ORDER BY e.at DESC
-        LIMIT $4`,
-      [code, empId, m, limit]
+      `SELECT id, month, employee_id, formula_id, sale, bonus, at
+         FROM bonus_entries
+        WHERE tenant_code=$1
+          AND month = ANY($2::text[])
+          AND employee_id=$3
+        ORDER BY at DESC`,
+      [code, months, empId]
     );
 
-    return res.json({ month: m, empId, entries: rows });
+    return res.json({ period: { keys: months }, empId, entries: rows });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
@@ -2762,33 +2757,43 @@ app.get('/bonusV3/entries', authRequired, bonusRequireOwner, async (req, res) =>
 });
 
 
+
 // 10) Historique gel d’un employé (OWNER) — lit bonus_ledger
 app.get('/bonusV3/history', authRequired, bonusRequireOwner, async (req, res) => {
   try {
-    const code = bonusCompanyCodeOf(req);
-    const empId = String(req.query.empId || '').trim();
+    const code  = bonusCompanyCodeOf(req);
+    const empId = Number(req.query.empId);
     if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
 
+    // total par période figée pour cet employé (depuis bonus_ledger)
     const { rows } = await pool.query(
-      `SELECT month, seq, frozen_at, by_employee
-         FROM bonus_ledger
-        WHERE tenant_code=$1
-        ORDER BY (COALESCE(frozen_at::text, month)) DESC, seq DESC`,
-      [code]
+      `SELECT
+         month,
+         seq,
+         frozen_at,
+         COALESCE((by_employee ->> $2)::double precision, 0) AS total
+       FROM bonus_ledger
+       WHERE tenant_code = $1
+         AND COALESCE((by_employee ->> $2)::double precision, 0) > 0
+       ORDER BY frozen_at DESC, month DESC, seq DESC`,
+      [code, String(empId)]
     );
 
-    const out = rows.map(r => ({
-      month: r.month,
-      seq: r.seq,
-      frozenAt: r.frozen_at,
-      total: Number((r.by_employee && r.by_employee[empId]) || 0)
-    })).filter(x => x.total > 0);
-
-    res.json({ empId: Number(empId), history: out });
+    return res.json({
+      empId,
+      history: rows.map(r => ({
+        month: String(r.month),
+        seq: Number(r.seq),
+        frozenAt: r.frozen_at ? String(r.frozen_at) : null,
+        total: Number(r.total),
+      })),
+    });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 // 11) Formules côté Employé
 app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, async (req, res) => {
@@ -3025,35 +3030,31 @@ app.get('/bonusV3/my-entries', authRequired, async (req, res) => {
     const empId = Number(req.user.sub);
     if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
 
-    const m = await parseOrActiveMonth(req.query.month, code);
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || 20), 10) || 20, 1), 200);
+    const months = await parseMonthOrActiveKeys(req.query.month, code);
+    const limit  = Math.min(Math.max(parseInt(String(req.query.limit || 20), 10) || 20, 1), 200);
 
     const { rows } = await pool.query(
-      `SELECT e.id,
-              e.month,
-              e.formula_id,
+      `SELECT e.id, e.month, e.formula_id,
               COALESCE(f.title, e.formula_id) AS formula_title,
-              e.sale,
-              e.bonus,
-              e.at
+              e.sale, e.bonus, e.at
          FROM bonus_entries e
          LEFT JOIN bonus_formulas f
            ON f.tenant_code = e.tenant_code AND f.id = e.formula_id
         WHERE e.tenant_code = $1
           AND e.employee_id = $2
-          AND to_date(e.month || '-01','YYYY-MM-DD')
-              = to_date($3     || '-01','YYYY-MM-DD')
+          AND e.month = ANY($3::text[])
         ORDER BY e.at DESC
         LIMIT $4`,
-      [code, empId, m, limit]
+      [code, empId, months, limit]
     );
 
-    return res.json({ month: m, entries: rows });
+    res.json({ period: { keys: months }, entries: rows });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: String(e.message || e) });
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 
