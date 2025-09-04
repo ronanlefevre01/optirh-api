@@ -2550,18 +2550,27 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
 // 2.2 Total de l’utilisateur courant (EMPLOYEE/OWNER)
 app.get('/bonusV3/my-total', authRequired, async (req, res) => {
   try {
-    const code = String(req.user.company_code || '').trim();
+    const code  = String(req.user.company_code || '').trim();
     const empId = Number(req.user.sub);
-    const m = String(req.query.month || MONTH());
-    const rows = await pool.query(
+    if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
+
+    // si month est fourni on le respecte, sinon on prend le mois ACTIF
+    let m = String(req.query.month || '').trim();
+    if (!m || m === 'active' || m === 'current') {
+      m = await getActiveMonth(pool, code);
+    }
+
+    const { rows } = await pool.query(
       `SELECT COALESCE(SUM(bonus),0)::float AS total, COUNT(*)::int AS count
          FROM bonus_entries
         WHERE tenant_code=$1 AND employee_id=$2 AND month=$3`,
       [code, empId, m]
     );
-    res.json({ month: m, total: rows.rows[0].total, count: rows.rows[0].count });
+
+    return res.json({ month: m, total: rows[0].total, count: rows[0].count });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
@@ -2966,7 +2975,7 @@ app.get('/bonusV3/my-entries', authRequired, async (req, res) => {
     const empId = Number(req.user.sub);
     if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
 
-    const m = String(req.query.month || monthKey());
+    const m = String(req.query.month || (await getActiveMonth(pool, code)));
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || 20), 10) || 20, 1), 200);
 
     const { rows } = await pool.query(
