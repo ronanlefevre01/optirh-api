@@ -342,6 +342,30 @@ async function sendExpoPush(tokens = [], message = { title: '', body: '', data: 
   }
 }
 
+// ---- Helpers tokens ---------------------------------------------------------
+async function getTokensForRoles(tenantCode, roles /* ['OWNER','HR'] */) {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT d.token
+       FROM devices d
+       JOIN users u
+         ON u.tenant_code = d.tenant_code AND u.id = d.user_id
+      WHERE d.tenant_code = $1
+        AND u.role = ANY($2::text[])`,
+    [tenantCode, roles]
+  );
+  return rows.map(r => r.token).filter(Boolean);
+}
+
+async function getTokensForUser(tenantCode, userId) {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT token
+       FROM devices
+      WHERE tenant_code = $1 AND user_id = $2`,
+    [tenantCode, Number(userId)]
+  );
+  return rows.map(r => r.token).filter(Boolean);
+}
+
 
 
 
@@ -1026,7 +1050,8 @@ app.post('/leaves', authRequired, async (req, res) => {
       SELECT l.id, l.employee_id, l.type, l.status, l.start_date, l.end_date,
              u.first_name, u.last_name, u.email
         FROM leaves l
-        JOIN users u ON u.id = l.employee_id
+        JOIN users u
+          ON u.id = l.employee_id AND u.tenant_code = l.tenant_code   -- ✅ scoped by tenant
        WHERE ${cClauses.join(' AND ')}
        ORDER BY l.start_date
     `;
@@ -1046,7 +1071,33 @@ app.post('/leaves', authRequired, async (req, res) => {
 
     const leave = ins.rows[0];
 
-    // On enrichit la réponse d’un snapshot "requester" (non stocké)
+    // Push aux OWNER/HR : "Nouvelle demande de congé"
+    try {
+      const tokRes = await pool.query(
+        `SELECT DISTINCT d.token
+           FROM devices d
+           JOIN users u
+             ON u.tenant_code = d.tenant_code AND u.id = d.user_id
+          WHERE d.tenant_code = $1
+            AND u.role IN ('OWNER','HR')`,
+        [code]
+      );
+      const tokens = tokRes.rows.map(r => r.token).filter(Boolean);
+      if (tokens.length) {
+        const who =
+          [requester.first_name, requester.last_name].filter(Boolean).join(' ').trim() ||
+          requester.email;
+        await sendExpoPush(tokens, {
+          title: 'Demande de congé 🕒',
+          body: `${who} • du ${start_date} au ${end_date}`,
+          data: { type: 'leave_request', leaveId: leave.id }
+        });
+      }
+    } catch (e) {
+      console.warn('[push] leave-create -> owners', e?.message || e);
+    }
+
+    // Réponse enrichie
     const responseLeave = {
       ...leave,
       requester: {
@@ -1062,6 +1113,7 @@ app.post('/leaves', authRequired, async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 // Lister les congés
 app.get("/leaves", authRequired, async (req, res) => {
@@ -1270,23 +1322,52 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
     const id   = Number(req.params.id);
     const { action, start_date, end_date } = req.body || {};
 
+    // petite utilitaire
+    const isYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s||''));
+
     let q = '';
     let params = [];
+
     if (action === 'approve') {
-      q = `UPDATE leaves SET status='APPROVED', updated_at=NOW()
-           WHERE tenant_code=$1 AND id=$2 RETURNING *`;
-      params = [code, id];
+      q = `UPDATE leaves
+              SET status='APPROVED',
+                  decided_by=$3,
+                  decided_at=NOW(),
+                  updated_at=NOW()
+            WHERE tenant_code=$1 AND id=$2
+          RETURNING *`;
+      params = [code, id, Number(req.user.sub)];
     } else if (action === 'deny') {
-      q = `UPDATE leaves SET status='REJECTED', updated_at=NOW()
-           WHERE tenant_code=$1 AND id=$2 RETURNING *`;
-      params = [code, id];
+      q = `UPDATE leaves
+              SET status='REJECTED',
+                  decided_by=$3,
+                  decided_at=NOW(),
+                  updated_at=NOW()
+            WHERE tenant_code=$1 AND id=$2
+          RETURNING *`;
+      params = [code, id, Number(req.user.sub)];
     } else if (action === 'cancel') {
-      q = `UPDATE leaves SET status='CANCELLED', updated_at=NOW()
-           WHERE tenant_code=$1 AND id=$2 RETURNING *`;
-      params = [code, id];
+      q = `UPDATE leaves
+              SET status='CANCELLED',
+                  decided_by=$3,
+                  decided_at=NOW(),
+                  updated_at=NOW()
+            WHERE tenant_code=$1 AND id=$2
+          RETURNING *`;
+      params = [code, id, Number(req.user.sub)];
     } else if (action === 'reschedule') {
-      q = `UPDATE leaves SET start_date=$3, end_date=$4, updated_at=NOW()
-           WHERE tenant_code=$1 AND id=$2 RETURNING *`;
+      if (!isYMD(start_date) || !isYMD(end_date)) {
+        return res.status(400).json({ error: 'bad date format (YYYY-MM-DD)' });
+      }
+      if (String(start_date) > String(end_date)) {
+        return res.status(400).json({ error: 'start_date must be <= end_date' });
+      }
+      q = `UPDATE leaves
+              SET start_date=$3,
+                  end_date=$4,
+                  updated_at=NOW()
+            WHERE tenant_code=$1 AND id=$2
+          RETURNING *`;
       params = [code, id, start_date, end_date];
     } else {
       return res.status(400).json({ error: 'Unknown action' });
@@ -1296,10 +1377,10 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
     const leave = rows[0];
     if (!leave) return res.status(404).json({ error: 'Leave not found' });
 
-    // met à jour l’agenda selon le statut
+    // MAJ agenda selon statut (crée/maj/supprime)
     await upsertCalendarForLeave(pool, code, id);
 
-    // renvoi normalisé pour le mobile
+    // Renvoi normalisé pour le mobile
     const { rows: outRows } = await pool.query(`
       SELECT
         l.id, l.employee_id, l.type, l.status,
@@ -1310,12 +1391,50 @@ app.patch('/leaves/:id', authRequired, async (req, res) => {
       WHERE l.tenant_code=$1 AND l.id=$2
     `, [code, id]);
 
-    res.json({ leave: outRows[0] });
+    const out = outRows[0];
+
+    // 🛎️ Push au salarié concerné
+    try {
+      const tokRes = await pool.query(
+        `SELECT token FROM devices WHERE tenant_code=$1 AND user_id=$2`,
+        [code, Number(leave.employee_id)]
+      );
+      const tokens = tokRes.rows.map(r => r.token).filter(Boolean);
+
+      if (tokens.length) {
+        const titles = {
+          approve: 'Congé approuvé ✅',
+          deny: 'Congé refusé ❌',
+          cancel: 'Congé annulé 🗑️',
+          reschedule: 'Congé modifié ✏️',
+        };
+        const body =
+          action === 'reschedule'
+            ? `Nouvelles dates : ${out.start_date} → ${out.end_date}`
+            : `Période : ${out.start_date} → ${out.end_date}`;
+
+        await sendExpoPush(tokens, {
+          title: titles[action] || 'Mise à jour de congé',
+          body,
+          data: {
+            type: 'leave_decision',
+            action,
+            status: String(out.status || '').toLowerCase(),
+            leaveId: out.id
+          },
+        });
+      }
+    } catch (e) {
+      console.warn('[push] leave decision -> employee', e?.message || e);
+    }
+
+    return res.json({ leave: out });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 // === OWNER crée un congé pour n'importe quel salarié (ou pour lui-même) ===
 // OWNER crée un congé pour n'importe quel salarié (avec possibilité de forcer)
