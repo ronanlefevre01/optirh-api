@@ -550,7 +550,7 @@ function normMonthKey(v) {
   throw new Error(`BAD_MONTH_KEY: ${v}`);
 }
 
-// --- est-ce que le mois est gelé ? (nouvelle source: bonus_periods)
+// --- est-ce que le mois est gelé ? (source: bonus_periods)
 export async function isMonthFrozen(pool, tenant, mk) {
   const m = normMonthKey(mk);
   const r = await pool.query(
@@ -560,24 +560,26 @@ export async function isMonthFrozen(pool, tenant, mk) {
   return r.rowCount > 0;
 }
 
-// --- dernier mois gelé (priorité à bonus_periods, fallback legacy bonus_ledger)
+// --- dernier mois gelé (priorité bonus_periods, fallback legacy bonus_ledger)
 export async function lastFrozenMonth(pool, tenant) {
+  // priorité: bonus_periods
   const r = await pool.query(
     `SELECT month
        FROM bonus_periods
       WHERE tenant_code=$1
-      ORDER BY month DESC, cycle DESC, COALESCE(frozen_at, now()) DESC
+      ORDER BY month DESC, COALESCE(cycle,0) DESC, COALESCE(frozen_at, now()) DESC
       LIMIT 1`,
     [tenant]
   );
   if (r.rowCount) return String(r.rows[0].month);
 
-  // fallback legacy si jamais bonus_periods est encore vide
+  // fallback: bonus_ledger (legacy)
   const r2 = await pool.query(
     `SELECT month
        FROM bonus_ledger
       WHERE tenant_code=$1
-      ORDER BY COALESCE(frozen_at::text, month) DESC, seq DESC
+      ORDER BY COALESCE(frozen_at, to_date(month || '-01','YYYY-MM-DD')) DESC,
+               seq DESC
       LIMIT 1`,
     [tenant]
   );
@@ -594,20 +596,22 @@ export async function getActiveMonth(pool, tenant, now = new Date()) {
   return (await isMonthFrozen(pool, tenant, mk)) ? nextMonthKey(mk) : mk;
 }
 
-/** Clés de période ACTIVE (compat appel existant qui attend parfois un tableau) */
+/** Clés de période ACTIVE (compat: certaines parties attendent un tableau) */
 export async function getActivePeriodKeys(pool, tenant, now = new Date()) {
   return [await getActiveMonth(pool, tenant, now)];
 }
 
-/** 'active'|'current'|YYYY-MM -> renvoie TOUJOURS un SCALAIRE 'YYYY-MM' */
-export async function parseMonthOrActiveKey(raw, tenant) {
+/**
+ * 'active' | 'current' | 'YYYY-MM' -> renvoie TOUJOURS un SCALAIRE 'YYYY-MM'
+ * ⚠️ Note: signature = (pool, tenant, raw, now?)
+ */
+export async function parseMonthOrActiveKey(pool, tenant, raw, now = new Date()) {
   const s = String(raw || '').trim().toLowerCase();
   if (!s || s === 'active' || s === 'current') {
-    return await getActiveMonth(pool, tenant);
+    return await getActiveMonth(pool, tenant, now);
   }
   return normMonthKey(raw);
 }
-
 
 
 
