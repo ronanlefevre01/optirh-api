@@ -677,11 +677,8 @@ function requireAdminKey(req, res) {
 
 // Upsert licence (appelé par OptiAdmin)
 app.post('/admin/licences', async (req, res) => {
-  try {
-    const key = req.headers['x-admin-key'] || req.query.key;
-    if (!key || key !== process.env.ADMIN_API_KEY) {
-      return res.status(401).json({ error: 'UNAUTHORIZED' });
-    }
+   try {
+     if (!requireAdminKey(req, res)) return;
 
     const { tenant_code, name, status, valid_until, seats = null, meta = null } = req.body || {};
     if (!tenant_code || !status) return res.status(400).json({ error: 'tenant_code & status required' });
@@ -2811,7 +2808,7 @@ app.get('/bonusV3/my-total', authRequired, async (req, res) => {
     const empId = Number(req.user.sub);
     if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
 
-    const m = await parseMonthOrActiveKey(req.query.month, code);
+    const m = await parseMonthOrActiveKey(pool, code, req.query.month);
 
     const { rows } = await pool.query(
       `SELECT COALESCE(SUM(bonus),0)::float AS total, COUNT(*)::int AS count
@@ -2834,7 +2831,7 @@ app.get('/bonusV3/summary', authRequired, async (req, res) => {
   try {
     if (!isOwnerLike(req.user.role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
     const code = String(req.user.company_code || '').trim();
-    const m = await parseMonthOrActiveKey(req.query.month, code);
+    const m = await parseMonthOrActiveKey(pool, code, req.query.month);
     const active = (m === await getActiveMonth(pool, code));
 
     let byEmp = {}, byFormula = {}, totalAll = 0;
@@ -2897,7 +2894,7 @@ app.post('/bonusV3/freeze', authRequired, async (req, res) => {
     if (!['OWNER','HR'].includes(role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
 
     const code = String(req.user.company_code || '').trim();
-    const m = await parseMonthOrActiveKey(req.query.month, code); // accepte ?month=active
+    const m = await parseMonthOrActiveKey(pool, code, req.query.month);
 
     const client = await pool.connect();
     try {
@@ -2967,7 +2964,7 @@ app.get('/bonusV3/entries', authRequired, bonusRequireOwner, async (req, res) =>
     const empId = Number(req.query.empId);
     if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
 
-    const m = await parseMonthOrActiveKey(req.query.month, code);
+    const m = await parseMonthOrActiveKey(pool, code, req.query.month);
 
     const { rows } = await pool.query(
       `SELECT id, month, employee_id, formula_id, sale, bonus, at
@@ -3268,7 +3265,7 @@ app.get('/bonusV3/my-entries', authRequired, async (req, res) => {
     const empId = Number(req.user.sub);
     if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
 
-    const m = await parseMonthOrActiveKey(req.query.month, code);
+    const m = await parseMonthOrActiveKey(pool, code, req.query.month);
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || 20), 10) || 20, 1), 200);
 
     const { rows } = await pool.query(
@@ -3318,12 +3315,10 @@ app.delete('/bonusV3/my-entries/:id', authRequired, async (req, res) => {
     if (!cur.rowCount) return res.status(404).json({ error: 'ENTRY_NOT_FOUND' });
     const { month } = cur.rows[0];
 
-    // 2) bloquer si le mois est gelé
-    const frozen = await pool.query(
-      'SELECT 1 FROM bonus_ledger WHERE tenant_code=$1 AND month=$2 LIMIT 1',
-      [code, month]
-    );
-    if (frozen.rowCount) return res.status(409).json({ error: 'MONTH_FROZEN' });
+    // 2) bloquer si le mois est gelé (nouvelle source: bonus_periods)
+    if (await isMonthFrozen(pool, code, month)) {
+    return res.status(409).json({ error: 'MONTH_FROZEN' });
+    }
 
     // 3) suppression
     await pool.query(
@@ -3407,17 +3402,18 @@ app.get('/profiles', authRequired, async (req, res) => {
       out[String(r.id)] = {
         id: r.id,
         email: r.email,
+        role: r.role,
         first_name: r.first_name ?? null,
         last_name: r.last_name ?? null,
         phone: r.phone ?? null,
         address: r.address ?? null,
-        updatedAt: r.profile_updated_at || r.updated_at || null,
-        // champs utiles en plus si ton front en a besoin :
-        role: r.role || null,
-        is_active: r.is_active,
+        is_active: !!r.is_active,
         created_at: r.created_at,
+        updated_at: r.profile_updated_at || r.updated_at || null,
+        name: [r.first_name || '', r.last_name || ''].join(' ').trim() || r.email,
       };
     }
+
     return res.json({ profiles: out });
   } catch (e) {
     console.error(e);
