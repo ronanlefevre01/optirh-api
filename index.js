@@ -939,6 +939,9 @@ app.patch('/admin/licences/:code', async (req, res) => {
 });
 
 // DELETE /admin/licences/:code?purge=false
+// =====================
+// DELETE /admin/licences/:code
+// =====================
 app.delete('/admin/licences/:code', async (req, res) => {
   if (!requireAdminKey(req, res)) return;
   try {
@@ -946,7 +949,7 @@ app.delete('/admin/licences/:code', async (req, res) => {
     const purge = String(req.query.purge || 'false').toLowerCase() === 'true';
 
     if (purge) {
-      // ⚠️ Danger : supprime aussi les données liées
+      // ⚠️ Danger : supprime aussi les données liées au tenant
       await pool.query(`DELETE FROM devices         WHERE tenant_code=$1`, [code]);
       await pool.query(`DELETE FROM announcements   WHERE tenant_code=$1`, [code]);
       await pool.query(`DELETE FROM calendar_events WHERE tenant_code=$1`, [code]);
@@ -965,37 +968,10 @@ app.delete('/admin/licences/:code', async (req, res) => {
   }
 });
 
-// ---- Seat limits depuis la licence
-const licQ = await pool.query(
-  `SELECT seats, meta FROM licences WHERE lower(tenant_code)=lower($1) LIMIT 1`,
-  [code]
-);
-const lic = licQ.rows[0] || {};
-const employeesMax = lic?.seats ?? lic?.meta?.limits?.employees_max ?? null;
-const adminsMax    = lic?.meta?.limits?.admins_max ?? null;
 
-if (role === 'EMPLOYEE' && employeesMax != null) {
-  const { rows: r } = await pool.query(
-    `SELECT COUNT(*)::int AS c FROM users WHERE tenant_code=$1 AND role='EMPLOYEE'`,
-    [code]
-  );
-  if (r[0].c >= Number(employeesMax)) {
-    return res.status(409).json({ error: 'EMPLOYEE_SEAT_LIMIT_REACHED' });
-  }
-}
-if (role !== 'EMPLOYEE' && adminsMax != null) {
-  const { rows: r } = await pool.query(
-    `SELECT COUNT(*)::int AS c FROM users WHERE tenant_code=$1 AND role IN ('OWNER','HR')`,
-    [code]
-  );
-  if (r[0].c >= Number(adminsMax)) {
-    return res.status(409).json({ error: 'ADMIN_SEAT_LIMIT_REACHED' });
-  }
-}
-
-
-/** ===== USERS ===== */
-
+// =====================
+// POST /users/invite  (avec contrôle des limites de sièges)
+// =====================
 app.post("/users/invite", authRequired, async (req, res) => {
   try {
     // Seuls OWNER ou HR peuvent inviter
@@ -1027,6 +1003,47 @@ app.post("/users/invite", authRequired, async (req, res) => {
     }
     if (!tempPassword) return res.status(400).json({ error: "temp_password requis" });
 
+    // ===== Limites de sièges tirées de la licence =====
+    // Priorités supportées :
+    // - employeesMax: meta.limits.employees_max OU meta.limits.employees OU seats
+    // - adminsMax:    meta.limits.admins_max   OU meta.limits.admins
+    const licQ = await pool.query(
+      `SELECT seats, meta FROM licences WHERE lower(tenant_code)=lower($1) LIMIT 1`,
+      [code]
+    );
+    const lic    = licQ.rows[0] || {};
+    const limits = (lic?.meta && lic.meta.limits) ? lic.meta.limits : {};
+
+    const employeesMax =
+      (limits.employees_max ?? limits.employees ?? lic.seats ?? null);
+    const adminsMax =
+      (limits.admins_max ?? limits.admins ?? null);
+
+    if (role === 'EMPLOYEE' && employeesMax != null) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(*)::int AS c
+           FROM users
+          WHERE tenant_code=$1 AND role='EMPLOYEE'`,
+        [code]
+      );
+      if (rows[0].c >= Number(employeesMax)) {
+        return res.status(409).json({ error: 'EMPLOYEE_SEAT_LIMIT_REACHED' });
+      }
+    }
+
+    if ((role === 'OWNER' || role === 'HR') && adminsMax != null) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(*)::int AS c
+           FROM users
+          WHERE tenant_code=$1 AND role IN ('OWNER','HR')`,
+        [code]
+      );
+      if (rows[0].c >= Number(adminsMax)) {
+        return res.status(409).json({ error: 'ADMIN_SEAT_LIMIT_REACHED' });
+      }
+    }
+    // ==================================================
+
     // Hash du mot de passe temporaire
     const hash = await bcrypt.hash(String(tempPassword), 10);
 
@@ -1049,6 +1066,7 @@ app.post("/users/invite", authRequired, async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
 
 
 
