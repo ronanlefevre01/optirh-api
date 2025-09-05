@@ -576,19 +576,18 @@ async function getActivePeriodKeys(pool, tenant, now = new Date()) {
   return [active];
 }
 
-// renvoie TOUJOURS une string "YYYY-MM" (ou le mois actif)
+// remplace TOUTES les versions de parseMonthOrActiveKey(s) par celle-ci
 async function parseMonthOrActiveKey(raw, tenant) {
   const s = String(raw || '').trim().toLowerCase();
   if (!s || s === 'active' || s === 'current') {
+    // renvoie un SCALAIRE 'YYYY-MM'
     return await getActiveMonth(pool, tenant);
   }
-  return String(raw).trim();
+  // normalisation légère + garde un 'YYYY-MM'
+  const m = String(raw).trim().slice(0, 7);
+  return m;
 }
 
-// garde la variante "pluriel" si un jour tu veux agréger plusieurs clés
-async function parseMonthOrActiveKeys(raw, tenant) {
-  return [await parseMonthOrActiveKey(raw, tenant)];
-}
 
 
 
@@ -2671,7 +2670,8 @@ app.get('/bonusV3/summary', authRequired, async (req, res) => {
     const totalAll = Object.values(be).reduce((s, x) => s + (x.total || 0), 0);
 
     res.json({
-      month: m,          // ← clé canonique (peut être le mois suivant si gel en cours de mois)
+      month: m,
+      frozen,          // ← clé canonique (peut être le mois suivant si gel en cours de mois)
       totalAll,
       byEmployee: be,
       byFormula: bf,
