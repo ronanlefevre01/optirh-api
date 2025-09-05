@@ -576,13 +576,18 @@ async function getActivePeriodKeys(pool, tenant, now = new Date()) {
   return [active];
 }
 
-/** Accepte ?month=active|current|YYYY-MM -> renvoie TOUJOURS un tableau de clés */
-async function parseMonthOrActiveKeys(raw, tenant) {
+// renvoie TOUJOURS une string "YYYY-MM" (ou le mois actif)
+async function parseMonthOrActiveKey(raw, tenant) {
   const s = String(raw || '').trim().toLowerCase();
   if (!s || s === 'active' || s === 'current') {
-    return await getActivePeriodKeys(pool, tenant);
+    return await getActiveMonth(pool, tenant);
   }
-  return [String(raw).trim()];
+  return String(raw).trim();
+}
+
+// garde la variante "pluriel" si un jour tu veux agréger plusieurs clés
+async function parseMonthOrActiveKeys(raw, tenant) {
+  return [await parseMonthOrActiveKey(raw, tenant)];
 }
 
 
@@ -632,20 +637,6 @@ app.get("/api/licences/validate", async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
-
-// renvoie TOUJOURS une string "YYYY-MM" (ou le mois actif)
-async function parseMonthOrActiveKey(raw, tenant) {
-  const s = String(raw || '').trim().toLowerCase();
-  if (!s || s === 'active' || s === 'current') {
-    return await getActiveMonth(pool, tenant);
-  }
-  return String(raw).trim();
-}
-
-// garde la variante "pluriel" si un jour tu veux agréger plusieurs clés
-async function parseMonthOrActiveKeys(raw, tenant) {
-  return [await parseMonthOrActiveKey(raw, tenant)];
-}
 
 
 
