@@ -616,6 +616,56 @@ export async function parseMonthOrActiveKey(pool, tenant, raw, now = new Date())
 
 
 /** ===== LICENCES ===== */
+// Helper
+function genPwd(n=10) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  return Array.from({length:n}, () => chars[Math.floor(Math.random()*chars.length)]).join('');
+}
+
+// POST /admin/owners/temp-password  { tenant_code, temp_password? }
+app.post('/admin/owners/temp-password', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const { tenant_code, temp_password } = req.body || {};
+    if (!tenant_code) return res.status(400).json({ error: 'tenant_code required' });
+
+    // trouver un OWNER existant
+    let owner = (await pool.query(
+      `SELECT id, email FROM users WHERE tenant_code=$1 AND role='OWNER' ORDER BY id LIMIT 1`,
+      [tenant_code]
+    )).rows[0];
+
+    // si pas d'OWNER, on tombe sur l’email de contact de la licence et on le crée
+    if (!owner) {
+      const lic = (await pool.query(
+        `SELECT meta FROM licences WHERE lower(tenant_code)=lower($1)`,
+        [tenant_code]
+      )).rows[0];
+      const contact = lic?.meta?.contact_email;
+      if (!contact) return res.status(404).json({ error: 'OWNER_NOT_FOUND_NO_CONTACT' });
+
+      owner = (await pool.query(
+        `INSERT INTO users (tenant_code,email,role,password_hash,must_change_password)
+         VALUES ($1,$2,'OWNER','',true) RETURNING id,email`,
+        [tenant_code, String(contact).toLowerCase()]
+      )).rows[0];
+    }
+
+    const pwd = temp_password || genPwd();
+    const hash = await bcrypt.hash(String(pwd), 10);
+    await pool.query(
+      `UPDATE users
+          SET password_hash=$1, must_change_password=true, updated_at=now()
+        WHERE tenant_code=$2 AND id=$3`,
+      [hash, tenant_code, owner.id]
+    );
+
+    return res.json({ ok: true, owner, temp_password: pwd });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 
 app.get("/api/licences/validate", async (req, res) => {
   try {
@@ -767,6 +817,51 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
+// POST /auth/change-password { currentPassword?, newPassword }
+app.post('/auth/change-password', authRequired, async (req, res) => {
+  try {
+    const code = String(req.user.company_code||'').trim();
+    const uid  = Number(req.user.sub);
+    const { currentPassword, newPassword } = req.body || {};
+
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
+    if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'BAD_USER' });
+    if (!newPassword || String(newPassword).length < 8) {
+      return res.status(400).json({ error: 'NEW_PASSWORD_TOO_WEAK' });
+    }
+
+    const cur = await pool.query(
+      'SELECT id, password_hash, must_change_password FROM users WHERE tenant_code=$1 AND id=$2',
+      [code, uid]
+    );
+    if (!cur.rowCount) return res.status(404).json({ error: 'User not found' });
+
+    const u = cur.rows[0];
+
+    // Si must_change_password=true, on ne demande PAS l'ancien mot de passe
+    let ok = false;
+    if (u.must_change_password) {
+      ok = true;
+    } else {
+      ok = u.password_hash && await bcrypt.compare(String(currentPassword||''), String(u.password_hash));
+    }
+    if (!ok) return res.status(400).json({ error: 'BAD_CURRENT_PASSWORD' });
+
+    const hash = await bcrypt.hash(String(newPassword), 10);
+    await pool.query(
+      `UPDATE users
+          SET password_hash=$1, must_change_password=false, updated_at=now()
+        WHERE tenant_code=$2 AND id=$3`,
+      [hash, code, uid]
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[change-password]', e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+
 
 
 app.get('/license/status', async (req, res) => {
@@ -837,6 +932,54 @@ app.post('/auth/change-email', authRequired, async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
+// AUTH — changer son mot de passe
+app.post('/auth/change-password', authRequired, async (req, res) => {
+  try {
+    const code = String(req.user.company_code || '').trim();
+    const uid  = Number(req.user.sub);
+    if (!code || !uid) return res.status(400).json({ error: 'BAD_CONTEXT' });
+
+    const { current_password, new_password } = req.body || {};
+    if (!new_password || String(new_password).length < 8) {
+      return res.status(400).json({ error: 'WEAK_PASSWORD' });
+    }
+
+    const cur = await pool.query(
+      `SELECT id, password_hash, must_change_password
+         FROM users
+        WHERE tenant_code=$1 AND id=$2
+        LIMIT 1`,
+      [code, uid]
+    );
+    if (!cur.rowCount) return res.status(404).json({ error: 'USER_NOT_FOUND' });
+
+    const user = cur.rows[0];
+
+    // si must_change_password = true, on ne réclame pas l'ancien mot de passe
+    if (!user.must_change_password) {
+      const ok = user.password_hash
+        ? await bcrypt.compare(String(current_password || ''), String(user.password_hash))
+        : false;
+      if (!ok) return res.status(400).json({ error: 'BAD_CURRENT_PASSWORD' });
+    }
+
+    const hash = await bcrypt.hash(String(new_password), 10);
+    await pool.query(
+      `UPDATE users
+          SET password_hash=$1,
+              must_change_password=FALSE,
+              updated_at=now()
+        WHERE tenant_code=$2 AND id=$3`,
+      [hash, code, uid]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 
 // GET /admin/licences  -> liste complète + compteurs users
 app.get('/admin/licences', async (req, res) => {
@@ -966,6 +1109,43 @@ app.delete('/admin/licences/:code', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// ADMIN — réinitialiser le mot de passe de tous les OWNER d'un tenant
+app.post('/admin/reset-owner-password', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const { tenant_code, new_password } = req.body || {};
+    if (!tenant_code) return res.status(400).json({ error: 'tenant_code required' });
+
+    // si pas fourni, on génère un mot de passe temporaire
+    const tmp = String(new_password || '').trim() ||
+      (Math.random().toString(36).slice(2, 10) + 'A1!'); // simple random + contrainte min
+
+    const hash = await bcrypt.hash(tmp, 10);
+
+    const { rows } = await pool.query(
+      `UPDATE users
+          SET password_hash = $1,
+              must_change_password = TRUE,
+              updated_at = now()
+        WHERE lower(tenant_code) = lower($2)
+          AND role = 'OWNER'
+        RETURNING id, email`,
+      [hash, tenant_code]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'OWNER_NOT_FOUND' });
+
+    // ⚠️ on renvoie le temp password uniquement si généré ici (sinon il est déjà connu du caller)
+    return res.json({
+      ok: true,
+      owners_updated: rows.length,
+      temp_password: new_password ? undefined : tmp
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
