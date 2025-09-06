@@ -1149,6 +1149,36 @@ app.post('/admin/reset-owner-password', async (req, res) => {
   }
 });
 
+// Page publique : suppression de compte / données
+app.get('/legal/delete-account', (_req, res) => {
+  res.type('html').send(`
+<!doctype html><meta charset="utf-8">
+<title>Suppression de compte – OptiRH</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.5}
+  code,a{color:#6f42c1}
+  h1{font-size:1.6rem}
+  .card{border:1px solid #eee;border-radius:12px;padding:16px;background:#fafafa}
+</style>
+<h1>Demander la suppression de votre compte et de vos données</h1>
+<p>OptiRH est un service d’entreprise : les comptes sont gérés par votre société (le “patron/administrateur”).</p>
+<div class="card">
+  <h2>Comment procéder</h2>
+  <ol>
+    <li>Contactez l’administrateur de votre société pour demander la suppression de votre compte.</li>
+    <li>Ou contactez notre support en précisant votre <b>entreprise</b> et l’<b>adresse e-mail</b> utilisée dans l’app : 
+      <a href="mailto:support@ovedistribution.com">support@ovedistribution.com</a>.
+    </li>
+  </ol>
+  <p>Une suppression entraîne la désactivation du compte et l’effacement des données personnelles associées 
+     (profil, appareil de notifications). Les données nécessaires aux obligations légales ou aux besoins de 
+     l’entreprise (ex. historiques de congés validés) peuvent être conservées conformément à la loi et au contrat.</p>
+</div>
+<p>Chiffrement en transit : oui (HTTPS). Partage à des tiers : non.</p>
+  `);
+});
+
+
 
 // =====================
 // POST /users/invite  (avec contrôle des limites de sièges)
