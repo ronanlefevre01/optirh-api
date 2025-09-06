@@ -1178,6 +1178,54 @@ app.get('/legal/delete-account', (_req, res) => {
   `);
 });
 
+// index.js (ou routes auth/profile)
+app.delete('/account', authRequired, async (req, res) => {
+  try {
+    const code = String(req.user.company_code || '').trim();
+    const uid  = Number(req.user.sub);
+    if (!code || !uid) return res.status(400).json({ error: 'BAD_CONTEXT' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Désactiver l’accès et virer les push tokens
+      await client.query(
+        `UPDATE users SET is_active=false, updated_at=now()
+         WHERE tenant_code=$1 AND id=$2`,
+        [code, uid]
+      );
+      await client.query(
+        `DELETE FROM devices WHERE tenant_code=$1 AND user_id=$2`,
+        [code, uid]
+      );
+
+      // Journaliser la demande (table simple)
+      await client.query(
+        `CREATE TABLE IF NOT EXISTS deletion_requests(
+           id bigserial primary key,
+           tenant_code text not null,
+           user_id bigint not null,
+           requested_at timestamptz not null default now()
+         )`
+      );
+      await client.query(
+        `INSERT INTO deletion_requests(tenant_code, user_id) VALUES($1,$2)`,
+        [code, uid]
+      );
+
+      await client.query('COMMIT');
+      res.json({ ok: true });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
 
 
 // =====================
