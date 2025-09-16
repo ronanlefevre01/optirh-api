@@ -2932,19 +2932,26 @@ function bonusRequireEmployeeOrOwner(req, res, next) {
 }
 
 // 1) Lister formules (OWNER)
-app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) => {
-  const code = bonusCompanyCodeOf(req);
+app.get('/bonusV3/formulas', authRequired, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
-         FROM bonus_formulas
-        WHERE lower(tenant_code) = lower($1)
-        ORDER BY position ASC, created_at ASC`,
-      [code]
-    );
-    res.json(rows);
+    const code = bonusCompanyCodeOf(req);
+    const role = bonusRoleOf(req);
+    const isOwner = BONUS_OWNER_LIKE.has(role);
+
+    const sql = isOwner
+      ? `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
+           FROM bonus_formulas
+          WHERE lower(tenant_code) = lower($1)
+          ORDER BY position ASC, created_at ASC`
+      : `SELECT id, title, fields
+           FROM bonus_formulas
+          WHERE lower(tenant_code) = lower($1)
+          ORDER BY position ASC, created_at ASC`;
+
+    const { rows } = await pool.query(sql, [code]);
+    return res.json(rows);
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
@@ -3060,30 +3067,25 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'BAD_REQUEST' });
     }
 
-    // ✅ Récupérer la formule du tenant + ID exact
+    // 🔧 correction ici
     const f = await pool.query(
       `SELECT id, version, title, fields, rules, rate
          FROM bonus_formulas
         WHERE lower(tenant_code) = lower($1) AND id = $2
         LIMIT 1`,
-      [code, formulaId]
+      [code, String(formulaId)]
     );
-    if (!f.rowCount) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
-    const formula = f.rows[0];
+    if (!f.rowCount) return res.status(404).json({ error: 'FORMULA_NOT_FOUND' });
 
-    // Calcul du bonus
+    const formula = f.rows[0];
     const bonus = Number(computeBonusV3(formula, sale) || 0);
 
-    // Période active : si le mois courant est gelé -> mois suivant
     const activeMonth = await getActiveMonth(pool, code);
 
-    // Enregistrement
     await pool.query(
-      `INSERT INTO bonus_entries
-         (tenant_code, employee_id, month, formula_id, sale, bonus)
-       VALUES
-         ($1,         $2,          $3,    $4,         $5::jsonb, $6)`,
-      [code, empId, activeMonth, formulaId, JSON.stringify(sale), bonus]
+      `INSERT INTO bonus_entries (tenant_code, employee_id, month, formula_id, sale, bonus)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+      [code, empId, activeMonth, formula.id, JSON.stringify(sale), bonus]
     );
 
     return res.json({ success: true, bonus, period: { month: activeMonth } });
@@ -3309,9 +3311,9 @@ app.get('/bonusV3/history', authRequired, bonusRequireOwner, async (req, res) =>
 
 
 // 11) Formules côté Employé
-app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, async (req, res) => {
-  const code = bonusCompanyCodeOf(req);
+app.get('/bonusV3/formulas-employee', authRequired, async (req, res) => {
   try {
+    const code = bonusCompanyCodeOf(req);
     const { rows } = await pool.query(
       `SELECT id, title, fields
          FROM bonus_formulas
@@ -3319,9 +3321,9 @@ app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner,
         ORDER BY position ASC, created_at ASC`,
       [code]
     );
-    res.json(rows.map(f => ({ id: f.id, title: f.title, fields: f.fields || [] })));
+    return res.json(rows.map(f => ({ id: f.id, title: f.title, fields: f.fields || [] })));
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
