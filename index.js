@@ -2934,22 +2934,29 @@ function bonusRequireEmployeeOrOwner(req, res, next) {
 // 1) Lister formules (OWNER)
 app.get('/bonusV3/formulas', authRequired, async (req, res) => {
   try {
-    const code = bonusCompanyCodeOf(req);
-    const role = bonusRoleOf(req);
-    const isOwner = BONUS_OWNER_LIKE.has(role);
+    const code = String(req.user.company_code || '').trim();
+    const role = String(req.user.role || '').toUpperCase();
 
-    const sql = isOwner
-      ? `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
+    if (new Set(['OWNER','HR']).has(role)) {
+      const { rows } = await pool.query(
+        `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
            FROM bonus_formulas
           WHERE lower(tenant_code) = lower($1)
-          ORDER BY position ASC, created_at ASC`
-      : `SELECT id, title, fields
-           FROM bonus_formulas
-          WHERE lower(tenant_code) = lower($1)
-          ORDER BY position ASC, created_at ASC`;
+          ORDER BY position ASC, created_at ASC`,
+        [code]
+      );
+      return res.json({ formulas: rows }); // 👈 attendu par l’espace Owner
+    }
 
-    const { rows } = await pool.query(sql, [code]);
-    return res.json(rows);
+    // Employé (lecture “light”)
+    const { rows } = await pool.query(
+      `SELECT id, title, fields
+         FROM bonus_formulas
+        WHERE lower(tenant_code) = lower($1)
+        ORDER BY position ASC, created_at ASC`,
+      [code]
+    );
+    return res.json(rows.map(f => ({ id: f.id, title: f.title, fields: f.fields || [] })));
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
@@ -3060,14 +3067,10 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
   try {
     const code  = String(req.user.company_code || '').trim();
     const empId = Number(req.user.sub);
-    if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
-
     const { formulaId, sale } = req.body || {};
-    if (!formulaId || typeof sale !== 'object') {
-      return res.status(400).json({ error: 'BAD_REQUEST' });
-    }
+    if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
+    if (!formulaId || typeof sale !== 'object') return res.status(400).json({ error: 'BAD_REQUEST' });
 
-    // 🔧 correction ici
     const f = await pool.query(
       `SELECT id, version, title, fields, rules, rate
          FROM bonus_formulas
@@ -3079,7 +3082,6 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
 
     const formula = f.rows[0];
     const bonus = Number(computeBonusV3(formula, sale) || 0);
-
     const activeMonth = await getActiveMonth(pool, code);
 
     await pool.query(
@@ -3090,7 +3092,6 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
 
     return res.json({ success: true, bonus, period: { month: activeMonth } });
   } catch (e) {
-    console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
@@ -3313,7 +3314,7 @@ app.get('/bonusV3/history', authRequired, bonusRequireOwner, async (req, res) =>
 // 11) Formules côté Employé
 app.get('/bonusV3/formulas-employee', authRequired, async (req, res) => {
   try {
-    const code = bonusCompanyCodeOf(req);
+    const code = String(req.user.company_code || '').trim();
     const { rows } = await pool.query(
       `SELECT id, title, fields
          FROM bonus_formulas
