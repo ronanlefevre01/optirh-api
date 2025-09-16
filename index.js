@@ -3067,35 +3067,72 @@ const isOwnerLike = (r) => new Set(['OWNER','HR']).has(String(r||'').toUpperCase
 const MONTH = () => monthKey(); // tu l'as déjà
 
 // 2.1 Enregistrer une vente (EMPLOYEE ou OWNER)
+// 2.1 Enregistrer une vente (EMPLOYEE ou OWNER) — version corrigée
 app.post('/bonusV3/sale', authRequired, async (req, res) => {
   try {
     const code  = String(req.user.company_code || '').trim();
     const empId = Number(req.user.sub);
-    const { formulaId, sale } = req.body || {};
     if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
-    if (!formulaId || typeof sale !== 'object') return res.status(400).json({ error: 'BAD_REQUEST' });
 
-    const f = await pool.query(
-  `SELECT id, version, title, fields, rules${hasRate ? ', rate' : ''}
-     FROM bonus_formulas
-    WHERE lower(tenant_code) = lower($1) AND id = $2
-    LIMIT 1`,
-  [code, formulaId]
-);
-    if (!f.rowCount) return res.status(404).json({ error: 'FORMULA_NOT_FOUND' });
+    const { formulaId, sale } = req.body || {};
+    if (!formulaId || typeof sale !== 'object') {
+      return res.status(400).json({ error: 'BAD_REQUEST' });
+    }
 
-    const formula = f.rows[0];
-    const bonus = Number(computeBonusV3(formula, sale) || 0);
+    // 1) Savoir si la colonne rate existe
+    const checkRate = await pool.query(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema='public'
+          AND table_name='bonus_formulas'
+          AND column_name='rate'
+        LIMIT 1`
+    );
+    const hasRate = checkRate.rowCount > 0;
+
+    // 2) Charger la formule de CE tenant + par ID
+    const fr = await pool.query(
+      `SELECT id, version, title, fields, rules${hasRate ? ', rate' : ''}
+         FROM bonus_formulas
+        WHERE lower(tenant_code) = lower($1) AND id = $2
+        LIMIT 1`,
+      [code, String(formulaId)]
+    );
+    if (!fr.rowCount) return res.status(404).json({ error: 'FORMULA_NOT_FOUND' });
+
+    const formula = fr.rows[0];
+    if (!('rate' in formula) || formula.rate == null) {
+      // sécurité si la colonne rate n'existe pas encore / pas définie
+      formula.rate = 0.1;
+    }
+
+    // 3) Calcul du bonus
+    let bonus = 0;
+    try {
+      bonus = Number(computeBonusV3(formula, sale) || 0);
+      if (!Number.isFinite(bonus)) bonus = 0;
+    } catch (e) {
+      return res.status(400).json({ error: 'COMPUTE_FAILED', detail: String(e.message || e) });
+    }
+
+    // 4) Mois ACTIF (si le mois courant est gelé -> mois suivant)
     const activeMonth = await getActiveMonth(pool, code);
 
+    // 5) Enregistrer la vente
     await pool.query(
-      `INSERT INTO bonus_entries (tenant_code, employee_id, month, formula_id, sale, bonus)
+      `INSERT INTO bonus_entries
+         (tenant_code, employee_id, month, formula_id, sale, bonus)
        VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
-      [code, empId, activeMonth, formula.id, JSON.stringify(sale), bonus]
+      [code, empId, activeMonth, String(formulaId), JSON.stringify(sale), bonus]
     );
 
-    return res.json({ success: true, bonus, period: { month: activeMonth } });
+    return res.json({
+      success: true,
+      bonus,
+      period: { month: activeMonth },
+    });
   } catch (e) {
+    console.error('[bonusV3/sale]', e);
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
