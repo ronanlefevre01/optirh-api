@@ -2938,12 +2938,14 @@ app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) =
     const { rows } = await pool.query(
       `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
          FROM bonus_formulas
-        WHERE tenant_code=$1
+        WHERE lower(tenant_code) = lower($1)
         ORDER BY position ASC, created_at ASC`,
       [code]
     );
     res.json(rows);
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 
@@ -2956,17 +2958,18 @@ app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) 
     const title = String(f.title || '').trim();
     if (!title) return res.status(400).json({ error: 'TITLE_REQUIRED' });
 
-    // 👇 parse du taux
+    // parse du taux
     let rate = undefined;
     if (f.rate !== undefined) {
       const parsed = Number.parseFloat(String(f.rate).replace(',', '.'));
       if (!Number.isFinite(parsed)) return res.status(400).json({ error: 'BAD_RATE' });
-      rate = parsed; // autorise 0
+      rate = parsed;
     }
 
     const { rows: pos } = await pool.query(
       `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
-         FROM bonus_formulas WHERE tenant_code=$1`,
+         FROM bonus_formulas
+        WHERE lower(tenant_code) = lower($1)`,
       [code]
     );
 
@@ -2976,8 +2979,10 @@ app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) 
       [code, id, title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[]), pos[0].next_pos, rate ?? 0.1]
     );
     res.json({ success: true, id });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
-});
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+})
 
 
 // 3) Update formule (OWNER)
@@ -3009,13 +3014,15 @@ app.put('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req, re
     const sql = `
       UPDATE bonus_formulas
          SET ${sets.join(', ')}
-       WHERE tenant_code = $${params.length - 1} AND id = $${params.length}
+       WHERE lower(tenant_code) = lower($${params.length - 1}) AND id = $${params.length}
     `;
 
     const { rowCount } = await pool.query(sql, params);
     if (!rowCount) return res.status(404).json({ error: 'NOT_FOUND' });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 
@@ -3025,12 +3032,15 @@ app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req,
   const id = String(req.params.id || '');
   try {
     const { rowCount } = await pool.query(
-      `DELETE FROM bonus_formulas WHERE tenant_code=$1 AND id=$2`,
+      `DELETE FROM bonus_formulas
+        WHERE lower(tenant_code) = lower($1) AND id = $2`,
       [code, id]
     );
     if (!rowCount) return res.status(404).json({ error: 'NOT_FOUND' });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // 5) Saisie vente (EMPLOYEE/OWNER)
@@ -3041,7 +3051,7 @@ const MONTH = () => monthKey(); // tu l'as déjà
 // 2.1 Enregistrer une vente (EMPLOYEE ou OWNER)
 app.post('/bonusV3/sale', authRequired, async (req, res) => {
   try {
-    const code = String(req.user.company_code || '').trim();
+    const code  = String(req.user.company_code || '').trim();
     const empId = Number(req.user.sub);
     if (!code || !empId) return res.status(400).json({ error: 'BAD_CONTEXT' });
 
@@ -3050,25 +3060,24 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'BAD_REQUEST' });
     }
 
-    // Récupérer la formule (scopée au tenant)
+    // ✅ Récupérer la formule du tenant + ID exact
     const f = await pool.query(
-  `SELECT id, version, title, fields, rules, rate
-     FROM bonus_formulas
-    WHERE tenant_code=$1 AND id=$2`,
-  [code, formulaId]
-);
-
+      `SELECT id, version, title, fields, rules, rate
+         FROM bonus_formulas
+        WHERE lower(tenant_code) = lower($1) AND id = $2
+        LIMIT 1`,
+      [code, formulaId]
+    );
     if (!f.rowCount) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
-
     const formula = f.rows[0];
 
-    // Calcul du bonus (selon ta logique existante)
+    // Calcul du bonus
     const bonus = Number(computeBonusV3(formula, sale) || 0);
 
-    // 🚦 Choisir la période active : si le mois courant est gelé -> mois suivant
+    // Période active : si le mois courant est gelé -> mois suivant
     const activeMonth = await getActiveMonth(pool, code);
 
-    // 💾 Insertion
+    // Enregistrement
     await pool.query(
       `INSERT INTO bonus_entries
          (tenant_code, employee_id, month, formula_id, sale, bonus)
@@ -3077,11 +3086,7 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
       [code, empId, activeMonth, formulaId, JSON.stringify(sale), bonus]
     );
 
-    return res.json({
-      success: true,
-      bonus,
-      period: { month: activeMonth }, // utile côté app pour afficher "Période active : Octobre 2025"
-    });
+    return res.json({ success: true, bonus, period: { month: activeMonth } });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: String(e.message || e) });
@@ -3310,12 +3315,14 @@ app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner,
     const { rows } = await pool.query(
       `SELECT id, title, fields
          FROM bonus_formulas
-        WHERE tenant_code=$1
+        WHERE lower(tenant_code) = lower($1)
         ORDER BY position ASC, created_at ASC`,
       [code]
     );
     res.json(rows.map(f => ({ id: f.id, title: f.title, fields: f.fields || [] })));
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // GET /bonusV3/periods?month=YYYY-MM
