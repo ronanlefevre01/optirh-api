@@ -2936,7 +2936,7 @@ app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) =
   const code = bonusCompanyCodeOf(req);
   try {
     const { rows } = await pool.query(
-      `SELECT id, version, title, fields, rules, position, created_at, updated_at
+      `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
          FROM bonus_formulas
         WHERE tenant_code=$1
         ORDER BY position ASC, created_at ASC`,
@@ -2945,6 +2945,7 @@ app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) =
     res.json(rows);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
+
 
 // 2) Créer formule (OWNER)
 app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) => {
@@ -2955,6 +2956,14 @@ app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) 
     const title = String(f.title || '').trim();
     if (!title) return res.status(400).json({ error: 'TITLE_REQUIRED' });
 
+    // 👇 parse du taux
+    let rate = undefined;
+    if (f.rate !== undefined) {
+      const parsed = Number.parseFloat(String(f.rate).replace(',', '.'));
+      if (!Number.isFinite(parsed)) return res.status(400).json({ error: 'BAD_RATE' });
+      rate = parsed; // autorise 0
+    }
+
     const { rows: pos } = await pool.query(
       `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
          FROM bonus_formulas WHERE tenant_code=$1`,
@@ -2962,13 +2971,14 @@ app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) 
     );
 
     await pool.query(
-      `INSERT INTO bonus_formulas (tenant_code, id, version, title, fields, rules, position)
-       VALUES ($1,$2,3,$3,$4::jsonb,$5::jsonb,$6)`,
-      [code, id, title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[]), pos[0].next_pos]
+      `INSERT INTO bonus_formulas (tenant_code, id, version, title, fields, rules, position, rate)
+       VALUES ($1,$2,3,$3,$4::jsonb,$5::jsonb,$6,$7)`,
+      [code, id, title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[]), pos[0].next_pos, rate ?? 0.1]
     );
     res.json({ success: true, id });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
+
 
 // 3) Update formule (OWNER)
 app.put('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req, res) => {
@@ -2979,16 +2989,35 @@ app.put('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req, re
     const title = String(f.title || '').trim();
     if (!title) return res.status(400).json({ error: 'TITLE_REQUIRED' });
 
-    const { rowCount } = await pool.query(
-      `UPDATE bonus_formulas
-          SET title=$1, fields=$2::jsonb, rules=$3::jsonb, version=3, updated_at=now()
-        WHERE tenant_code=$4 AND id=$5`,
-      [title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[]), code, id]
-    );
+    const sets = [
+      `title = $1`,
+      `fields = $2::jsonb`,
+      `rules  = $3::jsonb`,
+      `version = 3`,
+      `updated_at = now()`,
+    ];
+    const params = [title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[])];
+
+    if (f.rate !== undefined) {
+      const parsed = Number.parseFloat(String(f.rate).replace(',', '.'));
+      if (!Number.isFinite(parsed)) return res.status(400).json({ error: 'BAD_RATE' });
+      sets.push(`rate = $${params.length + 1}`);
+      params.push(parsed);
+    }
+
+    params.push(code, id);
+    const sql = `
+      UPDATE bonus_formulas
+         SET ${sets.join(', ')}
+       WHERE tenant_code = $${params.length - 1} AND id = $${params.length}
+    `;
+
+    const { rowCount } = await pool.query(sql, params);
     if (!rowCount) return res.status(404).json({ error: 'NOT_FOUND' });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
+
 
 // 4) Delete formule (OWNER)
 app.delete('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req, res) => {
@@ -3023,11 +3052,12 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
 
     // Récupérer la formule (scopée au tenant)
     const f = await pool.query(
-      `SELECT id, version, title, fields, rules
-         FROM bonus_formulas
-        WHERE tenant_code=$1 AND id=$2`,
-      [code, formulaId]
-    );
+  `SELECT id, version, title, fields, rules, rate
+     FROM bonus_formulas
+    WHERE tenant_code=$1 AND id=$2`,
+  [code, formulaId]
+);
+
     if (!f.rowCount) return res.status(400).json({ error: 'FORMULA_NOT_FOUND' });
 
     const formula = f.rows[0];
