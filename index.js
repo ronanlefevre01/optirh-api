@@ -2932,31 +2932,18 @@ function bonusRequireEmployeeOrOwner(req, res, next) {
 }
 
 // 1) Lister formules (OWNER)
-app.get('/bonusV3/formulas', authRequired, async (req, res) => {
+app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) => {
   try {
     const code = String(req.user.company_code || '').trim();
-    const role = String(req.user.role || '').toUpperCase();
-
-    if (new Set(['OWNER','HR']).has(role)) {
-      const { rows } = await pool.query(
-        `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
-           FROM bonus_formulas
-          WHERE lower(tenant_code) = lower($1)
-          ORDER BY position ASC, created_at ASC`,
-        [code]
-      );
-      return res.json({ formulas: rows }); // 👈 attendu par l’espace Owner
-    }
-
-    // Employé (lecture “light”)
     const { rows } = await pool.query(
-      `SELECT id, title, fields
+      `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
          FROM bonus_formulas
         WHERE lower(tenant_code) = lower($1)
         ORDER BY position ASC, created_at ASC`,
       [code]
     );
-    return res.json(rows.map(f => ({ id: f.id, title: f.title, fields: f.fields || [] })));
+    // 👇 c’est ce format que l’app attend
+    return res.json({ formulas: rows });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
@@ -3312,7 +3299,7 @@ app.get('/bonusV3/history', authRequired, bonusRequireOwner, async (req, res) =>
 
 
 // 11) Formules côté Employé
-app.get('/bonusV3/formulas-employee', authRequired, async (req, res) => {
+app.get('/bonusV3/formulas-employee', authRequired, bonusRequireEmployeeOrOwner, async (req, res) => {
   try {
     const code = String(req.user.company_code || '').trim();
     const { rows } = await pool.query(
@@ -3322,7 +3309,11 @@ app.get('/bonusV3/formulas-employee', authRequired, async (req, res) => {
         ORDER BY position ASC, created_at ASC`,
       [code]
     );
-    return res.json(rows.map(f => ({ id: f.id, title: f.title, fields: f.fields || [] })));
+    return res.json(rows.map(f => ({
+      id: f.id,
+      title: f.title,
+      fields: f.fields || []
+    })));
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
