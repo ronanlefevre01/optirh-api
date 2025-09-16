@@ -2933,22 +2933,36 @@ function bonusRequireEmployeeOrOwner(req, res, next) {
 
 // 1) Lister formules (OWNER)
 app.get('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) => {
+  const code = String(req.user.company_code || '').trim();
   try {
-    const code = String(req.user.company_code || '').trim();
-    const { rows } = await pool.query(
-      `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
-         FROM bonus_formulas
-        WHERE lower(tenant_code) = lower($1)
-        ORDER BY position ASC, created_at ASC`,
-      [code]
-    );
-    // 👇 c’est ce format que l’app attend
-    return res.json({ formulas: rows });
+    // détecte si la colonne rate existe
+    const hasRate = (await pool.query(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema='public'
+          AND table_name='bonus_formulas'
+          AND column_name='rate'
+        LIMIT 1`
+    )).rowCount > 0;
+
+    const sql = hasRate
+      ? `SELECT id, version, title, fields, rules, rate, position, created_at, updated_at
+           FROM bonus_formulas
+          WHERE lower(tenant_code) = lower($1)
+          ORDER BY position ASC, created_at ASC`
+      : `SELECT id, version, title, fields, rules, position, created_at, updated_at
+           FROM bonus_formulas
+          WHERE lower(tenant_code) = lower($1)
+          ORDER BY position ASC, created_at ASC`;
+
+    const { rows } = await pool.query(sql, [code]);
+
+    // si pas de colonne rate, on renvoie rate:null pour rester homogène
+    res.json(rows.map(r => hasRate ? r : { ...r, rate: null }));
   } catch (e) {
-    return res.status(500).json({ error: String(e.message || e) });
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
-
 
 // 2) Créer formule (OWNER)
 app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) => {
