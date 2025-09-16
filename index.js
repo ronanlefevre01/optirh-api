@@ -2973,31 +2973,32 @@ app.post('/bonusV3/formulas', authRequired, bonusRequireOwner, async (req, res) 
     const title = String(f.title || '').trim();
     if (!title) return res.status(400).json({ error: 'TITLE_REQUIRED' });
 
-    // parse du taux
-    let rate = undefined;
-    if (f.rate !== undefined) {
-      const parsed = Number.parseFloat(String(f.rate).replace(',', '.'));
-      if (!Number.isFinite(parsed)) return res.status(400).json({ error: 'BAD_RATE' });
-      rate = parsed;
+    // 🆕 Parsing tolérant du taux (decimal ou pourcentage, champs multiples)
+    let rateRaw = (f.rate ?? f.rate_percent ?? f.ratePercent);
+    let rate = 0.1; // défaut
+    if (rateRaw !== undefined) {
+      const n = Number.parseFloat(String(rateRaw).replace(',', '.'));
+      if (!Number.isFinite(n)) return res.status(400).json({ error: 'BAD_RATE' });
+      rate = (n > 1) ? n / 100 : n; // 20 => 0.20 ; 0.2 => 0.20
     }
 
+    // position auto
     const { rows: pos } = await pool.query(
       `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
-         FROM bonus_formulas
-        WHERE lower(tenant_code) = lower($1)`,
+         FROM bonus_formulas WHERE lower(tenant_code) = lower($1)`,
       [code]
     );
 
     await pool.query(
-      `INSERT INTO bonus_formulas (tenant_code, id, version, title, fields, rules, position, rate)
+      `INSERT INTO bonus_formulas
+         (tenant_code, id, version, title, fields, rules, position, rate)
        VALUES ($1,$2,3,$3,$4::jsonb,$5::jsonb,$6,$7)`,
-      [code, id, title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[]), pos[0].next_pos, rate ?? 0.1]
+      [code, id, title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[]), pos[0].next_pos, rate]
     );
     res.json({ success: true, id });
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-})
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 
 
 // 3) Update formule (OWNER)
@@ -3018,27 +3019,29 @@ app.put('/bonusV3/formulas/:id', authRequired, bonusRequireOwner, async (req, re
     ];
     const params = [title, JSON.stringify(f.fields||[]), JSON.stringify(f.rules||[])];
 
-    if (f.rate !== undefined) {
-      const parsed = Number.parseFloat(String(f.rate).replace(',', '.'));
-      if (!Number.isFinite(parsed)) return res.status(400).json({ error: 'BAD_RATE' });
+    // 🆕 Parsing tolérant du taux (decimal ou pourcentage, champs multiples)
+    if (f.rate !== undefined || f.rate_percent !== undefined || f.ratePercent !== undefined) {
+      const raw = f.rate ?? f.rate_percent ?? f.ratePercent;
+      const n = Number.parseFloat(String(raw).replace(',', '.'));
+      if (!Number.isFinite(n)) return res.status(400).json({ error: 'BAD_RATE' });
+      const rate = (n > 1) ? n / 100 : n;
       sets.push(`rate = $${params.length + 1}`);
-      params.push(parsed);
+      params.push(rate);
     }
 
     params.push(code, id);
     const sql = `
       UPDATE bonus_formulas
          SET ${sets.join(', ')}
-       WHERE lower(tenant_code) = lower($${params.length - 1}) AND id = $${params.length}
+       WHERE tenant_code = $${params.length - 1} AND id = $${params.length}
     `;
 
     const { rowCount } = await pool.query(sql, params);
     if (!rowCount) return res.status(404).json({ error: 'NOT_FOUND' });
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
+
 
 
 // 4) Delete formule (OWNER)
@@ -3073,12 +3076,12 @@ app.post('/bonusV3/sale', authRequired, async (req, res) => {
     if (!formulaId || typeof sale !== 'object') return res.status(400).json({ error: 'BAD_REQUEST' });
 
     const f = await pool.query(
-      `SELECT id, version, title, fields, rules, rate
-         FROM bonus_formulas
-        WHERE lower(tenant_code) = lower($1) AND id = $2
-        LIMIT 1`,
-      [code, String(formulaId)]
-    );
+  `SELECT id, version, title, fields, rules${hasRate ? ', rate' : ''}
+     FROM bonus_formulas
+    WHERE lower(tenant_code) = lower($1) AND id = $2
+    LIMIT 1`,
+  [code, formulaId]
+);
     if (!f.rowCount) return res.status(404).json({ error: 'FORMULA_NOT_FOUND' });
 
     const formula = f.rows[0];
