@@ -17,6 +17,7 @@ import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { pool /*, q*/ } from "./db.js";
 // import { q } from "./db.js"; // décommente si tu l’utilises vraiment
 
+import authRoutes from "./routes.auth.js";
 
 const app = express();
 
@@ -45,6 +46,7 @@ app.options("*", cors());
 // Helmet (assoupli pour API)
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: "1mb" }));
+app.use('/auth', authRoutes);
 
 /** ===== ENV ===== */
 const API = process.env.JSONBIN_API_URL;
@@ -152,7 +154,7 @@ function grabIdFromDriveLink(link) {
   return m ? m[1] : null;
 }
 
-// manquait dans ton header : utilisé pour upload buffer -> stream
+
 function bufferToStream(buffer) {
   const r = new Readable();
   r.push(buffer);
