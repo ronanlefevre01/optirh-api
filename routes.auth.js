@@ -1,7 +1,7 @@
 // routes.auth.js (ESM)
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
-import { v4 as uuid } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { signAccessToken } from './auth.token.js';   // ← adapte si ton fichier s'appelle autrement
 import { pool } from './db.js';                      // ← on utilise la même source DB que dans index.js
 
@@ -40,7 +40,7 @@ router.post('/login', async (req, res) => {
     });
 
     // refresh "par device"
-    const refreshToken = uuid();
+    const refreshToken = randomUUID();
     const refreshHash = await bcrypt.hash(refreshToken, 10);
     const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
 
@@ -107,7 +107,7 @@ router.post('/refresh', async (req, res) => {
     });
 
     // rotation du refresh
-    const newRefresh = uuid();
+    const newRefresh = randomUUID();
     const newHash = await bcrypt.hash(newRefresh, 10);
     const newExp = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
 
