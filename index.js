@@ -109,6 +109,60 @@ export async function requireDrive(res) {
   }
 }
 
+// === [Bloc A] Utils congés (dates, fériés, période légale, comptage) ===
+const pad = (n) => String(n).padStart(2, '0');
+const isoDay = (dt) => `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+const parseISO = (s) => { const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); };
+const addDays = (d, n) => { const c = new Date(d.getFullYear(), d.getMonth(), d.getDate()); c.setDate(c.getDate()+n); return c; };
+
+function easterDate(year) {
+  const a=year%19,b=Math.floor(year/100),c=year%100,d=Math.floor(b/4),e=b%4,f=Math.floor((b+8)/25),
+        g=Math.floor((b-f+1)/3),h=(19*a+b-d-g+15)%30,i=Math.floor(c/4),k=c%4,l=(32+2*e+2*i-h-k)%7,
+        m=Math.floor((a+11*h+22*l)/451),month=Math.floor((h+l-7*m+114)/31),day=((h+l-7*m+114)%31)+1;
+  return new Date(year, month-1, day);
+}
+function frenchPublicHolidays(year) {
+  const easter = easterDate(year);
+  const easterMon = isoDay(addDays(easter, 1));
+  const ascension = isoDay(addDays(easter, 39));
+  const whitMon = isoDay(addDays(easter, 50));
+  const fixed = [
+    `${year}-01-01`, `${year}-05-01`, `${year}-05-08`, `${year}-07-14`,
+    `${year}-08-15`, `${year}-11-01`, `${year}-11-11`, `${year}-12-25`,
+  ];
+  return [...fixed, easterMon, ascension, whitMon];
+}
+function holidaysForRange(startISO, endISO) {
+  const s = parseISO(startISO), e = parseISO(endISO);
+  const ys = s.getFullYear(), ye = e.getFullYear();
+  const list = [];
+  for (let y = ys; y <= ye; y++) list.push(...frenchPublicHolidays(y));
+  return new Set(list);
+}
+function legalPeriodForDate(dateISO) {
+  const d = parseISO(dateISO); const y = d.getFullYear(); const m = d.getMonth()+1;
+  const startYear = m >= 6 ? y : y-1;
+  return { start: `${startYear}-06-01`, end: `${startYear+1}-05-31`, startYear };
+}
+function intersection(aStart, aEnd, bStart, bEnd) {
+  const s = aStart > bStart ? aStart : bStart;
+  const e = aEnd   < bEnd   ? aEnd   : bEnd;
+  return s <= e ? { start: s, end: e } : null;
+}
+function countLeaveDays({ start, end, mode, workweek }) {
+  const hol = holidaysForRange(start, end);
+  const ww = (workweek && workweek.length) ? workweek : [1,2,3,4,5]; // lun..ven
+  let n = 0;
+  for (let d = parseISO(start); d <= parseISO(end); d = addDays(d, 1)) {
+    const dow = d.getDay(); // 0=dim..6=sam
+    const dayISO = isoDay(d);
+    if (hol.has(dayISO)) continue;
+    if (mode === 'ouvrables') { if (dow === 0) continue; n++; } // samedi compte
+    else { if (!ww.includes(dow)) continue; n++; }
+  }
+  return n;
+}
+
 // === Auth JWT (à mettre AVANT les routes) ===
 function getAuthToken(req) {
   const h = req.headers.authorization || req.headers.Authorization;
@@ -4085,6 +4139,87 @@ app.post('/legal/accept', authRequired, async (req, res) => {
   }
 });
 
+// === [Bloc B] GET /owner/leaves/stats-summary ===
+// Retourne: { year, mode, workweek, baseDays, employees: [{user_id, full_name, taken, allowance, left}] }
+app.get('/owner/leaves/stats-summary', async (req, res) => {
+  try {
+    const auth = req.headers.authorization || '';
+    const token = auth.replace(/^Bearer\s+/i, '');
+    let payload = null;
+    try { payload = jwt.verify(token, process.env.JWT_SECRET); } catch {}
+    if (!payload || !OWNER_LIKE.has(payload.role)) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+    const tenant = payload.tenant_code;
+
+    const yearQ = parseInt(String(req.query.year || ''), 10);
+    const nowISO = isoDay(new Date());
+    const { startYear } = legalPeriodForDate(nowISO);
+    const targetYear = Number.isFinite(yearQ) ? yearQ : startYear;
+    const pStart = `${targetYear}-06-01`;
+    const pEnd   = `${targetYear+1}-05-31`;
+
+    // PARAMS tenant (adapte ce SELECT à ta table "settings")
+    const settingsQ = await pool.query(
+      `select leave_count_mode as mode, workweek, default_allowance
+         from settings
+        where tenant_code = $1
+        limit 1`,
+      [tenant]
+    );
+    const st = settingsQ.rows[0] || {};
+    const mode = (st?.mode === 'ouvrables' ? 'ouvrables' : 'ouvres'); // défaut : ouvrés
+    const workweek = Array.isArray(st?.workweek) ? st.workweek.filter(n => Number.isInteger(n)) : null;
+    const baseDays = Number.isFinite(+st?.default_allowance) ? +st.default_allowance : (mode === 'ouvrables' ? 30 : 25);
+
+    // Employés (nom + dotation individuelle optionnelle)
+    const empQ = await pool.query(`
+      select u.id as user_id,
+             coalesce(u.first_name,'') || ' ' || coalesce(u.last_name,'') as full_name,
+             ep.leave_allowance
+      from employee_profiles ep
+      join users u on u.id = ep.user_id
+      where ep.tenant_code = $1
+      order by 2
+    `, [tenant]);
+    const employees = empQ.rows;
+
+    // Congés approuvés payés chevauchant la période
+    const leavesQ = await pool.query(`
+      select l.user_id, l.start_date::date as start_date, l.end_date::date as end_date, l.type, l.status
+      from leaves l
+      where l.tenant_code = $1
+        and l.status ilike 'approved'
+        and (l.type ilike 'paid' or l.type ilike 'pay%')
+        and l.end_date::date >= $2::date
+        and l.start_date::date <= $3::date
+    `, [tenant, pStart, pEnd]);
+    const leaves = leavesQ.rows;
+
+    // Somme par user dans [pStart, pEnd]
+    const byUser = new Map();
+    for (const l of leaves) {
+      const s = isoDay(new Date(l.start_date));
+      const e = isoDay(new Date(l.end_date));
+      const inter = intersection(s, e, pStart, pEnd);
+      if (!inter) continue;
+      const taken = countLeaveDays({ start: inter.start, end: inter.end, mode, workweek });
+      byUser.set(l.user_id, (byUser.get(l.user_id) || 0) + taken);
+    }
+
+    const out = employees.map(e => {
+      const taken = byUser.get(e.user_id) || 0;
+      const allowance = Number.isFinite(+e.leave_allowance) ? +e.leave_allowance : baseDays;
+      const left = Math.max(allowance - taken, 0);
+      return { user_id: e.user_id, full_name: e.full_name, taken, allowance, left };
+    });
+
+    res.json({ year: targetYear, mode, workweek: workweek || undefined, baseDays, employees: out });
+  } catch (e) {
+    console.error('[owner/leaves/stats-summary] error', e);
+    res.status(500).json({ error: 'STATS_SUMMARY_ERROR' });
+  }
+});
 
 
 const PORT = process.env.PORT || 3001;
