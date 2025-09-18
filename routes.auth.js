@@ -1,7 +1,7 @@
 // routes.auth.js (extrait) — ESM
 import express from 'express';
 import bcrypt from 'bcryptjs';
-import { v4 as uuid } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { signAccessToken } from './auth.tokens.js';
 import { pool } from './db.js';
 
@@ -61,11 +61,11 @@ router.post('/auth/login', async (req, res) => {
     });
 
     // refresh/device
-    const refreshToken = uuid();
+    const refreshToken = randomUUID();
     const refreshHash = await bcrypt.hash(refreshToken, 10);
     const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
 
-    if (!device_id) device_id = uuid(); // fallback si l’app n’envoie pas encore d’ID
+    if (!device_id) device_id = randomUUID(); // fallback si l’app n’envoie pas encore d’ID
 
     await pool.query(`
       insert into devices (user_id, tenant_code, device_id, refresh_hash, expires_at)
