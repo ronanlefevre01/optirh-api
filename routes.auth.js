@@ -2,7 +2,7 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
-import { signAccessToken } from './auth.token.js';   // ← adapte si ton fichier s'appelle autrement
+import { signAccessToken } from './auth.tokens.js';   // ← adapte si ton fichier s'appelle autrement
 import { pool } from './db.js';                      // ← on utilise la même source DB que dans index.js
 
 const router = Router();
