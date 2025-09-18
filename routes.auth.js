@@ -1,29 +1,24 @@
-// routes.auth.js (ESM)
-import { Router } from 'express';
+// routes.auth.js  (ESM)
+import express from 'express';
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
-import { signAccessToken } from './auth.tokens.js';   // ← adapte si ton fichier s'appelle autrement
-import { pool } from './db.js';                      // ← on utilise la même source DB que dans index.js
+import { pool } from './db.js';                 // ton pool Postgres
+import { signAccessToken } from './auth.tokens.js';
 
-const router = Router();
+const router = express.Router();
+
 const REFRESH_TTL_DAYS = Number(process.env.REFRESH_TTL_DAYS || 60);
 
-/**
- * POST /auth/login
- * Corps: { tenant_code, email, password, device_id }
- */
+// POST /auth/login
 router.post('/login', async (req, res) => {
   try {
-    const { tenant_code, email, password, device_id } = req.body || {};
-    if (!tenant_code || !email || !password || !device_id) {
-      return res.status(400).json({ error: 'MISSING_FIELDS' });
-    }
+    const { tenant_code, email, password, device_id } = req.body;
 
     const { rows } = await pool.query(
       `select id, email, tenant_code, role, password_hash
-         from users
-        where tenant_code = $1 and lower(email) = lower($2)
-        limit 1`,
+       from users
+       where tenant_code=$1 and email=$2
+       limit 1`,
       [tenant_code, email]
     );
     const user = rows[0];
@@ -32,29 +27,21 @@ router.post('/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash || '');
     if (!ok) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
 
-    const accessToken = signAccessToken({
-      id: user.id,
-      email: user.email,
-      tenant_code: user.tenant_code,
-      role: user.role,
-    });
+    const accessToken = signAccessToken(user);
 
-    // refresh "par device"
     const refreshToken = randomUUID();
     const refreshHash = await bcrypt.hash(refreshToken, 10);
     const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
 
     await pool.query(
-      `
-      insert into devices (user_id, tenant_code, device_id, refresh_hash, expires_at)
-      values ($1, $2, $3, $4, $5)
-      on conflict (device_id)
-      do update set user_id   = excluded.user_id,
-                    tenant_code = excluded.tenant_code,
-                    refresh_hash = excluded.refresh_hash,
-                    expires_at   = excluded.expires_at,
-                    updated_at   = now()
-      `,
+      `insert into devices (user_id, tenant_code, device_id, refresh_hash, expires_at)
+       values ($1,$2,$3,$4,$5)
+       on conflict (device_id)
+       do update set user_id=excluded.user_id,
+                    tenant_code=excluded.tenant_code,
+                    refresh_hash=excluded.refresh_hash,
+                    expires_at=excluded.expires_at,
+                    updated_at=now()`,
       [user.id, user.tenant_code, device_id, refreshHash, expiresAt]
     );
 
@@ -69,26 +56,18 @@ router.post('/login', async (req, res) => {
   }
 });
 
-/**
- * POST /auth/refresh
- * Corps: { device_id, refreshToken }
- */
+// POST /auth/refresh
 router.post('/refresh', async (req, res) => {
   try {
-    const { device_id, refreshToken } = req.body || {};
-    if (!device_id || !refreshToken) {
-      return res.status(400).json({ error: 'MISSING_FIELDS' });
-    }
+    const { device_id, refreshToken } = req.body;
 
     const { rows } = await pool.query(
-      `
-      select d.user_id, d.refresh_hash, d.expires_at,
-             u.email, u.tenant_code, u.role
-        from devices d
-        join users u on u.id = d.user_id
-       where d.device_id = $1
-       limit 1
-      `,
+      `select d.user_id, d.refresh_hash, d.expires_at,
+              u.email, u.tenant_code, u.role, u.id
+         from devices d
+         join users u on u.id = d.user_id
+        where d.device_id = $1
+        limit 1`,
       [device_id]
     );
 
@@ -99,20 +78,14 @@ router.post('/refresh', async (req, res) => {
     const ok = await bcrypt.compare(refreshToken, row.refresh_hash || '');
     if (!ok) return res.status(401).json({ error: 'INVALID_REFRESH' });
 
-    const accessToken = signAccessToken({
-      id: row.user_id,
-      email: row.email,
-      tenant_code: row.tenant_code,
-      role: row.role,
-    });
+    const accessToken = signAccessToken(row);
 
-    // rotation du refresh
     const newRefresh = randomUUID();
     const newHash = await bcrypt.hash(newRefresh, 10);
     const newExp = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
 
     await pool.query(
-      `update devices set refresh_hash=$2, expires_at=$3, updated_at=now() where device_id=$1`,
+      'update devices set refresh_hash=$2, expires_at=$3, updated_at=now() where device_id=$1',
       [device_id, newHash, newExp]
     );
 
@@ -123,15 +96,10 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
-/**
- * POST /auth/logout
- * Corps: { device_id }
- */
+// POST /auth/logout
 router.post('/logout', async (req, res) => {
   try {
-    const { device_id } = req.body || {};
-    if (!device_id) return res.status(400).json({ error: 'MISSING_FIELDS' });
-
+    const { device_id } = req.body;
     await pool.query('delete from devices where device_id=$1', [device_id]);
     return res.json({ ok: true });
   } catch (e) {
