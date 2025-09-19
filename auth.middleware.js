@@ -1,14 +1,19 @@
-// auth.middleware.js
-import { verifyToken } from "./auth.tokens.js";
+// auth.middleware.js (à la racine)
+import jwt from 'jsonwebtoken';
 
-export function authRequired(req, res, next) {
-  const h = req.headers.authorization || "";
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  if (!m) return res.status(401).json({ error: "Missing bearer token" });
+export default function auth(req, res, next) {
+  const h = req.headers.authorization || req.headers.Authorization;
+  if (!h) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+
+  const token = h.startsWith('Bearer ') ? h.slice(7) : h;
   try {
-    req.user = verifyToken(m[1]);
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = {
+      ...payload,
+      role: String(payload.role || '').toUpperCase(),
+    };
     next();
   } catch {
-    res.status(401).json({ error: "Invalid token" });
+    return res.status(401).json({ error: 'INVALID_TOKEN' });
   }
 }
