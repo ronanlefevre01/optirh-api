@@ -1,5 +1,5 @@
 // auth.middleware.js
-import { verifyToken } from "./auth.token.js";
+import { verifyToken } from "./auth.tokens.js";
 
 export function authRequired(req, res, next) {
   const h = req.headers.authorization || "";
