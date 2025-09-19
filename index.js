@@ -4082,87 +4082,114 @@ app.post('/legal/accept', authRequired, async (req, res) => {
   }
 });
 
-// === [Bloc B] GET /owner/leaves/stats-summary ===
-// Retourne: { year, mode, workweek, baseDays, employees: [{user_id, full_name, taken, allowance, left}] }
-app.get('/owner/leaves/stats-summary', async (req, res) => {
+// ==============================
+// SOLDES CONGÉS — Récap par salarié (OWNER/HR)
+// GET /owner/leaves/stats-summary?year=YYYY
+// ==============================
+app.get('/owner/leaves/stats-summary', authRequired, async (req, res) => {
   try {
-    const auth = req.headers.authorization || '';
-    const token = auth.replace(/^Bearer\s+/i, '');
-    let payload = null;
-    try { payload = jwt.verify(token, process.env.JWT_SECRET); } catch {}
-    if (!payload || !OWNER_LIKE.has(payload.role)) {
-      return res.status(403).json({ error: 'FORBIDDEN' });
-    }
-    const tenant = payload.tenant_code;
+    const role = String(req.user.role || '').toUpperCase();
+    if (!OWNER_LIKE.has(role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
 
-    const yearQ = parseInt(String(req.query.year || ''), 10);
-    const nowISO = isoDay(new Date());
-    const { startYear } = legalPeriodForDate(nowISO);
-    const targetYear = Number.isFinite(yearQ) ? yearQ : startYear;
-    const pStart = `${targetYear}-06-01`;
-    const pEnd   = `${targetYear+1}-05-31`;
+    const code = String(req.user.company_code || '').trim();
+    if (!code) return res.status(400).json({ error: 'TENANT_CODE_MISSING' });
 
-    // PARAMS tenant (adapte ce SELECT à ta table "settings")
-    const settingsQ = await pool.query(
-      `select leave_count_mode as mode, workweek, default_allowance
-         from settings
-        where tenant_code = $1
-        limit 1`,
-      [tenant]
+    // ------- année cible & période légale (01/06/Y -> 31/05/Y+1) -------
+    const now = new Date();
+    const fallbackYear = now.getMonth() + 1 >= 6 ? now.getFullYear() : now.getFullYear() - 1;
+    const Y = Number(req.query.year || fallbackYear);
+    if (!Number.isInteger(Y)) return res.status(400).json({ error: 'BAD_YEAR' });
+    const periodStart = `${Y}-06-01`;
+    const periodEnd   = `${Y + 1}-05-31`;
+
+    // ------- settings : mode de décompte, workweek, dotation annuelle -------
+    const sRows = await pool.query(
+      `SELECT key, value
+         FROM settings
+        WHERE tenant_code = $1
+          AND key IN ('leave_count_mode','workweek','annual_allowance_days')`,
+      [code]
     );
-    const st = settingsQ.rows[0] || {};
-    const mode = (st?.mode === 'ouvrables' ? 'ouvrables' : 'ouvres'); // défaut : ouvrés
-    const workweek = Array.isArray(st?.workweek) ? st.workweek.filter(n => Number.isInteger(n)) : null;
-    const baseDays = Number.isFinite(+st?.default_allowance) ? +st.default_allowance : (mode === 'ouvrables' ? 30 : 25);
+    const settings = {};
+    for (const r of sRows.rows) settings[r.key] = r.value;
 
-    // Employés (nom + dotation individuelle optionnelle)
-    const empQ = await pool.query(`
-      select u.id as user_id,
-             coalesce(u.first_name,'') || ' ' || coalesce(u.last_name,'') as full_name,
-             ep.leave_allowance
-      from employee_profiles ep
-      join users u on u.id = ep.user_id
-      where ep.tenant_code = $1
-      order by 2
-    `, [tenant]);
-    const employees = empQ.rows;
+    // mode: 'ouvres' (ouvrés) | 'ouvrables'
+    const mode = (settings.leave_count_mode || 'ouvres');
+    const workweek = Array.isArray(settings.workweek) ? settings.workweek.map(Number) : undefined;
 
-    // Congés approuvés payés chevauchant la période
-    const leavesQ = await pool.query(`
-      select l.user_id, l.start_date::date as start_date, l.end_date::date as end_date, l.type, l.status
-      from leaves l
-      where l.tenant_code = $1
-        and l.status ilike 'approved'
-        and (l.type ilike 'paid' or l.type ilike 'pay%')
-        and l.end_date::date >= $2::date
-        and l.start_date::date <= $3::date
-    `, [tenant, pStart, pEnd]);
-    const leaves = leavesQ.rows;
+    // Dotation annuelle par défaut: 25 en "ouvrables", 22 en "ouvres" (ajuste si besoin)
+    const baseDays =
+      (settings.annual_allowance_days != null
+        ? Number(settings.annual_allowance_days)
+        : (mode === 'ouvrables' ? 25 : 22));
 
-    // Somme par user dans [pStart, pEnd]
-    const byUser = new Map();
-    for (const l of leaves) {
-      const s = isoDay(new Date(l.start_date));
-      const e = isoDay(new Date(l.end_date));
-      const inter = intersection(s, e, pStart, pEnd);
-      if (!inter) continue;
-      const taken = countLeaveDays({ start: inter.start, end: inter.end, mode, workweek });
-      byUser.set(l.user_id, (byUser.get(l.user_id) || 0) + taken);
+    // ------- liste des users du tenant -------
+    const usersQ = await pool.query(
+      `SELECT id, email, first_name, last_name, role, is_active
+         FROM users
+        WHERE tenant_code = $1
+        ORDER BY created_at DESC`,
+      [code]
+    );
+
+    // ------- toutes les absences approuvées qui chevauchent la période -------
+    const leavesQ = await pool.query(
+      `SELECT id, employee_id, type, status,
+              TO_CHAR(start_date,'YYYY-MM-DD') AS start_date,
+              TO_CHAR(end_date  ,'YYYY-MM-DD') AS end_date
+         FROM leaves
+        WHERE tenant_code = $1
+          AND status = 'APPROVED'
+          AND start_date <= $3::date
+          AND end_date   >= $2::date`,
+      [code, periodStart, periodEnd]
+    );
+
+    // ------- calcul jours pris dans la période (en tenant compte du mode) -------
+    const takenByEmp = new Map(); // empId -> number
+    for (const l of leavesQ.rows) {
+      // copie tronquée à l'intérieur de la période
+      const s = String(l.start_date) < periodStart ? periodStart : String(l.start_date);
+      const e = String(l.end_date)   > periodEnd   ? periodEnd   : String(l.end_date);
+
+      const n = countLeaveDays({
+        start: s,
+        end: e,
+        mode,        // 'ouvres' ou 'ouvrables'
+        workweek,    // ex: [1,2,3,4,5] si "ouvrés"
+      }) || 0;
+
+      const emp = Number(l.employee_id);
+      takenByEmp.set(emp, (takenByEmp.get(emp) || 0) + n);
     }
 
-    const out = employees.map(e => {
-      const taken = byUser.get(e.user_id) || 0;
-      const allowance = Number.isFinite(+e.leave_allowance) ? +e.leave_allowance : baseDays;
-      const left = Math.max(allowance - taken, 0);
-      return { user_id: e.user_id, full_name: e.full_name, taken, allowance, left };
-    });
+    // ------- construire la réponse attendue par l’app -------
+    const employees = usersQ.rows
+      // tu peux filtrer ici si tu veux exclure OWNER/HR
+      // .filter(u => u.role === 'EMPLOYEE')
+      .map(u => {
+        const id = Number(u.id);
+        const taken = Number(takenByEmp.get(id) || 0);
+        const allowance = baseDays;                  // uniforme; à adapter si dotation par salarié plus tard
+        const left = Math.max(0, allowance - taken); // pas de négatif dans "left"
+        const full_name = ([u.first_name||'', u.last_name||''].join(' ').trim()) || u.email;
 
-    res.json({ year: targetYear, mode, workweek: workweek || undefined, baseDays, employees: out });
+        return { user_id: id, full_name, taken, allowance, left };
+      });
+
+    return res.json({
+      year: Y,
+      mode,         // 'ouvres' | 'ouvrables'
+      baseDays,     // dotation annuelle "de base"
+      workweek,     // utile si tu veux l’afficher côté app
+      employees,
+    });
   } catch (e) {
-    console.error('[owner/leaves/stats-summary] error', e);
-    res.status(500).json({ error: 'STATS_SUMMARY_ERROR' });
+    console.error('[stats-summary]', e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
+
 
 
 const PORT = process.env.PORT || 3001;
