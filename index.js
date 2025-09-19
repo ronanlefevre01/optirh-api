@@ -12,6 +12,7 @@ import { Readable } from "stream";
 import { computeBonusV3 } from "./bonusMathV3.js";
 import { monthKey } from "./utils/dates.js";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import auth from './auth.middleware.js';
 
 // ❗️Utilise ESM pour la DB (pas de require ici)
 import { pool /*, q*/ } from "./db.js";
@@ -814,64 +815,6 @@ app.post('/admin/licences', async (req, res) => {
 });
 
 
-app.post('/auth/login', async (req, res) => {
-  try {
-    const { company_code, email, password } = req.body || {};
-    if (!company_code || !email || !password)
-      return res.status(400).json({ error: 'fields required' });
-
-    const codeRaw = String(company_code).trim();
-
-    // Licence + contrôle statut/expiration + meta (optionnel)
-    const licQ = await pool.query(
-      `SELECT tenant_code, status, valid_until, meta
-         FROM licences
-        WHERE lower(tenant_code) = lower($1)`,
-      [codeRaw]
-    );
-    if (!licQ.rowCount) return res.status(404).json({ error: 'Unknown company' });
-    const lic = licQ.rows[0];
-    const tenantCode = lic.tenant_code;
-
-    const s = String(lic.status || '').toLowerCase();
-    const okStatus   = (s === 'active' || s === 'trial');
-    const notExpired = !lic.valid_until || new Date(lic.valid_until) >= new Date();
-    if (!okStatus || !notExpired) {
-      return res.status(402).json({ error: 'LICENSE_INVALID_OR_EXPIRED' });
-    }
-
-    // User
-    const uQ = await pool.query(
-      `SELECT id, email, role, first_name, last_name, password_hash
-         FROM users
-        WHERE lower(tenant_code) = lower($1)
-          AND lower(email) = lower($2)
-        LIMIT 1`,
-      [tenantCode, email]
-    );
-    if (!uQ.rowCount) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const u = uQ.rows[0];
-    if (!u.password_hash) return res.status(401).json({ error: 'NO_PASSWORD_SET' });
-
-    const ok = await bcrypt.compare(String(password), String(u.password_hash));
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-
-    // ⚠️ Pont legacy JSONBin (évite “tenant not found” tant que tout n’est pas migré)
-    try { await provisionLegacyTenantFromDB(tenantCode, u); } catch {}
-
-    const token = jwt.sign(
-      { sub: u.id, role: String(u.role || '').toUpperCase(), company_code: tenantCode },
-      process.env.JWT_SECRET,
-      { expiresIn: '12h' }
-    );
-
-    return res.json({ token, user: { ...u, company_code: tenantCode } });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: String(e.message || e) });
-  }
-});
 
 // POST /auth/change-password { currentPassword?, newPassword }
 app.post('/auth/change-password', authRequired, async (req, res) => {
@@ -1387,7 +1330,7 @@ app.post("/users/invite", authRequired, async (req, res) => {
 
 app.get("/users", authRequired, async (req, res) => {
   try {
-    if (String(req.user.role || "").toUpperCase() !== "OWNER") {
+    if (!OWNER_LIKE.has(String(req.user.role || "").toUpperCase())) {
       return res.status(403).json({ error: "Forbidden" });
     }
     const code = String(req.user.company_code || "").trim();
@@ -3770,7 +3713,7 @@ app.get('/bonusV3/my-frozen-history', authRequired, async (req, res) => {
 // ==============================
 app.get('/profiles', authRequired, async (req, res) => {
   try {
-    if (String(req.user.role || '').toUpperCase() !== 'OWNER') {
+    if (!OWNER_LIKE.has(String(req.user.role || '').toUpperCase())) {
       return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
     }
     const code = String(req.user.company_code || '').trim();
