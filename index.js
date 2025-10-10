@@ -636,7 +636,7 @@ export async function lastFrozenMonth(pool, tenant) {
        FROM bonus_ledger
       WHERE tenant_code=$1
       ORDER BY COALESCE(frozen_at, to_date(month || '-01','YYYY-MM-DD')) DESC,
-               seq DESC
+               cycle DESC
       LIMIT 1`,
     [tenant]
   );
@@ -3224,10 +3224,13 @@ app.get('/bonusV3/summary', authRequired, async (req, res) => {
 
 // 2.4 Geler le mois (OWNER) : snapshot + purge des saisies du mois
 // 2.4 Geler le mois (OWNER) : snapshot → NE SUPPRIME PAS les entrées
+// Geler la période courante (ou ?month=YYYY-MM) — crée un snapshot par employé
 app.post('/bonusV3/freeze', authRequired, async (req, res) => {
   try {
     const role = String(req.user.role || '').toUpperCase();
-    if (!['OWNER','HR'].includes(role)) return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+    if (!['OWNER', 'HR'].includes(role)) {
+      return res.status(403).json({ error: 'FORBIDDEN_OWNER' });
+    }
 
     const code = String(req.user.company_code || '').trim();
     const m = await parseMonthOrActiveKey(pool, code, req.query.month);
@@ -3236,49 +3239,57 @@ app.post('/bonusV3/freeze', authRequired, async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // cycle local pour le même mois
-      const { rows: seqRow } = await client.query(
-        `SELECT COALESCE(MAX(seq),0)+1 AS next
-           FROM bonus_periods WHERE tenant_code=$1 AND month=$2`,
+      // 1) Prochain cycle pour ce tenant et ce mois
+      const { rows: cycRow } = await client.query(
+        `SELECT COALESCE(MAX(cycle), 0) + 1 AS next
+           FROM bonus_periods
+          WHERE tenant_code = $1 AND month = $2`,
         [code, m]
       );
-      const seq = Number(seqRow[0].next || 1);
+      const cycle = Number(cycRow[0]?.next || 1);
 
-      // agrégat ventes du mois
+      // 2) Agrégat des ventes du mois par employé
       const { rows: agg } = await client.query(
         `SELECT employee_id,
-                COUNT(*)::int                                        AS nb_sales,
-                COALESCE(SUM(bonus),0)::float                        AS total_bonus,
-                COALESCE(SUM((sale->>'amount_ttc')::numeric),0)::float AS total_ttc
+                COUNT(*)::int                                          AS nb_sales,
+                COALESCE(SUM(bonus), 0)::float                         AS total_bonus,
+                COALESCE(SUM((sale->>'amount_ttc')::numeric), 0)::float AS total_ttc
            FROM bonus_entries
-          WHERE tenant_code=$1 AND month=$2
+          WHERE tenant_code = $1 AND month = $2
           GROUP BY employee_id`,
         [code, m]
       );
 
-      // snapshot dans bonus_periods
+      // 3) Snapshot : une ligne par employé (upsert sur (tenant_code, month, cycle, employee_id))
       for (const r of agg) {
         await client.query(
           `INSERT INTO bonus_periods
-             (tenant_code, month, seq, employee_id, nb_sales, total_bonus, total_ttc, frozen_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7, now())
-           ON CONFLICT (tenant_code, month, seq, employee_id)
-           DO UPDATE SET nb_sales=EXCLUDED.nb_sales,
-                         total_bonus=EXCLUDED.total_bonus,
-                         total_ttc=EXCLUDED.total_ttc,
-                         frozen_at=now()`,
-          [code, m, seq, r.employee_id, r.nb_sales, r.total_bonus, r.total_ttc]
+             (tenant_code, month, cycle, employee_id, nb_sales, total_bonus, total_ttc, frozen_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           ON CONFLICT (tenant_code, month, cycle, employee_id)
+           DO UPDATE SET
+             nb_sales    = EXCLUDED.nb_sales,
+             total_bonus = EXCLUDED.total_bonus,
+             total_ttc   = EXCLUDED.total_ttc,
+             frozen_at   = NOW()`,
+          [code, m, cycle, r.employee_id, r.nb_sales, r.total_bonus, r.total_ttc]
         );
       }
 
-      // purge du mois gelé => redémarre à zéro pour ce mois
+      // 4) (Option) Purger les saisies du mois gelé pour repartir propre
+      //    Si tu préfères conserver les entrées, commente ce bloc.
       await client.query(
-        `DELETE FROM bonus_entries WHERE tenant_code=$1 AND month=$2`,
+        `DELETE FROM bonus_entries WHERE tenant_code = $1 AND month = $2`,
         [code, m]
       );
 
       await client.query('COMMIT');
-      res.json({ success: true, month: m, seq, employees_snapshotted: agg.length });
+      return res.json({
+        success: true,
+        month: m,
+        cycle,
+        employees_snapshotted: agg.length,
+      });
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch {}
       throw e;
@@ -3286,11 +3297,10 @@ app.post('/bonusV3/freeze', authRequired, async (req, res) => {
       client.release();
     }
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: String(e.message || e) });
+    console.error('[bonusV3/freeze]', e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
-
 
 
 // 9) Liste des entrées d’un employé (OWNER)
@@ -3329,10 +3339,10 @@ app.get('/bonusV3/history', authRequired, bonusRequireOwner, async (req, res) =>
     if (!empId) return res.status(400).json({ error: 'EMP_ID_REQUIRED' });
 
     const { rows } = await pool.query(
-      `SELECT month, seq, frozen_at, total_bonus
+      `SELECT month, cycle, frozen_at, total_bonus
          FROM bonus_periods
         WHERE tenant_code=$1 AND employee_id=$2
-        ORDER BY month DESC, seq DESC`,
+        ORDER BY month DESC, cycle DESC`,
       [code, empId]
     );
 
@@ -3340,7 +3350,7 @@ app.get('/bonusV3/history', authRequired, bonusRequireOwner, async (req, res) =>
       empId,
       history: rows.map(r => ({
         month: String(r.month),
-        seq: Number(r.seq),
+        cycle: Number(r.cycle),
         frozenAt: r.frozen_at ? String(r.frozen_at) : null,
         total: Number(r.total_bonus || 0),
       })),
@@ -3682,10 +3692,10 @@ app.get('/bonusV3/my-frozen-history', authRequired, async (req, res) => {
     const empId = Number(req.user.sub);
 
     const { rows } = await pool.query(
-      `SELECT month, seq, nb_sales, total_bonus, total_ttc, frozen_at
+      `SELECT month, cycle, nb_sales, total_bonus, total_ttc, frozen_at
          FROM bonus_periods
         WHERE tenant_code=$1 AND employee_id=$2
-        ORDER BY month DESC, seq DESC`,
+        ORDER BY month DESC, cycle DESC`,
       [code, empId]
     );
 
@@ -3693,7 +3703,7 @@ app.get('/bonusV3/my-frozen-history', authRequired, async (req, res) => {
       ok: true,
       periods: rows.map(r => ({
         month: String(r.month),
-        cycle: Number(r.seq),
+        cycle: Number(r.cycle),
         nb_sales: Number(r.nb_sales || 0),
         total_bonus: Number(r.total_bonus || 0),
         total_ttc: Number(r.total_ttc || 0),
