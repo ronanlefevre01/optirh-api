@@ -9,15 +9,14 @@ const router = express.Router();
 const REFRESH_TTL_DAYS = Number(process.env.REFRESH_TTL_DAYS || 60);
 
 /**
- * POST /auth/login  (car monté avec app.use('/auth', router))
- * Body attendu:
- *   { tenant_code?, company_code?, email, password, device_id? }
+ * POST /auth/login
+ * Body: { tenant_code?, company_code?, email, password, device_id? }
  */
 router.post('/login', async (req, res) => {
   try {
     let { tenant_code, company_code, email, password, device_id } = req.body || {};
 
-    // normalisation champs
+    // normalisation
     email = (email || '').toString().trim().toLowerCase();
     const tc = (tenant_code || company_code || '').toString().trim() || null;
     const pass = (password || '').toString();
@@ -26,7 +25,7 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'FIELDS_REQUIRED', fields: ['email', 'password'] });
     }
 
-    // 1) lookup prioritaire par (email + tenant_code) si fourni
+    // 1) lookup prioritaire (email + tenant_code)
     let userRow = null;
     if (tc) {
       const q1 = `
@@ -40,7 +39,7 @@ router.post('/login', async (req, res) => {
       userRow = rows[0] || null;
     }
 
-    // 2) fallback: lookup par email seul
+    // 2) fallback: email seul
     if (!userRow) {
       const q2 = `
         select id, email, tenant_code, role, password_hash,
@@ -54,26 +53,25 @@ router.post('/login', async (req, res) => {
       userRow = rows[0] || null;
     }
 
-    if (!userRow) {
-      return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
-    }
-    if (userRow.is_active === false) {
-      return res.status(403).json({ error: 'USER_INACTIVE' });
-    }
+    if (!userRow) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+    if (userRow.is_active === false) return res.status(403).json({ error: 'USER_INACTIVE' });
 
     const ok = await bcrypt.compare(pass, userRow.password_hash || '');
-    if (!ok) {
-      return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
-    }
+    if (!ok) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
 
+    // 🔑 Valeur canonique du code entreprise
+    const tenant = userRow.tenant_code || tc || null;
+
+    // ✅ Mettre les deux clés dans le JWT pour compat descendante
     const accessToken = signAccessToken({
       id: userRow.id,
       email: userRow.email,
       role: userRow.role,
-      tenant_code: userRow.tenant_code || tc || null,
+      tenant_code: tenant,
+      company_code: tenant, // <— ajout important
     });
 
-    // gestion refresh/device (best-effort si table devices absente)
+    // refresh/device (best-effort)
     const refreshToken = randomUUID();
     const refreshHash = await bcrypt.hash(refreshToken, 10);
     const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
@@ -89,25 +87,25 @@ router.post('/login', async (req, res) => {
                       refresh_hash=excluded.refresh_hash,
                       expires_at=excluded.expires_at,
                       updated_at=now()`,
-        [userRow.id, userRow.tenant_code || tc, device_id, refreshHash, expiresAt]
+        [userRow.id, tenant, device_id, refreshHash, expiresAt]
       );
     } catch (e) {
-      // ne bloque pas le login si la table n'existe pas
       console.warn('[devices] insert/update skipped:', e?.message || e);
     }
 
-    // Réponse compatible avec l’app (token ET accessToken)
+    // ✅ Retourner aussi les deux clés côté payload user
     return res.json({
       token: accessToken,
-      accessToken,          // compat
+      accessToken,        // compat
       refreshToken,
       device_id,
-      role: userRow.role,   // pratique côté client
+      role: userRow.role,
       user: {
         id: userRow.id,
         email: userRow.email,
         role: userRow.role,
-        tenant_code: userRow.tenant_code || tc || null,
+        tenant_code: tenant,
+        company_code: tenant, // <— ajout important
       },
     });
   } catch (e) {
